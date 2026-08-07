@@ -1,9 +1,12 @@
 const uuid = require('./uuid')
 const Frontend = require('../frontend')
 const { OPTIONS } = require('../frontend/constants')
-const { encodeChange, decodeChange } = require('../backend/columnar')
+const { encodeChange: encodeChangeRaw, decodeChange, decodeChangeMeta, decodeChanges, splitContainers } = require('../backend/columnar')
 const { isObject } = require('./common')
+const { ImmutableString, isImmutableString } = require('./immutable_string')
 let backend = require('../backend') // mutable: can be overridden with setDefaultBackend()
+const viewDocs = new WeakSet()
+const fragmentMetadataCache = new WeakMap()
 
 /**
  * Automerge.* API
@@ -11,7 +14,41 @@ let backend = require('../backend') // mutable: can be overridden with setDefaul
  * the features of the Frontend (a document interface) and the backend (CRDT operations)
  */
 
+function normalizeInitOptions(options) {
+  if (typeof options === 'string' || typeof options === 'undefined') return options
+  if (!isObject(options)) return options
+  if (options.actorId !== undefined || !Object.prototype.hasOwnProperty.call(options, 'actor')) return options
+  const normalized = Object.assign({}, options)
+  if (options.actor !== null && options.actor !== undefined) normalized.actorId = options.actor
+  delete normalized.actor
+  return normalized
+}
+
+function encodeChange(change, actorOrder) {
+  if (!change || !Array.isArray(change.ops)) return encodeChangeRaw(change, actorOrder)
+  const ops = change.ops.map(op => {
+    for (const field of Object.keys(op)) {
+      if ((field === 'values' || field === 'multiOp') && op[field] !== undefined) {
+        throw new RangeError(`Unable to read JS change: unknown field \`${field}\`, expected one of ` +
+          '`ops`, `deps`, `message`, `seq`, `actor`, `requestType`')
+      }
+    }
+    if (op.action === 'inc') return Object.assign({}, op, {datatype: 'int', value: Math.trunc(op.value)})
+    if (op.datatype !== undefined || typeof op.value !== 'number' ||
+        !Number.isInteger(op.value) || op.value < 0 || op.value > Number.MAX_SAFE_INTEGER) return op
+    return Object.assign({}, op, {datatype: 'uint'})
+  })
+  return encodeChangeRaw(Object.assign({}, change, {ops}), actorOrder)
+}
+
+function assertWritable(doc) {
+  if (viewDocs.has(doc)) {
+    throw new RangeError('Cannot change an Automerge view; clone it first')
+  }
+}
+
 function init(options) {
+  options = normalizeInitOptions(options)
   if (typeof options === 'string') {
     options = {actorId: options}
   } else if (typeof options === 'undefined') {
@@ -19,7 +56,7 @@ function init(options) {
   } else if (!isObject(options)) {
     throw new TypeError(`Unsupported options for init(): ${options}`)
   }
-  return Frontend.init(Object.assign({backend}, options))
+  return Frontend.init(Object.assign({backend, textV2: true}, options))
 }
 
 /**
@@ -27,22 +64,35 @@ function init(options) {
  */
 function from(initialState, options) {
   const changeOpts = {message: 'Initialization'}
-  return change(init(options), changeOpts, doc => Object.assign(doc, initialState))
+  return changeWithSource(init(options), changeOpts, doc => Object.assign(doc, copyPatchValue(initialState)), 'from')
 }
 
 function change(doc, options, callback) {
+  return changeWithSource(doc, options, callback, 'change')
+}
+
+function changeWithSource(doc, options, callback, source) {
+  assertWritable(doc)
+  if (typeof options === 'function') {
+    callback = options
+    options = undefined
+  }
+  options = patchOptions(doc, options, source)
   const [newDoc] = Frontend.change(doc, options, callback)
   return newDoc
 }
 
 function emptyChange(doc, options) {
+  assertWritable(doc)
+  options = patchOptions(doc, options, 'emptyChange')
   const [newDoc] = Frontend.emptyChange(doc, options)
   return newDoc
 }
 
 function clone(doc, options = {}) {
+  options = normalizeInitOptions(options)
   const state = backend.clone(Frontend.getBackendState(doc, 'clone'))
-  return applyPatch(init(options), backend.getPatch(state), state, [], options)
+  return applyBackendPatch(init(options), backend.getPatch(state), state, [], options, null)
 }
 
 function free(doc) {
@@ -50,19 +100,36 @@ function free(doc) {
 }
 
 function load(data, options = {}) {
+  options = normalizeInitOptions(options)
   const state = backend.load(data)
-  return applyPatch(init(options), backend.getPatch(state), state, [data], options)
+  if ((!isObject(options) || !options.allowMissingChanges) && backend.getMissingDeps(state).length > 0) {
+    throw new RangeError("change's deps should already be in the document")
+  }
+  let doc = applyBackendPatch(init(options), backend.getPatch(state), state, [data], options, 'loadIncremental')
+  if (isObject(options) && options.convertImmutableStringsToText) {
+    doc = changeWithSource(doc, {time: 0}, migrateImmutableStrings, 'loadIncremental')
+  }
+  return doc
+}
+
+function migrateImmutableStrings(value) {
+  for (const key of Object.keys(value)) {
+    const child = value[key]
+    if (isImmutableString(child)) value[key] = child.val
+    else if (isObject(child) && !(child instanceof Date) && !ArrayBuffer.isView(child)) migrateImmutableStrings(child)
+  }
 }
 
 function save(doc) {
   return backend.save(Frontend.getBackendState(doc, 'save'))
 }
 
-function merge(localDoc, remoteDoc) {
+function merge(localDoc, remoteDoc, options = {}) {
+  assertWritable(localDoc)
   const localState = Frontend.getBackendState(localDoc, 'merge')
   const remoteState = Frontend.getBackendState(remoteDoc, 'merge', 'second')
   const changes = backend.getChangesAdded(localState, remoteState)
-  const [updatedDoc] = applyChanges(localDoc, changes)
+  const [updatedDoc] = applyChangesWithSource(localDoc, changes, options, 'merge')
   return updatedDoc
 }
 
@@ -76,19 +143,224 @@ function getAllChanges(doc) {
   return backend.getAllChanges(Frontend.getBackendState(doc, 'getAllChanges'))
 }
 
-function applyPatch(doc, patch, backendState, changes, options) {
+function getHeads(doc) {
+  return backend.getHeads(Frontend.getBackendState(doc, 'getHeads'))
+}
+
+function getBackend(doc) {
+  return Frontend.getBackendState(doc, 'getBackend')
+}
+
+function getObjectId(object, prop) {
+  if (object === null || object === undefined) return null
+  return (arguments.length > 1 ? Frontend.getObjectId(object, prop) : Frontend.getObjectId(object)) || null
+}
+
+function getConflicts(object, key) {
+  const values = Frontend.getConflicts(object, key)
+  if (!values) return
+  const projected = {}
+  for (const opId of Object.keys(values)) {
+    projected[opId] = values[opId] instanceof Frontend.Text ? values[opId].toJSON() : values[opId]
+  }
+  return projected
+}
+
+function getMissingDeps(doc, heads = []) {
+  return backend.getMissingDeps(Frontend.getBackendState(doc, 'getMissingDeps'), heads)
+}
+
+function hasHeads(doc, heads) {
+  if (!Array.isArray(heads)) throw new TypeError('Pass an array of hashes to hasHeads()')
+  const state = Frontend.getBackendState(doc, 'hasHeads')
+  if (backend.hasHeads) return backend.hasHeads(state, heads)
+  return heads.every(hash => !!backend.getChangeByHash(state, hash))
+}
+
+function getChangesSince(doc, heads) {
+  return backend.getChanges(Frontend.getBackendState(doc, 'getChangesSince'), heads)
+}
+
+function getChangesMetaSince(doc, heads) {
+  const state = Frontend.getBackendState(doc, 'getChangesMetaSince')
+  if (backend.getChangesMeta) return backend.getChangesMeta(state, heads)
+  return backend.getChanges(state, heads).map(change => {
+    const decoded = decodeChange(change)
+    const metadata = Object.assign({}, decoded)
+    delete metadata.ops
+    return metadata
+  })
+}
+
+function patchOptions(doc, options, source) {
+  let normalized
+  if (typeof options === 'string') normalized = {message: options}
+  else normalized = Object.assign({}, options || {})
+  const callback = normalized.patchCallback || doc[OPTIONS] && doc[OPTIONS].patchCallback
+  if (callback) {
+    normalized.patchCallback = (patch, before, after, local, changes) => {
+      callPatchCallback(callback, patch, before, after, local, changes, source)
+    }
+  }
+  return normalized
+}
+
+function callPatchCallback(callback, patch, before, after, local, changes, source) {
+  if (callback.length > 2) {
+    callback(patch, before, after, local, changes)
+  } else if (source) {
+    const patches = []
+    appendRecordDiff(patches, before, after, [], after)
+    appendConflictPatches(patches, before, after, [])
+    appendChangeMarkPatches(patches, before, after, changes)
+    if (patches.length > 0) callback(patches, {before, after, source})
+  }
+}
+
+function applyBackendPatch(doc, patch, backendState, changes, options, source) {
   const newDoc = Frontend.applyPatch(doc, patch, backendState)
   const patchCallback = options.patchCallback || doc[OPTIONS].patchCallback
   if (patchCallback) {
-    patchCallback(patch, doc, newDoc, false, changes)
+    callPatchCallback(patchCallback, patch, doc, newDoc, false, changes, source)
   }
   return newDoc
 }
 
 function applyChanges(doc, changes, options = {}) {
+  return applyChangesWithSource(doc, changes, options, 'applyChanges')
+}
+
+function applyChangesWithSource(doc, changes, options, source) {
+  assertWritable(doc)
   const oldState = Frontend.getBackendState(doc, 'applyChanges')
   const [newState, patch] = backend.applyChanges(oldState, changes)
-  return [applyPatch(doc, patch, newState, changes, options), patch]
+  return [applyBackendPatch(doc, patch, newState, changes, options, source)]
+}
+
+function loadIncremental(doc, data, options = {}) {
+  assertWritable(doc)
+  const oldState = Frontend.getBackendState(doc, 'loadIncremental')
+  const [newState, patch] = backend.loadIncremental(oldState, data)
+  if (!patch) return doc
+  return applyBackendPatch(doc, patch, newState, [data], options, 'loadIncremental')
+}
+
+function saveIncremental(doc) {
+  return backend.saveIncremental(Frontend.getBackendState(doc, 'saveIncremental'))
+}
+
+function saveSince(doc, heads) {
+  return backend.saveSince(Frontend.getBackendState(doc, 'saveSince'), heads)
+}
+
+function concatBinary(buffers) {
+  const byteLength = buffers.reduce((length, buffer) => length + buffer.byteLength, 0)
+  const result = new Uint8Array(byteLength)
+  let offset = 0
+  for (const buffer of buffers) {
+    result.set(buffer, offset)
+    offset += buffer.byteLength
+  }
+  return result
+}
+
+function saveBundle(doc, hashes) {
+  if (!Array.isArray(hashes)) throw new TypeError('saveBundle() hashes must be an array')
+  const state = Frontend.getBackendState(doc, 'saveBundle')
+  const selected = new Set(hashes)
+  if (selected.size !== hashes.length) throw new RangeError('saveBundle() hashes must be unique')
+  if (backend.saveBundleByHash) return backend.saveBundleByHash(state, hashes)
+  const changes = backend.getAllChanges(state).filter(change => {
+    const hash = decodeChangeMeta(change, true).hash
+    if (selected.has(hash)) {
+      selected.delete(hash)
+      return true
+    }
+    return false
+  })
+  if (selected.size > 0) throw new RangeError(`Unknown change hash: ${selected.values().next().value}`)
+  return backend.saveBundle ? backend.saveBundle(changes) : concatBinary(changes)
+}
+
+function readBundle(bundle) {
+  if (backend.readBundle) {
+    const decoded = backend.readBundle(bundle)
+    return {changes: decoded.changes, deps: decoded.deps}
+  }
+  const changes = decodeChanges([bundle])
+  const included = new Set(changes.map(change => change.hash))
+  const deps = new Set()
+  for (const change of changes) {
+    for (const dep of change.deps) if (!included.has(dep)) deps.add(dep)
+  }
+  return {changes, deps: [...deps].sort()}
+}
+
+function applyImportedChanges(doc, changes, options, source) {
+  assertWritable(doc)
+  options = options || {}
+  const oldState = Frontend.getBackendState(doc, source)
+  const [newState, patch] = backend.applyChanges(oldState, changes)
+  const newDoc = Frontend.applyPatch(doc, patch, newState)
+  const patchCallback = options.patchCallback || doc[OPTIONS].patchCallback
+  if (patchCallback && patch.diffs && Object.keys(patch.diffs.props).length > 0) {
+    callPatchCallback(patchCallback, patch, doc, newDoc, false, changes, source)
+  }
+  return newDoc
+}
+
+function addCommits(doc, commits, options = {}) {
+  if (!Array.isArray(commits)) throw new TypeError('addCommits() commits must be an array')
+  const changes = commits.map(commit => {
+    if (!commit || !(commit.bytes instanceof Uint8Array)) {
+      throw new RangeError('bad commit bytes: not a Uint8Array')
+    }
+    let metadata
+    try {
+      metadata = decodeChangeMeta(commit.bytes, true)
+    } catch (error) {
+      throw new RangeError(`bad commit bytes: ${error.message}`)
+    }
+    if (commit.head !== metadata.hash) {
+      throw new RangeError(`commit input head mismatch: expected ${commit.head}, actual ${metadata.hash}`)
+    }
+    if (!Array.isArray(commit.parents) || commit.parents.length !== metadata.deps.length ||
+        commit.parents.some((parent, index) => parent !== metadata.deps[index])) {
+      throw new RangeError('commit input parents do not match encoded change dependencies')
+    }
+    return commit.bytes
+  })
+  return applyImportedChanges(doc, changes, options, 'addCommits')
+}
+
+function addFragments(doc, fragments, options = {}) {
+  if (!Array.isArray(fragments)) throw new TypeError('addFragments() fragments must be an array')
+  const changes = []
+  for (const fragment of fragments) {
+    if (!fragment || !(fragment.bytes instanceof Uint8Array)) {
+      throw new RangeError('bad fragment bytes: not a Uint8Array')
+    }
+    let decoded
+    try {
+      decoded = []
+      for (const chunk of splitContainers(fragment.bytes)) {
+        if (chunk[8] === 3 && backend.readBundle) {
+          decoded.push(...backend.readBundle(chunk).changeBytes)
+        } else if (chunk[8] === 1 || chunk[8] === 2) {
+          decoded.push(chunk)
+        } else {
+          decoded.push(...decodeChanges([chunk]).map(encodeChangeRaw))
+        }
+      }
+    } catch (error) {
+      throw new RangeError(`error loading fragment bundles: ${error.message}`)
+    }
+    if (decoded.length === 0 && fragment.bytes.byteLength > 0) {
+      throw new RangeError('error loading fragment bundles: no changes found')
+    }
+    changes.push(...decoded)
+  }
+  return applyImportedChanges(doc, changes, options, 'addFragments')
 }
 
 function equals(val1, val2) {
@@ -117,27 +389,1293 @@ function getHistory(doc) {
   )
 }
 
+function changesAtHeads(doc, heads) {
+  if (!Array.isArray(heads)) throw new TypeError('Pass an array of hashes to view()')
+  const changes = getAllChanges(doc)
+  const decoded = changes.map(change => decodeChangeMeta(change, true))
+  const byHash = {}
+  for (const change of decoded) byHash[change.hash] = change
+  const selected = {}
+  const pending = heads.slice()
+
+  while (pending.length > 0) {
+    const hash = pending.pop()
+    if (selected[hash]) continue
+    const change = byHash[hash]
+    if (!change) throw new RangeError(`Unknown change hash: ${hash}`)
+    selected[hash] = true
+    pending.push(...change.deps)
+  }
+
+  return changes.filter((change, index) => selected[decoded[index].hash])
+}
+
+function documentFromChanges(changes, options = {}) {
+  const state = backend.loadChanges(backend.init(), changes)
+  return applyBackendPatch(init(options), backend.getPatch(state), state, changes, options)
+}
+
+function view(doc, heads) {
+  const snapshot = documentFromChanges(changesAtHeads(doc, heads), {
+    actorId: Frontend.getActorId(doc), freeze: doc[OPTIONS].freeze
+  })
+  viewDocs.add(snapshot)
+  return snapshot
+}
+
+function changeAt(doc, heads, options, callback) {
+  assertWritable(doc)
+  if (typeof options === 'function') {
+    callback = options
+    options = undefined
+  }
+  const snapshot = view(doc, heads)
+  const branch = clone(snapshot)
+  const branchOptions = isObject(options) ? Object.assign({}, options) : options
+  if (isObject(branchOptions)) delete branchOptions.patchCallback
+  const changed = changeWithSource(branch, branchOptions, callback, 'changeAt')
+  if (changed === branch) return {newDoc: doc, newHeads: null}
+  const newHeads = getHeads(changed)
+  const oldState = Frontend.getBackendState(doc, 'changeAt')
+  const changedState = Frontend.getBackendState(changed, 'changeAt', 'second')
+  const changes = backend.getChangesAdded(oldState, changedState)
+  return {newDoc: applyChangesWithSource(doc, changes, options || {}, 'changeAt')[0], newHeads}
+}
+
+function toJS(value) {
+  if (value instanceof Frontend.Text) {
+    let text = ''
+    for (const item of value) text += typeof item === 'string' ? item : '\ufffc'
+    return text
+  }
+  if (isImmutableString(value)) return new ImmutableString(value.val)
+  if (value instanceof Date) return new Date(value.getTime())
+  if (value instanceof Uint8Array) return value.slice()
+  if (value instanceof Frontend.Counter) return new Frontend.Counter(value.value)
+  if (Array.isArray(value)) return value.map(toJS)
+  if (!isObject(value)) return value
+  const copy = {}
+  for (const key of Object.keys(value)) copy[key] = toJS(value[key])
+  return copy
+}
+
+function isAutomerge(value) {
+  return isObject(value) && Frontend.getObjectId(value) === '_root'
+}
+
+function isCounter(value) {
+  return value instanceof Frontend.Counter
+}
+
+function getLastLocalChange(doc) {
+  return Frontend.getLastLocalChange(doc) || undefined
+}
+
+function insertAt(list, index, ...values) {
+  if (!list || typeof list.insertAt !== 'function') {
+    throw new RangeError('object cannot be modified outside of a change block')
+  }
+  list.insertAt(index, ...values)
+}
+
+function deleteAt(list, index, numDelete) {
+  if (!list || typeof list.deleteAt !== 'function') {
+    throw new RangeError('object cannot be modified outside of a change block')
+  }
+  list.deleteAt(index, numDelete)
+}
+
+function valueAtPath(doc, path, name) {
+  if (!Array.isArray(path)) throw new TypeError(`${name}() path must be an array`)
+  if (path.length === 0) throw new RangeError(`${name}() path must not be empty`)
+  let parent = doc
+  for (let index = 0; index < path.length - 1; index++) {
+    const prop = path[index]
+    if (parent === null || parent === undefined || !['string', 'number'].includes(typeof prop)) {
+      throw new RangeError(`${name}() path does not resolve to a string, Text, or list`)
+    }
+    parent = parent[prop]
+  }
+  const key = path[path.length - 1]
+  if (parent === null || parent === undefined || !['string', 'number'].includes(typeof key)) {
+    throw new RangeError(`${name}() path does not resolve to a string, Text, or list`)
+  }
+  return {parent, key, value: parent[key]}
+}
+
+function textAtTarget(target) {
+  if (target.value instanceof Frontend.Text) return target.value
+  return Frontend.getText(target.parent, target.key)
+}
+
+function textElementWidth(value) {
+  return typeof value === 'string' ? value.length : 1
+}
+
+function textLength(text) {
+  let length = 0
+  for (const value of text) length += textElementWidth(value)
+  return length
+}
+
+function textOffset(text, elementIndex) {
+  let offset = 0
+  for (let index = 0; index < elementIndex && index < text.length; index++) {
+    offset += textElementWidth(text.get(index))
+  }
+  return offset
+}
+
+function textElementIndex(text, offset) {
+  if (offset <= 0) return 0
+  let current = 0
+  for (let index = 0; index < text.length; index++) {
+    current += textElementWidth(text.get(index))
+    if (offset <= current) return index + 1
+  }
+  return text.length
+}
+
+function textCursorIndex(text, offset) {
+  let current = 0
+  for (let index = 0; index < text.length; index++) {
+    current += textElementWidth(text.get(index))
+    if (offset < current) return index
+  }
+  return text.length
+}
+
+function splice(doc, path, index, del, newText = '') {
+  const target = valueAtPath(doc, path, 'splice')
+  if (typeof index === 'string') index = getCursorPosition(doc, path, index)
+  if (!Number.isInteger(index) || !Number.isInteger(del)) {
+    throw new RangeError('splice() index and delete count must be integers')
+  }
+  if (typeof newText !== 'string') throw new TypeError('splice() text must be a string')
+  if (del < 0) {
+    index += del
+    del = -del
+  }
+  const text = textAtTarget(target) || target.value
+  if (typeof text !== 'string' && !(text instanceof Frontend.Text) && !Array.isArray(text)) {
+    throw new RangeError('splice() path does not resolve to a string, Text, or list')
+  }
+  const chars = [...newText]
+  const length = text instanceof Frontend.Text ? textLength(text) : text.length
+  if (index < 0 || index > length) throw new RangeError('splice() index is out of bounds')
+  del = Math.min(del, length - index)
+  if (text instanceof Frontend.Text) {
+    const start = textElementIndex(text, index)
+    let deleteCount = 0, deleted = 0
+    while (start + deleteCount < text.length && deleted < del) {
+      deleted += textElementWidth(text.get(start + deleteCount))
+      deleteCount++
+    }
+    if (chars.length > 0) text.insertAt(start, ...chars)
+    if (deleteCount > 0) text.deleteAt(start + chars.length, deleteCount)
+  } else if (Array.isArray(text)) {
+    text.splice(index, del, ...chars)
+  } else {
+    target.parent[target.key] = text.slice(0, index) + newText + text.slice(index + del)
+  }
+}
+
+function updateText(doc, path, newText) {
+  if (typeof newText !== 'string') throw new TypeError('updateText() text must be a string')
+  const target = valueAtPath(doc, path, 'updateText')
+  const text = textAtTarget(target) || target.value
+  if (!(text instanceof Frontend.Text) && !Array.isArray(text)) {
+    throw new RangeError('updateText() path does not resolve to a string, Text, or list')
+  }
+  const current = [...text]
+  if (!current.every(value => typeof value === 'string')) {
+    throw new RangeError('updateText() does not support inline objects')
+  }
+  const next = [...newText]
+  let prefix = 0
+  while (prefix < current.length && prefix < next.length && current[prefix] === next[prefix]) prefix++
+  let suffix = 0
+  while (suffix < current.length - prefix && suffix < next.length - prefix &&
+         current[current.length - suffix - 1] === next[next.length - suffix - 1]) suffix++
+  const start = text instanceof Frontend.Text ? textOffset(text, prefix) : prefix
+  const removed = text instanceof Frontend.Text
+    ? textOffset(text, current.length - suffix) - start
+    : current.length - prefix - suffix
+  splice(doc, path, start, removed,
+    next.slice(prefix, next.length - suffix).join(''))
+}
+
+function copyPatchValue(value) {
+  if (value instanceof Frontend.Text) return new Frontend.Text([...value].map(copyPatchValue))
+  if (isImmutableString(value)) return new ImmutableString(value.val)
+  if (value instanceof Date) return new Date(value.getTime())
+  if (value instanceof Uint8Array) return value.slice()
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice()
+  }
+  if (value instanceof Frontend.Counter) return new Frontend.Counter(value.value)
+  if (Array.isArray(value)) return value.map(copyPatchValue)
+  if (!isObject(value)) return value
+  const copy = {}
+  for (const key of Object.keys(value)) copy[key] = copyPatchValue(value[key])
+  return copy
+}
+
+function sameValue(left, right) {
+  if (Object.is(left, right)) return true
+  if (left instanceof Frontend.Text && right instanceof Frontend.Text) {
+    const leftValues = [...left], rightValues = [...right]
+    return sameValue(leftValues, rightValues)
+  }
+  if (left instanceof Frontend.Counter && right instanceof Frontend.Counter) {
+    return left.value === right.value
+  }
+  if (left instanceof Date && right instanceof Date) return left.getTime() === right.getTime()
+  if (left instanceof Uint8Array && right instanceof Uint8Array) {
+    if (left.byteLength !== right.byteLength) return false
+    for (let index = 0; index < left.byteLength; index++) {
+      if (left[index] !== right[index]) return false
+    }
+    return true
+  }
+  if (Array.isArray(left) && Array.isArray(right)) {
+    if (left.length !== right.length) return false
+    for (let index = 0; index < left.length; index++) {
+      if (!sameValue(left[index], right[index])) return false
+    }
+    return true
+  }
+  if (!isObject(left) || !isObject(right)) return false
+  const leftKeys = Object.keys(left).sort(), rightKeys = Object.keys(right).sort()
+  if (leftKeys.length !== rightKeys.length) return false
+  for (let index = 0; index < leftKeys.length; index++) {
+    if (leftKeys[index] !== rightKeys[index] || !sameValue(left[leftKeys[index]], right[rightKeys[index]])) {
+      return false
+    }
+  }
+  return true
+}
+
+function isRecord(value) {
+  if (!isObject(value) || Array.isArray(value) || value instanceof Date ||
+      value instanceof Frontend.Text || value instanceof Frontend.Counter ||
+      ArrayBuffer.isView(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function appendRichTextDiff(patches, before, after, path, afterDoc) {
+  before = [...before]
+  after = [...after]
+  let prefix = 0
+  while (prefix < before.length && prefix < after.length && sameValue(before[prefix], after[prefix])) prefix++
+  let suffix = 0
+  while (suffix < before.length - prefix && suffix < after.length - prefix &&
+         sameValue(before[before.length - suffix - 1], after[after.length - suffix - 1])) suffix++
+  const removed = before.length - prefix - suffix
+  const offset = before.slice(0, prefix).reduce((total, value) => total + textElementWidth(value), 0)
+  const deleteLength = before.slice(prefix, prefix + removed)
+    .reduce((total, value) => total + textElementWidth(value), 0)
+  const inserted = after.slice(prefix, after.length - suffix)
+  const insertBeforeDelete = removed > 0 && inserted.length > 0 && inserted.every(value => typeof value === 'string')
+  if (removed > 0 && !insertBeforeDelete) appendDelete(patches, path.concat(offset), deleteLength)
+  const markState = afterDoc ? markRanges(afterDoc, path).values : []
+  let index = offset, text = '', textMarks
+  function flushText() {
+    if (text.length === 0) return
+    const patch = {action: 'splice', path: path.concat(index), value: text}
+    if (textMarks && Object.keys(textMarks).length > 0) patch.marks = Object.assign({}, textMarks)
+    patches.push(patch)
+    index += text.length
+    text = ''
+    textMarks = undefined
+  }
+  for (let insertedIndex = 0; insertedIndex < inserted.length; insertedIndex++) {
+    const value = inserted[insertedIndex]
+    const valueMarks = markState[prefix + insertedIndex] || {}
+    if (typeof value === 'string') {
+      if (text.length > 0 && !sameValue(textMarks, valueMarks)) flushText()
+      if (text.length === 0) textMarks = valueMarks
+      text += value
+      continue
+    }
+    flushText()
+    patches.push({action: 'insert', path: path.concat(index), values: [{}]})
+    const updatingBlock = removed === 1 && inserted.length === 1 && isRecord(before[prefix]) && isRecord(value)
+    const keys = updatingBlock ? Object.keys(value).sort((left, right) => {
+      if (left === 'type') return -1
+      if (right === 'type') return 1
+      return left.localeCompare(right)
+    }) : undefined
+    appendRecordDiff(patches, {}, value, path.concat(index), afterDoc, keys)
+    index++
+  }
+  flushText()
+  if (insertBeforeDelete) appendDelete(patches, path.concat(index), deleteLength)
+}
+
+function appendArrayDiff(patches, before, after, path, afterDoc) {
+  const beforeIds = Frontend.getElementIds(before), afterIds = Frontend.getElementIds(after)
+  function beforeValue(index) { return Frontend.getText(before, index) || before[index] }
+  function afterValue(index) { return Frontend.getText(after, index) || after[index] }
+  const sameElement = beforeIds && afterIds
+    ? (beforeIndex, afterIndex) => beforeIds[beforeIndex] === afterIds[afterIndex] &&
+        sameValue(beforeValue(beforeIndex), afterValue(afterIndex))
+    : (beforeIndex, afterIndex) => sameValue(beforeValue(beforeIndex), afterValue(afterIndex))
+  let prefix = 0
+  while (prefix < before.length && prefix < after.length && sameElement(prefix, prefix)) prefix++
+  let suffix = 0
+  while (suffix < before.length - prefix && suffix < after.length - prefix &&
+         sameElement(before.length - suffix - 1, after.length - suffix - 1)) suffix++
+  const beforeMiddle = before.length - prefix - suffix
+  const afterMiddle = after.length - prefix - suffix
+  if (beforeMiddle === 0 && afterMiddle > 0) {
+    const values = Array.from({length: afterMiddle}, (_, index) => afterValue(prefix + index))
+    appendArrayInsert(patches, path, prefix, values, afterDoc)
+    return
+  }
+  if (afterMiddle === 0 && beforeMiddle > 0) {
+    appendDelete(patches, path.concat(prefix), beforeMiddle)
+    return
+  }
+  const common = Math.min(beforeMiddle, afterMiddle)
+  for (let index = 0; index < common; index++) {
+    appendValueDiff(patches, beforeValue(prefix + index), afterValue(prefix + index), path.concat(prefix + index), afterDoc)
+  }
+  if (beforeMiddle > afterMiddle) {
+    appendDelete(patches, path.concat(prefix + common), beforeMiddle - common)
+  } else if (afterMiddle > beforeMiddle) {
+    const values = Array.from({length: afterMiddle - common}, (_, index) => afterValue(prefix + common + index))
+    appendArrayInsert(patches, path, prefix + common, values, afterDoc)
+  }
+}
+
+function appendArrayInsert(patches, path, index, values, afterDoc) {
+  const inserted = values.map(patchPlaceholder)
+  patches.push({action: 'insert', path: path.concat(index), values: inserted})
+  appendInitializations(patches, values.map((value, offset) => ({value, path: path.concat(index + offset)})), afterDoc)
+}
+
+function appendDelete(patches, path, length) {
+  const patch = {action: 'del', path}
+  if (length > 1) patch.length = length
+  patches.push(patch)
+}
+
+function patchPlaceholder(value) {
+  if (typeof value === 'string' || value instanceof Frontend.Text) return ''
+  if (Array.isArray(value)) return []
+  if (isRecord(value)) return {}
+  return copyPatchValue(value)
+}
+
+function appendInitializations(patches, initial, afterDoc) {
+  function appendText(value, path) {
+    const markState = afterDoc ? markRangesForText(afterDoc, value).values : []
+    let index = 0, text = '', textMarks
+    function flushText() {
+      if (text.length === 0) return
+      const patch = {action: 'splice', path: path.concat(index), value: text}
+      if (textMarks && Object.keys(textMarks).length > 0) patch.marks = Object.assign({}, textMarks)
+      patches.push(patch)
+      index += text.length
+      text = ''
+      textMarks = undefined
+    }
+    for (let itemIndex = 0; itemIndex < value.length; itemIndex++) {
+      const item = value.get(itemIndex)
+      const itemMarks = markState[itemIndex] || {}
+      if (typeof item === 'string') {
+        if (text.length > 0 && !sameValue(textMarks, itemMarks)) flushText()
+        if (text.length === 0) textMarks = itemMarks
+        text += item
+      } else {
+        flushText()
+        patches.push({action: 'insert', path: path.concat(index), values: [{}]})
+        queue.push({value: item, path: path.concat(index)})
+        index++
+      }
+    }
+    flushText()
+  }
+  const queue = initial.slice()
+  for (let queueIndex = 0; queueIndex < queue.length; queueIndex++) {
+    const {value, path} = queue[queueIndex]
+    if (typeof value === 'string') {
+      if (value.length > 0) patches.push({action: 'splice', path: path.concat(0), value})
+    } else if (value instanceof Frontend.Text) {
+      appendText(value, path)
+    } else if (Array.isArray(value) && value.length > 0) {
+      patches.push({action: 'insert', path: path.concat(0), values: value.map(patchPlaceholder)})
+      for (let index = 0; index < value.length; index++) queue.push({value: value[index], path: path.concat(index)})
+    } else if (isRecord(value)) {
+      for (const key of Object.keys(value).sort()) {
+        patches.push({action: 'put', path: path.concat(key), value: patchPlaceholder(value[key])})
+      }
+      for (const key of Object.keys(value).sort()) queue.push({value: value[key], path: path.concat(key)})
+    }
+  }
+}
+
+function appendPutValue(patches, value, path, afterDoc) {
+  patches.push({action: 'put', path, value: patchPlaceholder(value)})
+  appendInitializations(patches, [{value, path}], afterDoc)
+}
+
+function appendRecordDiff(patches, before, after, path, afterDoc, orderedKeys) {
+  const beforeKeys = Object.keys(before).sort(), afterKeys = orderedKeys || Object.keys(after).sort()
+  const beforeSet = new Set(beforeKeys), afterSet = new Set(afterKeys)
+  const initializations = []
+  for (const key of beforeKeys) {
+    if (!afterSet.has(key)) patches.push({action: 'del', path: path.concat(key)})
+  }
+  for (const key of afterKeys) {
+    const afterValue = Frontend.getText(after, key) || after[key]
+    if (!beforeSet.has(key)) {
+      const valuePath = path.concat(key)
+      patches.push({action: 'put', path: valuePath, value: patchPlaceholder(afterValue)})
+      initializations.push({value: afterValue, path: valuePath})
+    } else {
+      const beforeValue = Frontend.getText(before, key) || before[key]
+      appendValueDiff(patches, beforeValue, afterValue, path.concat(key), afterDoc)
+    }
+  }
+  appendInitializations(patches, initializations, afterDoc)
+}
+
+function appendValueDiff(patches, before, after, path, afterDoc) {
+  const beforeId = isObject(before) && Frontend.getObjectId(before)
+  const afterId = isObject(after) && Frontend.getObjectId(after)
+  if (sameValue(before, after) && (!beforeId || beforeId === afterId)) return
+  if (beforeId && afterId && beforeId !== afterId) {
+    appendPutValue(patches, after, path, afterDoc)
+    return
+  }
+  if (typeof before === 'string' && typeof after === 'string') {
+    appendPutValue(patches, after, path, afterDoc)
+  } else if ((typeof before === 'string' || before instanceof Frontend.Text) &&
+             (typeof after === 'string' || after instanceof Frontend.Text)) {
+    appendRichTextDiff(patches, before, after, path, afterDoc)
+  } else if (before instanceof Frontend.Counter && after instanceof Frontend.Counter) {
+    patches.push({action: 'inc', path, value: after.value - before.value})
+  } else if (Array.isArray(before) && Array.isArray(after)) {
+    appendArrayDiff(patches, before, after, path, afterDoc)
+  } else if (isRecord(before) && isRecord(after)) {
+    appendRecordDiff(patches, before, after, path, afterDoc)
+  } else {
+    patches.push({action: 'put', path, value: copyPatchValue(after)})
+  }
+}
+
+function diff(doc, beforeHeads, afterHeads) {
+  if (!Array.isArray(beforeHeads) || !Array.isArray(afterHeads)) {
+    throw new TypeError('diff() heads must be arrays')
+  }
+  if (!hasHeads(doc, beforeHeads) || !hasHeads(doc, afterHeads)) return []
+  const before = view(doc, beforeHeads), after = view(doc, afterHeads)
+  const patches = []
+  appendRecordDiff(patches, before, after, [], after)
+  appendConflictPatches(patches, before, after, [])
+  appendMarkPatches(patches, before, after, before, after, [])
+  return patches
+}
+
+function conflictMap(object, key) {
+  return Frontend.getConflicts(object, key) || {}
+}
+
+function appendConflictPatches(patches, before, after, path) {
+  if (before instanceof Frontend.Text || after instanceof Frontend.Text) return
+  if (Array.isArray(before) && Array.isArray(after)) {
+    const length = Math.min(before.length, after.length)
+    for (let index = 0; index < length; index++) {
+      const beforeConflicts = conflictMap(before, index), afterConflicts = conflictMap(after, index)
+      if (!sameValue(beforeConflicts, afterConflicts) && Object.keys(afterConflicts).length > 1) {
+        const patchPath = path.concat(index)
+        const put = patches.find(patch => patch.action === 'put' && sameValue(patch.path, patchPath))
+        if (put) put.conflict = true
+        else if (sameValue(before[index], after[index])) patches.push({action: 'conflict', path: patchPath})
+      }
+      appendConflictPatches(patches, Frontend.getText(before, index) || before[index],
+        Frontend.getText(after, index) || after[index], path.concat(index))
+    }
+  } else if (isRecord(before) && isRecord(after)) {
+    for (const key of Object.keys(after)) {
+      if (!Object.prototype.hasOwnProperty.call(before, key)) continue
+      const beforeConflicts = conflictMap(before, key), afterConflicts = conflictMap(after, key)
+      if (!sameValue(beforeConflicts, afterConflicts) && Object.keys(afterConflicts).length > 1) {
+        const patchPath = path.concat(key)
+        const put = patches.find(patch => patch.action === 'put' && sameValue(patch.path, patchPath))
+        if (put) put.conflict = true
+        else if (sameValue(before[key], after[key])) patches.push({action: 'conflict', path: patchPath})
+      }
+      appendConflictPatches(patches, Frontend.getText(before, key) || before[key],
+        Frontend.getText(after, key) || after[key], path.concat(key))
+    }
+  }
+}
+
+function markEqual(left, right) {
+  return left.name === right.name && left.start === right.start && left.end === right.end &&
+    sameValue(left.value, right.value)
+}
+
+function findTextObject(value, objectId, path = []) {
+  if (!isObject(value)) return
+  const keys = Array.isArray(value) ? value.map((_, index) => index) : Object.keys(value)
+  for (const key of keys) {
+    const text = Frontend.getText(value, key)
+    if (text) {
+      const textPath = path.concat(key)
+      if (Frontend.getObjectId(text) === objectId) return {path: textPath, text}
+      let offset = 0
+      for (const item of text) {
+        if (isObject(item)) {
+          const found = findTextObject(item, objectId, textPath.concat(offset))
+          if (found) return found
+        }
+        offset += textElementWidth(item)
+      }
+    } else {
+      const child = value[key]
+      if (Array.isArray(child) || isRecord(child)) {
+        const found = findTextObject(child, objectId, path.concat(key))
+        if (found) return found
+      }
+    }
+  }
+}
+
+function markEndpoint(doc, target, elemId) {
+  if (elemId === '_head') return 0
+  let offset = 0
+  for (const elem of target.text.elems) {
+    offset += textElementWidth(elem.value)
+    if (elem.elemId === elemId) return offset
+  }
+  const state = Frontend.getBackendState(doc, 'patchCallback')
+  const index = backend.getCursorPosition(state, Frontend.getObjectId(target.text), elemId, 'after')
+  return textOffset(target.text, index)
+}
+
+function appendChangeMarkPatches(patches, before, after, changes) {
+  if (!Array.isArray(changes) || changes.length === 0) return
+  const groups = [], pending = new Map()
+  for (const change of decodeChanges(changes)) {
+    for (const op of change.ops) {
+      if (op.action === 'markBegin') {
+        if (!pending.has(op.obj)) pending.set(op.obj, [])
+        pending.get(op.obj).push(op)
+      } else if (op.action === 'markEnd') {
+        const stack = pending.get(op.obj)
+        if (!stack || stack.length === 0) continue
+        const begin = stack.pop()
+        const target = findTextObject(after, op.obj)
+        if (!target || !findTextObject(before, op.obj)) continue
+        let group = groups.find(value => sameValue(value.path, target.path))
+        if (!group) {
+          group = {path: target.path, marks: []}
+          groups.push(group)
+        }
+        group.marks.push({
+          name: begin.name,
+          value: copyPatchValue(begin.value),
+          start: markEndpoint(after, target, begin.elemId),
+          end: markEndpoint(after, target, op.elemId)
+        })
+      }
+    }
+  }
+  for (const group of groups) patches.push({action: 'mark', path: group.path, marks: group.marks})
+}
+
+function appendMarkPatches(patches, beforeDoc, afterDoc, before, after, path) {
+  if (before instanceof Frontend.Text && after instanceof Frontend.Text) {
+    if (!sameValue([...before], [...after])) return
+    const oldMarks = marks(beforeDoc, path), newMarks = marks(afterDoc, path)
+    const removed = oldMarks.filter(oldMark => !newMarks.some(newMark => markEqual(oldMark, newMark)))
+    const added = newMarks.filter(newMark => !oldMarks.some(oldMark => markEqual(oldMark, newMark)))
+    for (const value of removed) {
+      patches.push({action: 'unmark', path, name: value.name, start: value.start, end: value.end})
+    }
+    if (added.length > 0) patches.push({action: 'mark', path, marks: added})
+    return
+  }
+  if (Array.isArray(before) && Array.isArray(after) && before.length === after.length) {
+    for (let index = 0; index < before.length; index++) {
+      appendMarkPatches(patches, beforeDoc, afterDoc, Frontend.getText(before, index) || before[index],
+        Frontend.getText(after, index) || after[index], path.concat(index))
+    }
+  } else if (isRecord(before) && isRecord(after)) {
+    for (const key of Object.keys(after)) {
+      if (Object.prototype.hasOwnProperty.call(before, key)) {
+        appendMarkPatches(patches, beforeDoc, afterDoc, Frontend.getText(before, key) || before[key],
+          Frontend.getText(after, key) || after[key], path.concat(key))
+      }
+    }
+  }
+}
+
+function diffPath(doc, path, beforeHeads, afterHeads, options = {}) {
+  if (!Array.isArray(path)) throw new TypeError('diffPath() path must be an array')
+  const recursive = options.recursive !== false
+  return diff(doc, beforeHeads, afterHeads).filter(patch => {
+    if (patch.path.length < path.length) return false
+    for (let index = 0; index < path.length; index++) {
+      if (patch.path[index] !== path[index]) return false
+    }
+    return recursive || patch.path.length <= path.length + 1
+  })
+}
+
+function applyPatch(doc, patch) {
+  if (!patch || !Array.isArray(patch.path)) throw new TypeError('applyPatch() requires a patch with a path')
+  if (patch.action === 'put') {
+    const target = valueAtPath(doc, patch.path, 'applyPatch')
+    target.parent[target.key] = copyPatchValue(patch.value)
+  } else if (patch.action === 'insert') {
+    const target = valueAtPath(doc, patch.path, 'applyPatch')
+    if (!Array.isArray(target.parent) || typeof target.key !== 'number') {
+      throw new RangeError('insert patch target is not a list index')
+    }
+    target.parent.splice(target.key, 0, ...patch.values.map(copyPatchValue))
+  } else if (patch.action === 'del') {
+    const target = valueAtPath(doc, patch.path, 'applyPatch')
+    if (Array.isArray(target.parent) && typeof target.key === 'number') {
+      target.parent.splice(target.key, patch.length || 1)
+    } else if (target.parent instanceof Frontend.Text && typeof target.key === 'number') {
+      target.parent.deleteAt(target.key, patch.length || 1)
+    } else if (typeof target.parent === 'string' && typeof target.key === 'number') {
+      splice(doc, patch.path.slice(0, -1), target.key, patch.length || 1)
+    } else {
+      delete target.parent[target.key]
+    }
+  } else if (patch.action === 'splice') {
+    const index = patch.path[patch.path.length - 1]
+    if (typeof index !== 'number') throw new RangeError('splice patch target is not a string index')
+    splice(doc, patch.path.slice(0, -1), index, 0, patch.value)
+  } else if (patch.action === 'inc') {
+    const target = valueAtPath(doc, patch.path, 'applyPatch')
+    if (target.value && typeof target.value.increment === 'function') {
+      target.value.increment(patch.value)
+    } else if (target.value instanceof Frontend.Counter) {
+      target.parent[target.key] = new Frontend.Counter(target.value.value + patch.value)
+    } else if (typeof target.value === 'number') {
+      target.parent[target.key] += patch.value
+    } else {
+      throw new RangeError('inc patch target is not a counter or number')
+    }
+  } else if (patch.action === 'mark') {
+    if (isAutomerge(doc)) {
+      for (const value of patch.marks) {
+        mark(doc, patch.path, {start: value.start, end: value.end, expand: 'none'}, value.name, value.value)
+      }
+    }
+  } else if (patch.action === 'unmark') {
+    if (isAutomerge(doc)) {
+      unmark(doc, patch.path, {start: patch.start, end: patch.end, expand: 'none'}, patch.name)
+    }
+  } else if (patch.action !== 'conflict') {
+    throw new RangeError(`Unsupported patch action: ${patch.action}`)
+  }
+}
+
+function applyPatches(doc, patches) {
+  if (!Array.isArray(patches)) throw new TypeError('applyPatches() requires an array')
+  for (const patch of patches) applyPatch(doc, patch)
+}
+
+function getCursor(doc, path, position, move = 'after') {
+  const target = valueAtPath(doc, path, 'getCursor')
+  const value = textAtTarget(target) || target.value
+  if (!(value instanceof Frontend.Text)) {
+    throw new RangeError('getCursor() path does not resolve to a string or Text')
+  }
+  const length = textLength(value)
+  if (!['before', 'after'].includes(move)) throw new RangeError('getCursor() move must be before or after')
+  if (position === 'start' || (typeof position === 'number' && position < 0)) return 's'
+  if (position === 'end' || (typeof position === 'number' && position >= length)) return 'e'
+  if (!Number.isInteger(position)) throw new RangeError('getCursor() position must be a number, start, or end')
+  const elementIndex = textCursorIndex(value, position)
+  if (elementIndex === value.length) return 'e'
+  const elemId = value.getElemId(elementIndex)
+  return move === 'before' ? `-${elemId}` : elemId
+}
+
+function updateCursorPosition(before, after, position, move) {
+  let prefix = 0
+  while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) prefix++
+  let suffix = 0
+  while (suffix < before.length - prefix && suffix < after.length - prefix &&
+         before[before.length - suffix - 1] === after[after.length - suffix - 1]) suffix++
+  const beforeEnd = before.length - suffix, afterEnd = after.length - suffix
+  if (position < prefix) return position
+  if (position === prefix && beforeEnd === prefix) return move === 'after' ? afterEnd : prefix
+  if (position >= beforeEnd) return afterEnd + position - beforeEnd
+  return move === 'after' ? afterEnd : prefix
+}
+
+const cursorOffsets = new WeakMap()
+
+function getCursorPosition(doc, path, cursor) {
+  const target = valueAtPath(doc, path, 'getCursorPosition')
+  const value = textAtTarget(target) || target.value
+  if (!(value instanceof Frontend.Text)) {
+    throw new RangeError('getCursorPosition() path does not resolve to a string or Text')
+  }
+  if (cursor === 's') return 0
+  if (cursor === 'e') return textLength(value)
+  const opId = /^(-?)(\d+)@(.+)$/.exec(cursor)
+  if (opId) {
+    const elemId = `${opId[2]}@${opId[3]}`
+    if (value.context) {
+      const visible = value.elems.findIndex(elem => elem.elemId === elemId)
+      if (visible >= 0) return textOffset(value, visible)
+    }
+    const state = Frontend.getBackendState(doc, 'getCursorPosition')
+    const index = backend.getCursorPosition(state, Frontend.getObjectId(value), elemId,
+      opId[1] === '-' ? 'before' : 'after')
+    let offsets = cursorOffsets.get(value)
+    if (!offsets) {
+      offsets = new Float64Array(value.length + 1)
+      for (let element = 0; element < value.length; element++) {
+        offsets[element + 1] = offsets[element] + textElementWidth(value.get(element))
+      }
+      cursorOffsets.set(value, offsets)
+    }
+    return offsets[Math.min(index, value.length)]
+  }
+  const match = /^classic:(before|after):(\d+)(?::(.*))?$/.exec(cursor)
+  if (!match) throw new RangeError('getCursorPosition() received an invalid cursor')
+  const length = textLength(value)
+  const position = parseInt(match[2], 10)
+  if (match[3] === undefined) return Math.min(position, length)
+  let before
+  try {
+    before = [...decodeURIComponent(match[3])]
+  } catch (error) {
+    throw new RangeError('getCursorPosition() received an invalid cursor')
+  }
+  const after = typeof value === 'string' ? [...value] : [...value.toString()]
+  return Math.min(updateCursorPosition(before, after, position, match[1]), length)
+}
+
+function mark(doc, path, range, name, value) {
+  const target = valueAtPath(doc, path, 'mark')
+  const text = textAtTarget(target) || target.value
+  if (!(text instanceof Frontend.Text) || !text.context) {
+    throw new RangeError('mark() path must resolve to Text inside a change block')
+  }
+  const length = textLength(text)
+  if (!range || !Number.isInteger(range.start) || !Number.isInteger(range.end) ||
+      range.start < 0 || range.end < range.start || range.end > length) {
+    throw new RangeError('mark() range is invalid')
+  }
+  if (typeof name !== 'string') throw new TypeError('mark() name must be a string')
+  const expand = range.expand || 'after'
+  if (!['before', 'after', 'both', 'none'].includes(expand)) throw new RangeError('mark() expand is invalid')
+  const objectId = Frontend.getObjectId(text)
+  const startIndex = textElementIndex(text, range.start)
+  const endIndex = textElementIndex(text, range.end)
+  const start = startIndex === 0 ? '_head' : text.getElemId(startIndex - 1)
+  const end = endIndex === 0 ? '_head' : text.getElemId(endIndex - 1)
+  text.context.addOp({
+    action: 'markBegin', obj: objectId, elemId: start, insert: true, name, value,
+    expand: expand === 'before' || expand === 'both', pred: []
+  })
+  text.context.addOp({
+    action: 'markEnd', obj: objectId, elemId: end, insert: true,
+    expand: expand === 'after' || expand === 'both', pred: []
+  })
+  text.context.updated[objectId] = text.context.getObject(objectId)
+}
+
+function unmark(doc, path, range, name) {
+  mark(doc, path, range, name, null)
+}
+
+function markRanges(doc, path) {
+  const target = valueAtPath(doc, path, 'marks')
+  const text = textAtTarget(target) || target.value
+  if (!(text instanceof Frontend.Text)) throw new RangeError('marks() path must resolve to Text')
+  return markRangesForText(doc, text)
+}
+
+function markRangesForText(doc, text) {
+  const objectId = Frontend.getObjectId(text)
+  const positions = new Map(text.elems.map((elem, index) => [elem.elemId, index + 1]))
+  positions.set('_head', 0)
+  const pending = [], operations = []
+  for (const bytes of getAllChanges(doc)) {
+    const change = decodeChange(bytes, true)
+    for (let index = 0; index < change.ops.length; index++) {
+      const op = change.ops[index]
+      if (op.obj !== objectId) continue
+      if (op.action === 'markBegin') {
+        pending.push({op, id: `${change.startOp + index}@${change.actor}`})
+      } else if (op.action === 'markEnd' && pending.length > 0) {
+        const begin = pending.pop()
+        const start = positions.get(begin.op.elemId), end = positions.get(op.elemId)
+        if (start !== undefined && end !== undefined && start <= end) {
+          operations.push({name: begin.op.name, value: begin.op.value, start, end, id: begin.id})
+        }
+      }
+    }
+  }
+  operations.sort((left, right) => {
+    const leftId = left.id.split('@'), rightId = right.id.split('@')
+    return parseInt(leftId[0], 10) - parseInt(rightId[0], 10) || leftId[1].localeCompare(rightId[1])
+  })
+  const values = Array.from({length: text.length}, () => ({}))
+  for (const operation of operations) {
+    for (let index = operation.start; index < operation.end; index++) {
+      if (operation.value === null) delete values[index][operation.name]
+      else values[index][operation.name] = operation.value
+    }
+  }
+  const offsets = [0]
+  for (let index = 0; index < text.length; index++) {
+    offsets.push(offsets[index] + textElementWidth(text.get(index)))
+  }
+  const ranges = []
+  const names = new Set(values.flatMap(value => Object.keys(value)))
+  for (const name of names) {
+    let start = 0
+    while (start < values.length) {
+      if (!Object.prototype.hasOwnProperty.call(values[start], name)) {
+        start++
+        continue
+      }
+      const value = values[start][name]
+      let end = start + 1
+      while (end < values.length && sameValue(values[end][name], value)) end++
+      ranges.push({name, value, start: offsets[start], end: offsets[end]})
+      start = end
+    }
+  }
+  ranges.sort((left, right) => left.start - right.start || left.end - right.end || left.name.localeCompare(right.name))
+  return {text, values, ranges}
+}
+
+function marks(doc, path) {
+  return markRanges(doc, path).ranges
+}
+
+function marksAt(doc, path, index) {
+  const state = markRanges(doc, path)
+  const length = textLength(state.text)
+  if (!Number.isInteger(index) || index < 0 || index > length) {
+    throw new RangeError('marksAt() index is invalid')
+  }
+  if (index === length) return {}
+  const elementIndex = textElementIndex(state.text, index)
+  return elementIndex === state.text.length ? {} : Object.assign({}, state.values[elementIndex])
+}
+
+function spans(doc, path) {
+  const state = markRanges(doc, path)
+  const result = []
+  let value = '', active = null
+  for (let index = 0; index < state.text.length; index++) {
+    const marks = state.values[index]
+    const element = state.text.get(index)
+    if (typeof element !== 'string') {
+      if (value.length > 0) {
+        result.push(Object.keys(active).length > 0 ? {type: 'text', value, marks: active} : {type: 'text', value})
+        value = ''
+      }
+      result.push({type: 'block', value: toJS(element)})
+      active = null
+      continue
+    }
+    if (active !== null && !sameValue(active, marks)) {
+      result.push(Object.keys(active).length > 0 ? {type: 'text', value, marks: active} : {type: 'text', value})
+      value = ''
+    }
+    value += element
+    active = marks
+  }
+  if (value.length > 0) {
+    result.push(Object.keys(active).length > 0 ? {type: 'text', value, marks: active} : {type: 'text', value})
+  }
+  return result
+}
+
+function richTextValue(value) {
+  if (typeof value === 'string') return new Frontend.Text(value)
+  if (Array.isArray(value)) return value.map(richTextValue)
+  if (!isRecord(value)) return value
+  const result = {}
+  for (const key of Object.keys(value)) result[key] = richTextValue(value[key])
+  return result
+}
+
+function richTextTarget(doc, path, index, name, convert) {
+  const target = valueAtPath(doc, path, name)
+  let text = textAtTarget(target) || target.value
+  if (typeof text === 'string' && convert) {
+    target.parent[target.key] = new Frontend.Text(text)
+    text = textAtTarget(target) || target.parent[target.key]
+  }
+  if (!(text instanceof Frontend.Text)) throw new RangeError(`${name}() path must resolve to Text`)
+  if (typeof index === 'string') index = getCursorPosition(doc, path, index)
+  if (!Number.isInteger(index) || index < 0 || index > textLength(text)) {
+    throw new RangeError(`${name}() index is invalid`)
+  }
+  return {text, index: textElementIndex(text, index)}
+}
+
+function block(doc, path, index) {
+  const target = richTextTarget(doc, path, index, 'block', false)
+  if (target.index === target.text.length) return null
+  const value = target.text.get(target.index)
+  return isRecord(value) ? toJS(value) : null
+}
+
+function splitBlock(doc, path, index, value) {
+  if (!isRecord(value)) throw new TypeError('splitBlock() block must be an object')
+  const target = richTextTarget(doc, path, index, 'splitBlock', true)
+  target.text.insertAt(target.index, richTextValue(value))
+}
+
+function joinBlock(doc, path, index) {
+  const target = richTextTarget(doc, path, index, 'joinBlock', true)
+  if (target.index < target.text.length) target.text.deleteAt(target.index)
+}
+
+function updateBlock(doc, path, index, value) {
+  if (!isRecord(value)) throw new TypeError('updateBlock() block must be an object')
+  const target = richTextTarget(doc, path, index, 'updateBlock', true)
+  if (target.index === target.text.length) throw new RangeError('updateBlock() index is invalid')
+  target.text.set(target.index, richTextValue(value))
+}
+
+function updateSpans(doc, path, newSpans, config = {}) {
+  if (!Array.isArray(newSpans)) throw new TypeError('updateSpans() spans must be an array')
+  const target = richTextTarget(doc, path, 0, 'updateSpans', true)
+  const next = [], nextMarks = []
+  let index = 0
+  for (const span of newSpans) {
+    if (!span || span.type === 'text' && typeof span.value !== 'string' ||
+        span.type === 'block' && !isRecord(span.value) || span.type !== 'text' && span.type !== 'block') {
+      throw new TypeError('updateSpans() received an invalid span')
+    }
+    if (span.type === 'block') {
+      next.push(richTextValue(span.value))
+      index++
+    } else {
+      const values = [...span.value]
+      next.push(...values)
+      for (const name of Object.keys(span.marks || {})) {
+        nextMarks.push({start: index, end: index + span.value.length, name, value: span.marks[name]})
+      }
+      index += span.value.length
+    }
+  }
+  const defaultExpand = config.defaultExpand || 'both'
+  const currentDoc = target.text.context.cache._root
+  const currentTarget = valueAtPath(currentDoc, path, 'updateSpans')
+  const currentText = textAtTarget(currentTarget) || currentTarget.value
+  const currentMarks = currentText instanceof Frontend.Text ? marks(currentDoc, path) : []
+  for (const range of currentMarks) {
+    if (!nextMarks.some(nextMark => markEqual(range, nextMark))) {
+      const expand = config.perMarkExpand && config.perMarkExpand[range.name] || defaultExpand
+      unmark(doc, path, {start: range.start, end: range.end, expand}, range.name)
+    }
+  }
+  const current = [...target.text]
+  let prefix = 0
+  while (prefix < current.length && prefix < next.length && sameValue(current[prefix], next[prefix])) prefix++
+  let suffix = 0
+  while (suffix < current.length - prefix && suffix < next.length - prefix &&
+         sameValue(current[current.length - suffix - 1], next[next.length - suffix - 1])) suffix++
+  const removed = current.length - prefix - suffix
+  const inserted = next.slice(prefix, next.length - suffix)
+  if (removed > 0) target.text.deleteAt(prefix, removed)
+  if (inserted.length > 0) target.text.insertAt(prefix, ...inserted)
+  for (const range of nextMarks) {
+    if (currentMarks.some(currentMark => markEqual(range, currentMark))) continue
+    const expand = config.perMarkExpand && config.perMarkExpand[range.name] || defaultExpand
+    mark(doc, path, {start: range.start, end: range.end, expand}, range.name, range.value)
+  }
+}
+
+function encodeSyncMessage(message) {
+  return backend.encodeSyncMessage(message)
+}
+
+function decodeSyncMessage(message) {
+  return backend.decodeSyncMessage(message)
+}
+
+function encodeSyncState(syncState) {
+  return backend.encodeSyncState(syncState)
+}
+
+function decodeSyncState(syncState) {
+  return backend.decodeSyncState(syncState)
+}
+
+function topoHistoryTraversal(doc) {
+  const state = Frontend.getBackendState(doc, 'topoHistoryTraversal')
+  if (backend.topoHistoryTraversal) return backend.topoHistoryTraversal(state)
+  return backend.getAllChanges(state).map(change => decodeChange(change).hash)
+}
+
+function inspectChange(doc, hash) {
+  const state = Frontend.getBackendState(doc, 'inspectChange')
+  const change = backend.getChangeByHash(state, hash)
+  return change ? decodeChange(change) : null
+}
+
+function fragmentLevel(hash) {
+  let level = 0
+  while (hash.slice(level * 2, level * 2 + 2) === '00') level++
+  return level
+}
+
+function fragmentLevelRange(levels) {
+  if (levels === undefined || levels === null) return {start: 0, end: Infinity}
+  if (typeof levels === 'number') return {start: levels, end: levels + 1}
+  if (!isObject(levels)) throw new TypeError('getFragmentMetadata() level must be a number or range')
+  const start = levels.start === undefined ? 0 : levels.start
+  const end = levels.end === undefined ? Infinity : levels.end
+  if (!Number.isInteger(start) || end !== Infinity && !Number.isInteger(end)) {
+    throw new TypeError('getFragmentMetadata() range bounds must be integers')
+  }
+  return {start, end}
+}
+
+function cloneFragmentMetadata(fragment) {
+  return {
+    head: fragment.head,
+    level: fragment.level,
+    boundary: fragment.boundary.slice(),
+    checkpoints: fragment.checkpoints.slice(),
+    members: fragment.members.slice()
+  }
+}
+
+function buildFragmentMetadata(doc) {
+  function descending(left, right) {
+    return byHash.get(right).index - byHash.get(left).index
+  }
+
+  const state = Frontend.getBackendState(doc, 'getFragmentMetadata')
+  let cacheKey, history
+  if (backend.getHistoryMeta) {
+    const metadata = backend.getHistoryMeta(state)
+    cacheKey = metadata
+    const cached = fragmentMetadataCache.get(cacheKey)
+    if (cached) return cached
+    history = metadata.map(change => ({
+      index: change.index,
+      hash: change.hash,
+      deps: change.deps,
+      level: fragmentLevel(change.hash)
+    }))
+  } else {
+    const changes = backend.getAllChanges(state)
+    cacheKey = state.state || state
+    const cached = fragmentMetadataCache.get(cacheKey)
+    if (cached && cached.length === changes.length) return cached
+    history = changes.map((bytes, index) => {
+      const change = decodeChangeMeta(bytes, true)
+      return {bytes, index, hash: change.hash, deps: change.deps, level: fragmentLevel(change.hash)}
+    })
+  }
+  const byHash = new Map(history.map(change => [change.hash, change]))
+  const checkpointByHead = new Map()
+  const checkpoints = []
+
+  for (const change of history) {
+    if (change.level === 0) continue
+    const members = new Set(), boundary = new Set(), includedCheckpoints = new Set()
+    const memberOrder = [], queue = [change.hash]
+    let queueIndex = 0
+    while (queueIndex < queue.length) {
+      const hash = queue[queueIndex++]
+      if (members.has(hash) || boundary.has(hash)) continue
+      const current = byHash.get(hash)
+      if (!current) continue
+      if (hash !== change.hash && current.level >= change.level) {
+        boundary.add(hash)
+        const checkpoint = checkpointByHead.get(hash)
+        if (checkpoint) for (const ancestor of checkpoint.boundary) boundary.add(ancestor)
+      } else {
+        members.add(hash)
+        memberOrder.push(hash)
+        if (current.level > 0) includedCheckpoints.add(hash)
+        queue.push(...current.deps)
+      }
+    }
+    const fragment = {
+      head: change.hash,
+      level: change.level,
+      boundary: [...boundary].sort(descending),
+      checkpoints: [...includedCheckpoints].sort(descending),
+      members: memberOrder
+    }
+    checkpoints.push(fragment)
+    checkpointByHead.set(change.hash, fragment)
+  }
+
+  const absorbed = new Set()
+  for (const fragment of checkpoints) {
+    for (const checkpoint of fragment.checkpoints) {
+      if (checkpoint !== fragment.head) absorbed.add(checkpoint)
+    }
+  }
+  const fragments = checkpoints.filter(fragment => !absorbed.has(fragment.head))
+  const covered = new Set()
+  for (const fragment of fragments) for (const hash of fragment.members) covered.add(hash)
+  for (const change of history) {
+    if (!covered.has(change.hash)) {
+      fragments.push({
+        head: change.hash,
+        level: 0,
+        boundary: change.deps.slice(),
+        checkpoints: [],
+        members: [change.hash]
+      })
+    }
+  }
+  fragments.sort((left, right) => byHash.get(left.head).index - byHash.get(right.head).index)
+  const fragmentByHead = new Map(fragments.map(fragment => [fragment.head, fragment]))
+  const result = {length: history.length, fragments, history, byHash, fragmentByHead, checkpointByHead, absorbed}
+  fragmentMetadataCache.set(cacheKey, result)
+  return result
+}
+
+function getFragmentMetadata(doc, levels) {
+  const {start, end} = fragmentLevelRange(levels)
+  return buildFragmentMetadata(doc).fragments
+    .filter(fragment => fragment.level >= start && fragment.level < end)
+    .map(cloneFragmentMetadata)
+}
+
+function bundleFragmentMetadata(doc, metadata) {
+  if (!Array.isArray(metadata)) throw new TypeError('bundleFragmentMetadata() metadata must be an array')
+  const state = Frontend.getBackendState(doc, 'bundleFragmentMetadata')
+  const fragments = buildFragmentMetadata(doc)
+  return metadata.map(fragment => {
+    if (!fragment || typeof fragment.head !== 'string') throw new RangeError('Invalid fragment metadata')
+    const change = fragments.byHash.get(fragment.head)
+    if (!change) throw new RangeError(`Unknown fragment head: ${fragment.head}`)
+    if (fragment.level === 0) return backend.getChangeByHash(state, fragment.head)
+    const canonical = fragments.fragmentByHead.get(fragment.head)
+    if (!canonical || canonical.level !== fragment.level) throw new RangeError(`Unavailable fragment: ${fragment.head}`)
+    return saveBundle(doc, canonical.members)
+  })
+}
+
+function getCommits(doc) {
+  const metadata = getFragmentMetadata(doc, 0)
+  const bundles = bundleFragmentMetadata(doc, metadata)
+  return metadata.map((fragment, index) => ({
+    head: fragment.head,
+    parents: fragment.boundary,
+    bytes: bundles[index]
+  }))
+}
+
+function getFragments(doc, levels = {start: 1}) {
+  const metadata = getFragmentMetadata(doc, levels)
+  const bundles = bundleFragmentMetadata(doc, metadata)
+  return metadata.map((fragment, index) => Object.assign({}, fragment, {bytes: bundles[index]}))
+}
+
+function getFragmentMeta(doc, head) {
+  if (typeof head !== 'string') throw new TypeError('getFragmentMeta() head must be a string')
+  const metadata = buildFragmentMetadata(doc)
+  const change = metadata.byHash.get(head)
+  if (!change) return null
+  if (change.level === 0) {
+    return {head, level: 0, boundary: change.deps.slice(), checkpoints: [], members: [head]}
+  }
+  const fragment = metadata.fragmentByHead.get(head)
+  return fragment ? cloneFragmentMetadata(fragment) : null
+}
+
+function stats(doc) {
+  const state = Frontend.getBackendState(doc, 'stats')
+  let result
+  if (backend.stats) {
+    result = backend.stats(state)
+  } else {
+    const changes = backend.getAllChanges(state).map(decodeChange)
+    result = {
+      numChanges: changes.length,
+      numOps: changes.reduce((count, change) => count + change.ops.length, 0),
+      numActors: new Set(changes.map(change => change.actor)).size
+    }
+  }
+  return Object.assign({
+    cargoPackageName: '@automerge/automerge-classic',
+    cargoPackageVersion: 'classic',
+    rustcVersion: 'not applicable'
+  }, result)
+}
+
+function resolvedPromise() {
+  const scope = typeof self === 'undefined' ? global : self
+  const name = 'Promise'
+  return scope[name].resolve()
+}
+
+function initializeWasm() {
+  return resolvedPromise()
+}
+
+function initializeBase64Wasm() {
+  return resolvedPromise()
+}
+
+function wasmInitialized() {
+  return resolvedPromise()
+}
+
+function isWasmInitialized() {
+  return true
+}
+
+function use() {}
+
+function dump() {}
+
+function releaseInfo() {
+  return {js: {gitHead: 'classic'}, wasm: null}
+}
+
 function generateSyncMessage(doc, syncState) {
   const state = Frontend.getBackendState(doc, 'generateSyncMessage')
   return backend.generateSyncMessage(state, syncState)
 }
 
-function receiveSyncMessage(doc, oldSyncState, message) {
+function receiveSyncMessage(doc, oldSyncState, message, options = {}) {
+  assertWritable(doc)
   const oldBackendState = Frontend.getBackendState(doc, 'receiveSyncMessage')
   const [backendState, syncState, patch] = backend.receiveSyncMessage(oldBackendState, oldSyncState, message)
-  if (!patch) return [doc, syncState, patch]
+  if (!patch) return [doc, syncState, null]
 
   // The patchCallback is passed as argument all changes that are applied.
   // We get those from the sync message if a patchCallback is present.
   let changes = null
-  if (doc[OPTIONS].patchCallback) {
+  if (options.patchCallback || doc[OPTIONS].patchCallback) {
     changes = backend.decodeSyncMessage(message).changes
   }
-  return [applyPatch(doc, patch, backendState, changes, {}), syncState, patch]
+  return [applyBackendPatch(doc, patch, backendState, changes, options, 'receiveSyncMessage'), syncState, null]
 }
 
-function initSyncState() {
-  return backend.initSyncState()
+function initSyncState(options) {
+  return backend.initSyncState(options)
+}
+
+function hasOurChanges(doc, remoteState) {
+  if (!remoteState || !Array.isArray(remoteState.sharedHeads)) return false
+  const heads = getHeads(doc)
+  return heads.length === remoteState.sharedHeads.length &&
+    heads.every((head, index) => head === remoteState.sharedHeads[index])
 }
 
 /**
@@ -148,16 +1686,35 @@ function setDefaultBackend(newBackend) {
   backend = newBackend
 }
 
-module.exports = {
+const api = {
   init, from, change, emptyChange, clone, free,
   load, save, merge, getChanges, getAllChanges, applyChanges,
+  loadIncremental, saveIncremental, saveSince, saveBundle, readBundle, addCommits, addFragments,
+  getHeads, getBackend, getMissingDeps, hasHeads, hasOurChanges, getChangesSince, getChangesMetaSince,
+  view, changeAt, diff, diffPath, applyPatch, applyPatches, toJS, isAutomerge, isCounter,
+  insertAt, deleteAt, splice, updateText, getCursor, getCursorPosition,
   encodeChange, decodeChange, equals, getHistory, uuid,
   Frontend, setDefaultBackend, generateSyncMessage, receiveSyncMessage, initSyncState,
+  encodeSyncMessage, decodeSyncMessage, encodeSyncState, decodeSyncState,
+  topoHistoryTraversal, inspectChange, stats,
+  getFragmentMetadata, getFragmentMeta, bundleFragmentMetadata, getCommits, getFragments,
+  getObjectId, getConflicts,
+  getLastLocalChange,
+  ImmutableString, RawString: ImmutableString,
+  isImmutableString, isRawString: isImmutableString,
+  initializeWasm, initializeBase64Wasm, wasmInitialized, isWasmInitialized, use, dump, releaseInfo,
+  mark, unmark, marks, marksAt, spans, updateSpans,
+  block, splitBlock, joinBlock, updateBlock,
   get Backend() { return backend }
 }
 
-for (let name of ['getObjectId', 'getObjectById', 'getActorId',
-     'setActorId', 'getConflicts', 'getLastLocalChange',
+for (let name of ['getObjectById', 'getActorId',
+     'setActorId',
      'Text', 'Table', 'Counter', 'Observable', 'Int', 'Uint', 'Float64']) {
-  module.exports[name] = Frontend[name]
+  api[name] = Frontend[name]
 }
+
+api.next = Object.assign({}, api)
+Object.defineProperty(api.next, 'Backend', {enumerable: true, get() { return backend }})
+
+module.exports = api

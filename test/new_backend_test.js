@@ -1,7 +1,10 @@
 const assert = require('assert')
 const { checkEncoded } = require('./helpers')
-const { DOC_OPS_COLUMNS, encodeChange, decodeChange } = require('../backend/columnar')
-const { MAX_BLOCK_SIZE, BackendDoc, bloomFilterContains } = require('../backend/new')
+const {
+  DOC_OPS_COLUMNS, encodeChange, decodeChange, decodeChangeColumns,
+  encodeColumnInfo, encodeContainer, encoderByColumnId
+} = require('../backend/columnar')
+const { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, bloomFilterContains } = require('../backend/new')
 const uuid = require('../src/uuid')
 
 function checkColumns(block, expectedCols) {
@@ -9,7 +12,7 @@ function checkColumns(block, expectedCols) {
     const {columnName} = DOC_OPS_COLUMNS.find(({columnId}) => columnId === actual.columnId) || {columnName: actual.columnId.toString()}
     if (expectedCols[columnName]) {
       checkEncoded(actual.decoder.buf, expectedCols[columnName], `${columnName} column`)
-    } else if (columnName !== 'chldActor' && columnName !== 'chldCtr') {
+    } else if (!['chldActor', 'chldCtr', 'expand', 'markName'].includes(columnName)) {
       throw new Error(`Unexpected column ${columnName}`)
     }
   }
@@ -23,6 +26,35 @@ function checkColumns(block, expectedCols) {
 
 function hash(change) {
   return decodeChange(encodeChange(change)).hash
+}
+
+function addChangeColumns(changeBytes, extraColumns) {
+  const change = decodeChangeColumns(changeBytes)
+  const columns = change.columns.map(column => ({
+    columnId: column.columnId,
+    encoder: {buffer: column.buffer}
+  })).concat(extraColumns).sort((left, right) => left.columnId - right.columnId)
+  return encodeContainer(1, encoder => {
+    encoder.appendUint53(change.deps.length)
+    for (const dep of change.deps) encoder.appendRawBytes(Uint8Array.from(dep.match(/../g).map(byte => parseInt(byte, 16))))
+    encoder.appendHexString(change.actor)
+    encoder.appendUint53(change.seq)
+    encoder.appendUint53(change.startOp)
+    encoder.appendInt53(change.time)
+    encoder.appendPrefixedString(change.message || '')
+    encoder.appendUint53(change.actorIds.length - 1)
+    for (const actor of change.actorIds.slice(1)) encoder.appendHexString(actor)
+    encodeColumnInfo(encoder, columns)
+    for (const column of columns) encoder.appendRawBytes(column.encoder.buffer)
+    if (change.extraBytes) encoder.appendRawBytes(change.extraBytes)
+  }).bytes
+}
+
+function encodedColumn(columnId, values, raw = false) {
+  const encoder = encoderByColumnId(columnId)
+  if (raw) encoder.appendRawBytes(Uint8Array.from(values))
+  else for (const value of values) encoder.appendValue(value)
+  return {columnId, encoder}
 }
 
 
@@ -271,6 +303,41 @@ describe('BackendDoc applying changes', () => {
     })
     assert.strictEqual(backend.blocks[0].lastKey, 'x')
     assert.strictEqual(backend.blocks[0].numOps, 3)
+  })
+
+  it('should preserve an earlier conflict when seeking to a predecessor block', () => {
+    const actor1 = '01234567', actor2 = '89abcdef'
+    const backend = new BackendDoc()
+    let lastHash
+
+    for (let seq = 1; seq <= MAX_BLOCK_SIZE + 1; seq++) {
+      const change = {actor: actor1, seq, startOp: seq, time: 0, deps: lastHash ? [lastHash] : [], ops: [
+        {action: 'set', obj: '_root', key: 'x', datatype: 'uint', value: seq,
+          pred: seq === 1 ? [] : [`${seq - 1}@${actor1}`]}
+      ]}
+      const encoded = encodeChange(change)
+      lastHash = decodeChange(encoded).hash
+      backend.applyChanges([encoded])
+    }
+
+    const conflict = {actor: actor2, seq: 1, startOp: 1, time: 0, deps: [], ops: [
+      {action: 'set', obj: '_root', key: 'x', datatype: 'uint', value: 700, pred: []}
+    ]}
+    const loaded = new BackendDoc(backend.save())
+    loaded.applyChanges([encodeChange(conflict)])
+
+    const seq = MAX_BLOCK_SIZE + 2
+    const overwrite = {actor: actor1, seq, startOp: seq, time: 0, deps: [lastHash], ops: [
+      {action: 'set', obj: '_root', key: 'x', datatype: 'uint', value: seq,
+        pred: [`${seq - 1}@${actor1}`]}
+    ]}
+    const expected = {
+      [`1@${actor2}`]: {type: 'value', value: 700, datatype: 'uint'},
+      [`${seq}@${actor1}`]: {type: 'value', value: seq, datatype: 'uint'}
+    }
+    const copy = loaded.clone()
+    assert.deepStrictEqual(copy.applyChanges([encodeChange(overwrite)]).diffs.props.x, expected)
+    assert.deepStrictEqual(loaded.applyChanges([encodeChange(overwrite)]).diffs.props.x, expected)
   })
 
   it('should throw an error if the predecessor operation does not exist (1)', () => {
@@ -1902,6 +1969,139 @@ describe('BackendDoc applying changes', () => {
     assert.strictEqual(backend.blocks[0].numOps, 1)
     assert.strictEqual(backend.blocks[0].lastObjectActor, null)
     assert.strictEqual(backend.blocks[0].lastObjectCtr, null)
+    const loaded = new BackendDoc(backend.save())
+    assert.deepStrictEqual(loaded.getChanges([]), [change])
+    assert.strictEqual(loaded.clock['1234'], 1)
+  })
+
+  it('should retain a future column introduced later in a batch', () => {
+    const actor = 'aaaa'
+    const change1 = encodeChange({actor, seq: 1, startOp: 1, time: 0, deps: [], ops: [
+      {action: 'set', obj: '_root', key: 'x', value: 1, pred: []}
+    ]})
+    const change2 = addChangeColumns(encodeChange({
+      actor, seq: 2, startOp: 2, time: 0, deps: [decodeChange(change1).hash], ops: [
+        {action: 'set', obj: '_root', key: 'y', value: 2, pred: []}
+      ]
+    }), [encodedColumn(0xf2, [42])])
+    const backend = new BackendDoc()
+    backend.applyChanges([change1, change2])
+
+    const column = backend.blocks[0].columns.find(candidate => candidate.columnId === 0xf2)
+    assert.ok(column)
+    checkEncoded(column.decoder.buf, [0, 1, 0x7f, 42])
+
+    const loaded = new BackendDoc(backend.save())
+    const loadedColumn = loaded.blocks[0].columns.find(candidate => candidate.columnId === 0xf2)
+    assert.ok(loadedColumn)
+    checkEncoded(loadedColumn.decoder.buf, [0, 1, 0x7f, 42])
+    assert.deepStrictEqual(loaded.getChanges([]), [change1, change2])
+  })
+
+  it('should preserve grouped future value columns', () => {
+    const actor = 'aaaa'
+    const change1 = addChangeColumns(encodeChange({actor, seq: 1, startOp: 1, time: 0, deps: [], ops: [
+      {action: 'set', obj: '_root', key: 'x', value: 1, pred: []}
+    ]}), [
+      encodedColumn(0xf0, [2]),
+      encodedColumn(0xf1, [0, 0]),
+      encodedColumn(0xf3, [1, 2]),
+      encodedColumn(0xf6, [0x16, 0x16]),
+      encodedColumn(0xf7, [0xaa, 0xbb], true)
+    ])
+    assert.doesNotThrow(() => decodeChange(change1))
+    const change2 = encodeChange({
+      actor, seq: 2, startOp: 2, time: 0, deps: [decodeChange(change1).hash], ops: [
+        {action: 'set', obj: '_root', key: 'y', value: 2, pred: []}
+      ]
+    })
+    const backend = new BackendDoc()
+    backend.applyChanges([change1, change2])
+
+    const raw = backend.blocks[0].columns.find(candidate => candidate.columnId === 0xf7)
+    assert.ok(raw)
+    checkEncoded(raw.decoder.buf, [0xaa, 0xbb])
+
+    const loaded = new BackendDoc(backend.save())
+    const loadedRaw = loaded.blocks[0].columns.find(candidate => candidate.columnId === 0xf7)
+    assert.ok(loadedRaw)
+    checkEncoded(loadedRaw.decoder.buf, [0xaa, 0xbb])
+    assert.deepStrictEqual(loaded.getChanges([]), [change1, change2])
+  })
+
+  it('should keep loaded state intact when future column presence is ambiguous', () => {
+    const actor = 'aaaa'
+    const change1 = encodeChange({actor, seq: 1, startOp: 1, time: 0, deps: [], ops: [
+      {action: 'set', obj: '_root', key: 'x', value: 1, pred: []}
+    ]})
+    const change2 = addChangeColumns(encodeChange({
+      actor, seq: 2, startOp: 2, time: 0, deps: [decodeChange(change1).hash], ops: [
+        {action: 'set', obj: '_root', key: 'y', value: 2, pred: []}
+      ]
+    }), [encodedColumn(0xf4, [false])])
+    const backend = new BackendDoc()
+    backend.applyChanges([change1, change2])
+    const saved = backend.save()
+    const loaded = new BackendDoc(saved)
+    const heads = loaded.heads
+
+    assert.throws(() => loaded.getChanges([]), /Mismatched heads hashes/)
+    assert.strictEqual(loaded.haveHashGraph, false)
+    assert.deepStrictEqual(loaded.clock, {[actor]: 2})
+    assert.deepStrictEqual(loaded.heads, heads)
+    assert.strictEqual(loaded.changes.length, 2)
+    assert.deepStrictEqual(loaded.save(), saved)
+  })
+
+  it('should not retain hashes after a failed batched apply', () => {
+    const actor1 = 'aaaa', actor2 = 'bbbb'
+    const change1 = encodeChange({actor: actor1, seq: 1, startOp: 1, time: 0, deps: [], ops: [
+      {action: 'set', obj: '_root', key: 'x', value: 1, pred: []}
+    ]})
+    const change1Hash = decodeChange(change1).hash
+    const invalid = encodeChange({actor: actor2, seq: 1, startOp: 1, time: 0, deps: [change1Hash], ops: [
+      {action: 'set', obj: '_root', key: 'x', value: 2, pred: [`99@${actor1}`]}
+    ]})
+    const backend = new BackendDoc()
+
+    assert.throws(() => backend.applyChanges([invalid, change1]), /no matching operation/)
+    assert.strictEqual(backend.changes.length, 0)
+    assert.strictEqual(backend.blocks[0].numOps, 0)
+    assert.strictEqual(backend.changeIndexByHash[change1Hash], undefined)
+    assert.strictEqual(backend.applyChanges([change1]).clock[actor1], 1)
+  })
+
+  it('should not enumerate committed hashes when applying a change', () => {
+    const actor = 'aaaa'
+    const change1 = encodeChange({actor, seq: 1, startOp: 1, time: 0, deps: [], ops: [
+      {action: 'set', obj: '_root', key: 'x', value: 1, pred: []}
+    ]})
+    const change1Hash = decodeChange(change1).hash
+    const change2 = encodeChange({actor, seq: 2, startOp: 2, time: 0, deps: [change1Hash], ops: [
+      {action: 'set', obj: '_root', key: 'x', value: 2, pred: [`1@${actor}`]}
+    ]})
+    const backend = new BackendDoc()
+    backend.applyChanges([change1])
+    backend.changeIndexByHash = new Proxy(backend.changeIndexByHash, {
+      ownKeys() { throw new Error('enumerated committed hashes') }
+    })
+
+    assert.doesNotThrow(() => backend.applyChanges([change2]))
+    assert.strictEqual(backend.changeIndexByHash[decodeChange(change2).hash], 1)
+  })
+
+  it('should keep map operation blocks small', () => {
+    const actor = uuid(), backend = new BackendDoc()
+    let pred = []
+    for (let seq = 1; seq <= MAX_MAP_BLOCK_SIZE + 1; seq++) {
+      const change = {actor, seq, startOp: seq, time: 0, deps: backend.heads, ops: [
+        {action: 'set', obj: '_root', key: 'value', insert: false, datatype: 'uint', value: seq, pred}
+      ]}
+      backend.applyChanges([encodeChange(change)])
+      pred = [`${seq}@${actor}`]
+    }
+    assert.strictEqual(backend.blocks.length, 2)
+    assert.strictEqual(backend.blocks.every(block => block.numOps <= MAX_MAP_BLOCK_SIZE), true)
   })
 
   it('should split a long insertion into multiple blocks', () => {

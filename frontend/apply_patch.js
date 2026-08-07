@@ -1,20 +1,21 @@
 const { isObject, copyObject, parseOpId } = require('../src/common')
 const { OBJECT_ID, CONFLICTS, ELEM_IDS } = require('./constants')
-const { instantiateText } = require('./text')
+const { Text, instantiateText } = require('./text')
 const { instantiateTable } = require('./table')
 const { Counter } = require('./counter')
+const { ImmutableString } = require('../src/immutable_string')
 
 /**
  * Reconstructs the value from the patch object `patch`.
  */
-function getValue(patch, object, updated) {
+function getValue(patch, object, updated, textV2) {
   if (patch.objectId) {
     // If the objectId of the existing object does not match the objectId in the patch,
     // that means the patch is replacing the object with a new one made from scratch
     if (object && object[OBJECT_ID] !== patch.objectId) {
       object = undefined
     }
-    return interpretPatch(patch, object, updated)
+    return interpretPatch(patch, object, updated, textV2)
   } else if (patch.datatype === 'timestamp') {
     // Timestamp: value is milliseconds since 1970 epoch
     return new Date(patch.value)
@@ -54,7 +55,7 @@ function lamportCompare(ts1, ts2) {
  * to `conflicts[key]`. If there is no conflict, the conflicts object contains
  * just a single opId-value mapping.
  */
-function applyProperties(props, object, conflicts, updated) {
+function applyProperties(props, object, conflicts, updated, textV2) {
   if (!props) return
 
   for (let key of Object.keys(props)) {
@@ -62,17 +63,19 @@ function applyProperties(props, object, conflicts, updated) {
     for (let opId of opIds) {
       const subpatch = props[key][opId]
       if (conflicts[key] && conflicts[key][opId]) {
-        values[opId] = getValue(subpatch, conflicts[key][opId], updated)
+        values[opId] = getValue(subpatch, conflicts[key][opId], updated, textV2)
       } else {
-        values[opId] = getValue(subpatch, undefined, updated)
+        values[opId] = getValue(subpatch, undefined, updated, textV2)
       }
+      if (textV2 && typeof values[opId] === 'string') values[opId] = new ImmutableString(values[opId])
     }
 
     if (opIds.length === 0) {
       delete object[key]
       delete conflicts[key]
     } else {
-      object[key] = values[opIds[0]]
+      const value = values[opIds[0]]
+      object[key] = textV2 && value instanceof Text ? value.toJSON() : value
       conflicts[key] = values
     }
   }
@@ -95,14 +98,14 @@ function cloneMapObject(originalObject, objectId) {
  * `patch`, or creates a new object if `obj` is undefined. Mutates `updated`
  * to map the objectId to the new object, and returns the new object.
  */
-function updateMapObject(patch, obj, updated) {
+function updateMapObject(patch, obj, updated, textV2) {
   const objectId = patch.objectId
   if (!updated[objectId]) {
     updated[objectId] = cloneMapObject(obj, objectId)
   }
 
   const object = updated[objectId]
-  applyProperties(patch.props, object, object[CONFLICTS], updated)
+  applyProperties(patch.props, object, object[CONFLICTS], updated, textV2)
   return object
 }
 
@@ -111,7 +114,7 @@ function updateMapObject(patch, obj, updated) {
  * `patch`, or creates a new object if `obj` is undefined. Mutates `updated`
  * to map the objectId to the new object, and returns the new object.
  */
-function updateTableObject(patch, obj, updated) {
+function updateTableObject(patch, obj, updated, textV2) {
   const objectId = patch.objectId
   if (!updated[objectId]) {
     updated[objectId] = obj ? obj._clone() : instantiateTable(objectId)
@@ -126,7 +129,7 @@ function updateTableObject(patch, obj, updated) {
       object.remove(key)
     } else if (opIds.length === 1) {
       const subpatch = patch.props[key][opIds[0]]
-      object._set(key, getValue(subpatch, object.byId(key), updated), opIds[0])
+      object._set(key, getValue(subpatch, object.byId(key), updated, textV2), opIds[0])
     } else {
       throw new RangeError('Conflicts are not supported on properties of a table')
     }
@@ -153,7 +156,7 @@ function cloneListObject(originalList, objectId) {
  * `patch`, or creates a new object if `obj` is undefined. Mutates `updated`
  * to map the objectId to the new object, and returns the new object.
  */
-function updateListObject(patch, obj, updated) {
+function updateListObject(patch, obj, updated, textV2) {
   const objectId = patch.objectId
   if (!updated[objectId]) {
     updated[objectId] = cloneListObject(obj, objectId)
@@ -165,7 +168,8 @@ function updateListObject(patch, obj, updated) {
 
     if (edit.action === 'insert' || edit.action === 'update') {
       const oldValue = conflicts[edit.index] && conflicts[edit.index][edit.opId]
-      let lastValue = getValue(edit.value, oldValue, updated)
+      let lastValue = getValue(edit.value, oldValue, updated, textV2)
+      if (textV2 && typeof lastValue === 'string') lastValue = new ImmutableString(lastValue)
       let values = {[edit.opId]: lastValue}
 
       // Successive updates for the same index are an indication of a conflict on that list element.
@@ -176,16 +180,17 @@ function updateListObject(patch, obj, updated) {
         i++
         const conflict = patch.edits[i]
         const oldValue2 = conflicts[conflict.index] && conflicts[conflict.index][conflict.opId]
-        lastValue = getValue(conflict.value, oldValue2, updated)
+        lastValue = getValue(conflict.value, oldValue2, updated, textV2)
+        if (textV2 && typeof lastValue === 'string') lastValue = new ImmutableString(lastValue)
         values[conflict.opId] = lastValue
       }
 
       if (edit.action === 'insert') {
-        list.splice(edit.index, 0, lastValue)
+        list.splice(edit.index, 0, textV2 && lastValue instanceof Text ? lastValue.toJSON() : lastValue)
         conflicts.splice(edit.index, 0, values)
         elemIds.splice(edit.index, 0, edit.elemId)
       } else {
-        list[edit.index] = lastValue
+        list[edit.index] = textV2 && lastValue instanceof Text ? lastValue.toJSON() : lastValue
         conflicts[edit.index] = values
       }
 
@@ -194,9 +199,10 @@ function updateListObject(patch, obj, updated) {
       const datatype = edit.datatype
       edit.values.forEach((value, index) => {
         const elemId = `${startElemId.counter + index}@${startElemId.actorId}`
-        value = getValue({ value, datatype }, undefined, updated)
-        newValues.push(value)
-        newConflicts.push({[elemId]: {value, datatype, type: 'value'}})
+        value = getValue({ value, datatype }, undefined, updated, textV2)
+        const scalar = textV2 && typeof value === 'string' ? new ImmutableString(value) : value
+        newValues.push(scalar)
+        newConflicts.push({[elemId]: {value: scalar, datatype, type: 'value'}})
         newElems.push(elemId)
       })
       list.splice(edit.index, 0, ...newValues)
@@ -217,7 +223,7 @@ function updateListObject(patch, obj, updated) {
  * `patch`, or creates a new object if `obj` is undefined. Mutates `updated`
  * to map the objectId to the new object, and returns the new object.
  */
-function updateTextObject(patch, obj, updated) {
+function updateTextObject(patch, obj, updated, textV2) {
   const objectId = patch.objectId
   let elems
   if (updated[objectId]) {
@@ -230,7 +236,7 @@ function updateTextObject(patch, obj, updated) {
 
   for (const edit of patch.edits) {
     if (edit.action === 'insert') {
-      const value = getValue(edit.value, undefined, updated)
+      const value = getValue(edit.value, undefined, updated, textV2)
       const elem = {elemId: edit.elemId, pred: [edit.opId], value}
       elems.splice(edit.index, 0, elem)
 
@@ -238,7 +244,7 @@ function updateTextObject(patch, obj, updated) {
       const startElemId = parseOpId(edit.elemId)
       const datatype = edit.datatype
       const newElems = edit.values.map((value, index) => {
-        value = getValue({ datatype, value }, undefined, updated)
+        value = getValue({ datatype, value }, undefined, updated, textV2)
         const elemId = `${startElemId.counter + index}@${startElemId.actorId}`
         return {elemId, pred: [elemId], value}
       })
@@ -246,7 +252,7 @@ function updateTextObject(patch, obj, updated) {
 
     } else if (edit.action === 'update') {
       const elemId = elems[edit.index].elemId
-      const value = getValue(edit.value, elems[edit.index].value, updated)
+      const value = getValue(edit.value, elems[edit.index].value, updated, textV2)
       elems[edit.index] = {elemId, pred: [edit.opId], value}
 
     } else if (edit.action === 'remove') {
@@ -263,7 +269,7 @@ function updateTextObject(patch, obj, updated) {
  * Clones a writable copy of `obj` and places it in `updated` (indexed by
  * objectId), if that has not already been done. Returns the updated object.
  */
-function interpretPatch(patch, obj, updated) {
+function interpretPatch(patch, obj, updated, textV2 = false) {
   // Return original object if it already exists and isn't being modified
   if (isObject(obj) && (!patch.props || Object.keys(patch.props).length === 0) &&
       (!patch.edits || patch.edits.length === 0) && !updated[patch.objectId]) {
@@ -271,13 +277,13 @@ function interpretPatch(patch, obj, updated) {
   }
 
   if (patch.type === 'map') {
-    return updateMapObject(patch, obj, updated)
+    return updateMapObject(patch, obj, updated, textV2)
   } else if (patch.type === 'table') {
-    return updateTableObject(patch, obj, updated)
+    return updateTableObject(patch, obj, updated, textV2)
   } else if (patch.type === 'list') {
-    return updateListObject(patch, obj, updated)
+    return updateListObject(patch, obj, updated, textV2)
   } else if (patch.type === 'text') {
-    return updateTextObject(patch, obj, updated)
+    return updateTextObject(patch, obj, updated, textV2)
   } else {
     throw new TypeError(`Unknown object type: ${patch.type}`)
   }
@@ -294,5 +300,5 @@ function cloneRootObject(root) {
 }
 
 module.exports = {
-  interpretPatch, cloneRootObject
+  interpretPatch, cloneRootObject, lamportCompare
 }

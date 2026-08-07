@@ -1,9 +1,9 @@
-declare module 'automerge' {
+declare namespace Automerge {
   /**
    * The return type of `Automerge.init<T>()`, `Automerge.change<T>()`, etc. where `T` is the
    * original type. It is a recursively frozen version of the original type.
    */
-  type Doc<T> = FreezeObject<T>
+  type Doc<T> = {readonly [P in keyof T]: T[P]}
 
   type ChangeFn<T> = (doc: T) => void
 
@@ -17,10 +17,14 @@ declare module 'automerge' {
   type InitOptions<T> =
     | string // = actorId
     | { 
+      actor?: string | null
       actorId?: string
+      allowMissingChanges?: boolean
+      convertImmutableStringsToText?: boolean
       deferActorId?: boolean
       freeze?: boolean
-      patchCallback?: PatchCallback<T>
+      patchCallback?: PatchCallback<T> | LegacyPatchCallback<T>
+      unchecked?: boolean
       observable?: Observable
     }
 
@@ -29,41 +33,102 @@ declare module 'automerge' {
     | {
       message?: string
       time?: number
-      patchCallback?: PatchCallback<T>
+      patchCallback?: PatchCallback<T> | LegacyPatchCallback<T>
     }
 
-  type PatchCallback<T> = (patch: Patch, before: T, after: T, local: boolean, changes: BinaryChange[]) => void
+  type PatchCallback<T> = (patches: Patch[], info: PatchInfo<T>) => void
+  type LegacyPatchCallback<T> = (patch: BackendPatch, before: T, after: T, local: boolean, changes: BinaryChange[]) => void
   type ObserverCallback<T> = (diff: MapDiff | ListDiff | ValueDiff, before: T, after: T, local: boolean, changes: BinaryChange[]) => void
 
   class Observable {
     observe<T>(object: T, callback: ObserverCallback<T>): void
   }
 
-  function merge<T>(localdoc: Doc<T>, remotedoc: Doc<T>): Doc<T>
+  function merge<T>(localdoc: Doc<T>, remotedoc: Doc<T>, options?: ApplyOptions<T>): Doc<T>
 
   function change<T>(doc: Doc<T>, options: ChangeOptions<T>, callback: ChangeFn<T>): Doc<T>
   function change<T>(doc: Doc<T>, callback: ChangeFn<T>): Doc<T>
   function emptyChange<D extends Doc<any>>(doc: D, options?: ChangeOptions<D>): D
-  function applyChanges<T>(doc: Doc<T>, changes: BinaryChange[]): [Doc<T>, Patch]
+  function applyChanges<T>(doc: Doc<T>, changes: BinaryChange[], options?: ApplyOptions<T>): [Doc<T>]
+  function addCommits<T>(doc: Doc<T>, commits: Commit[], options?: ApplyOptions<T>): Doc<T>
+  function addFragments<T>(doc: Doc<T>, fragments: Fragment[], options?: ApplyOptions<T>): Doc<T>
+  function applyPatch(doc: unknown, patch: Patch): void
+  function applyPatches(doc: unknown, patches: Patch[]): void
+  function changeAt<T>(doc: Doc<T>, heads: Heads, options: ChangeOptions<T>, callback: ChangeFn<T>): ChangeAtResult<T>
+  function changeAt<T>(doc: Doc<T>, heads: Heads, callback: ChangeFn<T>): ChangeAtResult<T>
   function equals<T>(val1: T, val2: T): boolean
-  function encodeChange(change: Change): BinaryChange
-  function decodeChange(binaryChange: BinaryChange): Change
+  function encodeChange(change: DecodedChange | ChangeToEncode): Change
+  function decodeChange(binaryChange: Change): DecodedChange
 
   function getActorId<T>(doc: Doc<T>): string
+  function getBackend<T>(doc: Doc<T>): BackendState
   function getAllChanges<T>(doc: Doc<T>): BinaryChange[]
   function getChanges<T>(olddoc: Doc<T>, newdoc: Doc<T>): BinaryChange[]
+  function getChangesMetaSince<T>(doc: Doc<T>, heads: Heads): ChangeMetadata[]
+  function getChangesSince<T>(doc: Doc<T>, heads: Heads): BinaryChange[]
   function getConflicts<T>(doc: Doc<T>, key: keyof T): any
+  function getCursor<T>(doc: Doc<T>, path: Prop[], position: CursorPosition, move?: MoveCursor): Cursor
+  function getCursorPosition<T>(doc: Doc<T>, path: Prop[], cursor: Cursor): number
+  function getHeads<T>(doc: Doc<T>): Heads
   function getHistory<T>(doc: Doc<T>): State<T>[]
-  function getLastLocalChange<T>(doc: Doc<T>): BinaryChange
+  function getLastLocalChange<T>(doc: Doc<T>): Change | undefined
+  function getMissingDeps<T>(doc: Doc<T>, heads?: Heads): Heads
   function getObjectById<T>(doc: Doc<T>, objectId: OpId): any
-  function getObjectId(object: any): OpId
+  function getObjectId(object: any, prop?: Prop): OpId | null
+  function hasHeads<T>(doc: Doc<T>, heads: Heads): boolean
+  function hasOurChanges<T>(doc: Doc<T>, remoteState: SyncState): boolean
+  function inspectChange<T>(doc: Doc<T>, hash: Hash): DecodedChange | null
+  function getFragmentMetadata<T>(doc: Doc<T>, level?: FragmentLevelRange): FragmentMetadata[]
+  function getFragmentMeta<T>(doc: Doc<T>, head: Hash): FragmentMetadata | null
+  function bundleFragmentMetadata<T>(doc: Doc<T>, metadata: FragmentMetadata[]): Uint8Array[]
+  function isAutomerge(value: unknown): boolean
+  function isCounter(value: unknown): value is Counter
+  function stats<T>(doc: Doc<T>): Stats
+  function releaseInfo(): ReleaseInfo
+  function topoHistoryTraversal<T>(doc: Doc<T>): Hash[]
+  function toJS<T>(doc: Doc<T>): T
+  function view<T>(doc: Doc<T>, heads: Heads): Doc<T>
+  function diff<T>(doc: Doc<T>, before: Heads, after: Heads): Patch[]
+  function diffPath<T>(doc: Doc<T>, path: Prop[], before: Heads, after: Heads, options?: DiffOptions): Patch[]
+  function dump<T>(doc: Doc<T>): void
 
   function load<T>(data: BinaryDocument, options?: InitOptions<T>): Doc<T>
+  function loadIncremental<T>(doc: Doc<T>, data: Uint8Array, options?: ApplyOptions<T>): Doc<T>
   function save<T>(doc: Doc<T>): BinaryDocument
+  function saveIncremental<T>(doc: Doc<T>): Uint8Array
+  function saveSince<T>(doc: Doc<T>, heads: Heads): Uint8Array
+  function saveBundle<T>(doc: Doc<T>, hashes: Heads): Uint8Array
+  function readBundle(bundle: Uint8Array): {changes: DecodedChange[], deps: Heads}
 
-  function generateSyncMessage<T>(doc: Doc<T>, syncState: SyncState): [SyncState, BinarySyncMessage?]
-  function receiveSyncMessage<T>(doc: Doc<T>, syncState: SyncState, message: BinarySyncMessage): [Doc<T>, SyncState, Patch?]
-  function initSyncState(): SyncState
+  function generateSyncMessage<T>(doc: Doc<T>, syncState: SyncState): [SyncState, SyncMessage | null]
+  function receiveSyncMessage<T>(doc: Doc<T>, syncState: SyncState, message: SyncMessage, options?: ApplyOptions<T>): [Doc<T>, SyncState, null]
+  function initSyncState(options?: {readOnly?: boolean}): SyncState
+  function encodeSyncMessage(message: DecodedSyncMessage): SyncMessage
+  function decodeSyncMessage(bytes: SyncMessage): DecodedSyncMessage
+  function encodeSyncState(syncState: SyncState): BinarySyncState
+  function decodeSyncState(bytes: BinarySyncState): SyncState
+
+  function insertAt<T>(list: T[], index: number, ...values: T[]): void
+  function deleteAt<T>(list: T[], index: number, numDelete?: number): void
+  function splice<T>(doc: Doc<T>, path: Prop[], index: number | Cursor, del: number, newText?: string): void
+  function updateText<T>(doc: Doc<T>, path: Prop[], newText: string): void
+
+  function initializeWasm(wasm?: unknown): Promise<void>
+  function initializeBase64Wasm(wasm?: string): Promise<void>
+  function wasmInitialized(): Promise<void>
+  function isWasmInitialized(): boolean
+  function use(api: unknown): void
+
+  function mark<T>(doc: Doc<T>, path: Prop[], range: MarkRange, name: string, value: MarkValue): void
+  function unmark<T>(doc: Doc<T>, path: Prop[], range: MarkRange, name: string): void
+  function marks<T>(doc: Doc<T>, path: Prop[]): Mark[]
+  function marksAt<T>(doc: Doc<T>, path: Prop[], index: number): MarkSet
+  function spans<T>(doc: Doc<T>, path: Prop[]): Span[]
+  function updateSpans<T>(doc: Doc<T>, path: Prop[], spans: Span[], config?: UpdateSpansConfig): void
+  function block<T>(doc: Doc<T>, path: Prop[], index: number | Cursor): {[key: string]: MaterializeValue} | null
+  function splitBlock<T>(doc: Doc<T>, path: Prop[], index: number | Cursor, block: {[key: string]: MaterializeValue}): void
+  function joinBlock<T>(doc: Doc<T>, path: Prop[], index: number | Cursor): void
+  function updateBlock<T>(doc: Doc<T>, path: Prop[], index: number | Cursor, block: {[key: string]: MaterializeValue}): void
 
   // custom CRDT types
 
@@ -71,7 +136,7 @@ declare module 'automerge' {
     readonly id: UUID
   }
 
-  class Table<T> {
+  class Table<T> extends Array<T & TableRow> {
     constructor()
     add(item: T): UUID
     byId(id: UUID): T & TableRow
@@ -82,8 +147,8 @@ declare module 'automerge' {
   }
 
   class List<T> extends Array<T> {
-    insertAt?(index: number, ...args: T[]): List<T>
-    deleteAt?(index: number, numDelete?: number): List<T>
+    insertAt(index: number, ...args: T[]): List<T>
+    deleteAt(index: number, numDelete?: number): List<T>
   }
 
   class Text extends List<string> {
@@ -91,6 +156,19 @@ declare module 'automerge' {
     get(index: number): string
     toSpans<T>(): (string | T)[]
   }
+
+  class ImmutableString {
+    constructor(value: string)
+    readonly val: string
+    toJSON(): string
+    toString(): string
+    valueOf(): string
+  }
+
+  const RawString: typeof ImmutableString
+  type RawString = ImmutableString
+  function isImmutableString(value: unknown): value is ImmutableString
+  function isRawString(value: unknown): value is ImmutableString
 
   // Note that until https://github.com/Microsoft/TypeScript/issues/2361 is addressed, we
   // can't treat a Counter like a literal number without force-casting it as a number.
@@ -120,16 +198,16 @@ declare module 'automerge' {
   // Front & back
 
   namespace Frontend {
-    function applyPatch<T>(doc: Doc<T>, patch: Patch, backendState?: BackendState): Doc<T>
-    function change<T>(doc: Doc<T>, message: string | undefined, callback: ChangeFn<T>): [Doc<T>, Change]
-    function change<T>(doc: Doc<T>, callback: ChangeFn<T>): [Doc<T>, Change]
-    function emptyChange<T>(doc: Doc<T>, message?: string): [Doc<T>, Change]
-    function from<T>(initialState: T | Doc<T>, options?: InitOptions<T>): [Doc<T>, Change]
+    function applyPatch<T>(doc: Doc<T>, patch: BackendPatch, backendState?: BackendState): Doc<T>
+    function change<T>(doc: Doc<T>, message: string | undefined, callback: ChangeFn<T>): [Doc<T>, DecodedChange]
+    function change<T>(doc: Doc<T>, callback: ChangeFn<T>): [Doc<T>, DecodedChange]
+    function emptyChange<T>(doc: Doc<T>, message?: string): [Doc<T>, DecodedChange]
+    function from<T>(initialState: T | Doc<T>, options?: InitOptions<T>): [Doc<T>, DecodedChange]
     function getActorId<T>(doc: Doc<T>): string
     function getBackendState<T>(doc: Doc<T>): BackendState
     function getConflicts<T>(doc: Doc<T>, key: keyof T): any
     function getElementIds(list: any): string[]
-    function getLastLocalChange<T>(doc: Doc<T>): BinaryChange
+    function getLastLocalChange<T>(doc: Doc<T>): BinaryChange | undefined
     function getObjectById<T>(doc: Doc<T>, objectId: OpId): Doc<T>
     function getObjectId<T>(doc: Doc<T>): OpId
     function init<T>(options?: InitOptions<T>): Doc<T>
@@ -137,8 +215,8 @@ declare module 'automerge' {
   }
 
   namespace Backend {
-    function applyChanges(state: BackendState, changes: BinaryChange[]): [BackendState, Patch]
-    function applyLocalChange(state: BackendState, change: Change): [BackendState, Patch, BinaryChange]
+    function applyChanges(state: BackendState, changes: BinaryChange[]): [BackendState, BackendPatch]
+    function applyLocalChange(state: BackendState, change: DecodedChange): [BackendState, BackendPatch, BinaryChange]
     function clone(state: BackendState): BackendState
     function free(state: BackendState): void
     function getAllChanges(state: BackendState): BinaryChange[]
@@ -147,16 +225,16 @@ declare module 'automerge' {
     function getChangesAdded(state1: BackendState, state2: BackendState): BinaryChange[]
     function getHeads(state: BackendState): Hash[]
     function getMissingDeps(state: BackendState, heads?: Hash[]): Hash[]
-    function getPatch(state: BackendState): Patch
+    function getPatch(state: BackendState): BackendPatch
     function init(): BackendState
     function load(data: BinaryDocument): BackendState
     function loadChanges(state: BackendState, changes: BinaryChange[]): BackendState
     function save(state: BackendState): BinaryDocument
     function generateSyncMessage(state: BackendState, syncState: SyncState): [SyncState, BinarySyncMessage?]
-    function receiveSyncMessage(state: BackendState, syncState: SyncState, message: BinarySyncMessage): [BackendState, SyncState, Patch?]
-    function encodeSyncMessage(message: SyncMessage): BinarySyncMessage
-    function decodeSyncMessage(bytes: BinarySyncMessage): SyncMessage
-    function initSyncState(): SyncState
+    function receiveSyncMessage(state: BackendState, syncState: SyncState, message: BinarySyncMessage): [BackendState, SyncState, BackendPatch?]
+    function encodeSyncMessage(message: DecodedSyncMessage): BinarySyncMessage
+    function decodeSyncMessage(bytes: BinarySyncMessage): DecodedSyncMessage
+    function initSyncState(options?: {readOnly?: boolean}): SyncState
     function encodeSyncState(syncState: SyncState): BinarySyncState
     function decodeSyncState(bytes: BinarySyncState): SyncState
   }
@@ -164,7 +242,14 @@ declare module 'automerge' {
   // Internals
 
   type Hash = string // 64-digit hex string
+  type Heads = Hash[]
+  type Prop = string | number
+  type Cursor = string
+  type CursorPosition = number | 'start' | 'end'
+  type MoveCursor = 'before' | 'after'
   type OpId = string // of the form `${counter}@${actorId}`
+  type ActorId = string
+  type ObjID = OpId
 
   type UUID = string
   type UUIDGenerator = () => UUID
@@ -179,28 +264,134 @@ declare module 'automerge' {
   }
 
   interface State<T> {
-    change: Change
+    change: DecodedChange
     snapshot: T
   }
+
+  interface ApplyOptions<T> {
+    patchCallback?: PatchCallback<T> | LegacyPatchCallback<T>
+  }
+
+  type PatchSource =
+    | 'from'
+    | 'emptyChange'
+    | 'change'
+    | 'changeAt'
+    | 'merge'
+    | 'loadIncremental'
+    | 'applyChanges'
+    | 'receiveSyncMessage'
+    | 'addCommits'
+    | 'addFragments'
+
+  interface PatchInfo<T> {
+    before: Doc<T>
+    after: Doc<T>
+    source: PatchSource
+  }
+
+  interface ChangeAtResult<T> {
+    newDoc: Doc<T>
+    newHeads: Heads | null
+  }
+
+  interface ChangeMetadata {
+    actor: string
+    deps: Heads
+    hash: Hash
+    maxOp: number
+    message: string | null
+    seq: number
+    startOp: number
+    time: number
+  }
+
+  interface Stats {
+    cargoPackageName: string
+    cargoPackageVersion: string
+    numActors: number
+    numChanges: number
+    numOps: number
+    rustcVersion: string
+  }
+
+  interface DiffOptions {
+    recursive?: boolean
+  }
+
+  interface JsReleaseInfo {gitHead: string}
+
+  interface WasmReleaseInfo {
+    gitHead: string
+    cargoPackageName: string
+    cargoPackageVersion: string
+    rustcVersion: string
+  }
+
+  interface ReleaseInfo {js: JsReleaseInfo; wasm: WasmReleaseInfo | null}
+
+  type FragmentLevelRange = number | {
+    start?: number
+    end?: number
+  } | null
+
+  interface FragmentMetadata {
+    head: Hash
+    level: number
+    boundary: Heads
+    checkpoints: Heads
+    members: Heads
+  }
+
+  type FragmentMeta = FragmentMetadata
+
+  interface Commit {
+    head: Hash
+    parents: Heads
+    bytes: Uint8Array
+  }
+
+  interface Fragment extends FragmentMetadata {
+    bytes: Uint8Array
+  }
+
+  type CommitBundle = Commit
+  type FragmentBundle = Fragment
+
+  function getCommits<T>(doc: Doc<T>): Commit[]
+  function getFragments<T>(doc: Doc<T>, levels?: FragmentLevelRange): Fragment[]
 
   interface BackendState {
     // no public methods or properties
   }
 
-  type BinaryChange = Uint8Array & { __binaryChange: true }
-  type BinaryDocument = Uint8Array & { __binaryDocument: true }
-  type BinarySyncState = Uint8Array & { __binarySyncState: true }
-  type BinarySyncMessage = Uint8Array & { __binarySyncMessage: true }
+  type Change = Uint8Array
+  type BinaryChange = Change
+  type BinaryDocument = Uint8Array
+  type BinarySyncState = Uint8Array
+  type BinarySyncMessage = Uint8Array
 
   interface SyncState {
     // no public methods or properties
+    sharedHeads: Heads
+    lastSentHeads: Heads
+    theirHeads: Heads | null
+    theirNeed: Heads | null
+    theirHave: SyncHave[] | null
+    sentHashes: {[hash: string]: boolean}
+    readOnly?: boolean
+    peerReadOnly?: boolean
   }
 
-  interface SyncMessage {
+  type SyncMessage = Uint8Array
+
+  interface DecodedSyncMessage {
     heads: Hash[]
     need: Hash[]
     have: SyncHave[]
-    changes: BinaryChange[]
+    changes: Change[]
+    type?: 'v1' | 'v2'
+    supportedCapabilities?: string[]
   }
 
   interface SyncHave {
@@ -208,32 +399,122 @@ declare module 'automerge' {
     bloom: Uint8Array
   }
 
-  interface Change {
-    message: string
+  interface DecodedChange {
+    message: string | null
     actor: string
     time: number
     seq: number
     startOp: number
-    hash?: Hash
+    hash: Hash
     deps: Hash[]
     ops: Op[]
   }
 
+  type ChangeToEncode = Omit<DecodedChange, 'hash'> & {hash?: Hash}
+  type API = any
+
   interface Op {
-    action: OpAction
+    action: string
     obj: OpId
-    key: string | number
-    insert: boolean
+    key?: string | number
+    insert?: boolean
     elemId?: OpId
     child?: OpId
-    value?: number | boolean | string | null
+    value?: number | boolean | string | null | number[] | Uint8Array
     datatype?: DataType
     pred?: OpId[]
     values?: (number | boolean | string | null)[]
     multiOp?: number
   }
 
-  interface Patch {
+  type MarkValue = string | number | null | boolean | Date | Uint8Array
+
+  interface MarkSet {
+    [name: string]: MarkValue
+  }
+
+  interface Mark {
+    name: string
+    value: MarkValue
+    start: number
+    end: number
+  }
+
+  interface MarkRange {
+    expand?: 'before' | 'after' | 'both' | 'none'
+    start: number
+    end: number
+  }
+
+  type ScalarValue = string | number | null | boolean | Date | Counter | Uint8Array | ImmutableString
+  type AutomergeValue = ScalarValue | {[key: string]: AutomergeValue} | AutomergeValue[]
+  type MapValue = {[key: string]: AutomergeValue}
+  type ListValue = AutomergeValue[]
+  type MaterializeValue = {[key: string]: MaterializeValue} | MaterializeValue[] | ScalarValue
+  type Conflicts = {[opId: string]: AutomergeValue}
+  type Span = {type: 'text', value: string, marks?: MarkSet} | {type: 'block', value: {[key: string]: MaterializeValue}}
+  type UpdateSpansConfig = {
+    defaultExpand?: 'before' | 'after' | 'both' | 'none'
+    perMarkExpand?: {[key: string]: 'before' | 'after' | 'both' | 'none'}
+  }
+
+  type Patch = PutPatch | DelPatch | SpliceTextPatch | IncPatch | InsertPatch | MarkPatch | UnmarkPatch | ConflictPatch
+  type PatchValue = string | number | boolean | null | Date | Uint8Array | Counter | Text | {[key: string]: any} | any[]
+
+  interface PutPatch {
+    action: 'put'
+    path: Prop[]
+    value: PatchValue
+    conflict?: boolean
+  }
+
+  interface DelPatch {
+    action: 'del'
+    path: Prop[]
+    length?: number
+  }
+
+  interface SpliceTextPatch {
+    action: 'splice'
+    path: Prop[]
+    value: string
+    marks?: MarkSet
+  }
+
+  interface IncPatch {
+    action: 'inc'
+    path: Prop[]
+    value: number
+  }
+
+  interface InsertPatch {
+    action: 'insert'
+    path: Prop[]
+    values: PatchValue[]
+    marks?: MarkSet
+    conflicts?: boolean[]
+  }
+
+  interface MarkPatch {
+    action: 'mark'
+    path: Prop[]
+    marks: Mark[]
+  }
+
+  interface UnmarkPatch {
+    action: 'unmark'
+    path: Prop[]
+    name: string
+    start: number
+    end: number
+  }
+
+  interface ConflictPatch {
+    action: 'conflict'
+    path: Prop[]
+  }
+
+  interface BackendPatch {
     actor?: string
     seq?: number
     pendingChanges: number
@@ -324,6 +605,8 @@ declare module 'automerge' {
     | 'makeTable'
     | 'makeList'
     | 'makeMap'
+    | 'markBegin'
+    | 'markEnd'
 
   type CollectionType =
     | 'list' //..
@@ -337,6 +620,7 @@ declare module 'automerge' {
     | 'float64'
     | 'counter'
     | 'timestamp'
+    | 'bytes'
 
   // TYPE UTILITY FUNCTIONS
 
@@ -360,4 +644,199 @@ declare module 'automerge' {
   interface FreezeArray<T> extends ReadonlyArray<Freeze<T>> {}
   interface FreezeMap<K, V> extends ReadonlyMap<Freeze<K>, Freeze<V>> {}
   type FreezeObject<T> = { readonly [P in keyof T]: Freeze<T[P]> }
+
 }
+
+export import Doc = Automerge.Doc
+export import ChangeFn = Automerge.ChangeFn
+export import init = Automerge.init
+export import from = Automerge.from
+export import clone = Automerge.clone
+export import free = Automerge.free
+export import InitOptions = Automerge.InitOptions
+export import ChangeOptions = Automerge.ChangeOptions
+export import PatchCallback = Automerge.PatchCallback
+export import LegacyPatchCallback = Automerge.LegacyPatchCallback
+export import ObserverCallback = Automerge.ObserverCallback
+export import Observable = Automerge.Observable
+export import merge = Automerge.merge
+export import change = Automerge.change
+export import emptyChange = Automerge.emptyChange
+export import applyChanges = Automerge.applyChanges
+export import addCommits = Automerge.addCommits
+export import addFragments = Automerge.addFragments
+export import applyPatch = Automerge.applyPatch
+export import applyPatches = Automerge.applyPatches
+export import changeAt = Automerge.changeAt
+export import equals = Automerge.equals
+export import encodeChange = Automerge.encodeChange
+export import decodeChange = Automerge.decodeChange
+export import getActorId = Automerge.getActorId
+export import getBackend = Automerge.getBackend
+export import getAllChanges = Automerge.getAllChanges
+export import getChanges = Automerge.getChanges
+export import getChangesMetaSince = Automerge.getChangesMetaSince
+export import getChangesSince = Automerge.getChangesSince
+export import getConflicts = Automerge.getConflicts
+export import getCursor = Automerge.getCursor
+export import getCursorPosition = Automerge.getCursorPosition
+export import getHeads = Automerge.getHeads
+export import getHistory = Automerge.getHistory
+export import getLastLocalChange = Automerge.getLastLocalChange
+export import getMissingDeps = Automerge.getMissingDeps
+export import getObjectById = Automerge.getObjectById
+export import getObjectId = Automerge.getObjectId
+export import hasHeads = Automerge.hasHeads
+export import hasOurChanges = Automerge.hasOurChanges
+export import inspectChange = Automerge.inspectChange
+export import getFragmentMetadata = Automerge.getFragmentMetadata
+export import getFragmentMeta = Automerge.getFragmentMeta
+export import bundleFragmentMetadata = Automerge.bundleFragmentMetadata
+export import isAutomerge = Automerge.isAutomerge
+export import isCounter = Automerge.isCounter
+export import stats = Automerge.stats
+export import releaseInfo = Automerge.releaseInfo
+export import topoHistoryTraversal = Automerge.topoHistoryTraversal
+export import toJS = Automerge.toJS
+export import view = Automerge.view
+export import diff = Automerge.diff
+export import diffPath = Automerge.diffPath
+export import dump = Automerge.dump
+export import load = Automerge.load
+export import loadIncremental = Automerge.loadIncremental
+export import save = Automerge.save
+export import saveIncremental = Automerge.saveIncremental
+export import saveSince = Automerge.saveSince
+export import saveBundle = Automerge.saveBundle
+export import readBundle = Automerge.readBundle
+export import generateSyncMessage = Automerge.generateSyncMessage
+export import receiveSyncMessage = Automerge.receiveSyncMessage
+export import initSyncState = Automerge.initSyncState
+export import encodeSyncMessage = Automerge.encodeSyncMessage
+export import decodeSyncMessage = Automerge.decodeSyncMessage
+export import encodeSyncState = Automerge.encodeSyncState
+export import decodeSyncState = Automerge.decodeSyncState
+export import insertAt = Automerge.insertAt
+export import deleteAt = Automerge.deleteAt
+export import splice = Automerge.splice
+export import updateText = Automerge.updateText
+export import initializeWasm = Automerge.initializeWasm
+export import initializeBase64Wasm = Automerge.initializeBase64Wasm
+export import wasmInitialized = Automerge.wasmInitialized
+export import isWasmInitialized = Automerge.isWasmInitialized
+export import use = Automerge.use
+export import mark = Automerge.mark
+export import unmark = Automerge.unmark
+export import marks = Automerge.marks
+export import marksAt = Automerge.marksAt
+export import spans = Automerge.spans
+export import updateSpans = Automerge.updateSpans
+export import block = Automerge.block
+export import splitBlock = Automerge.splitBlock
+export import joinBlock = Automerge.joinBlock
+export import updateBlock = Automerge.updateBlock
+export import TableRow = Automerge.TableRow
+export import Table = Automerge.Table
+export import List = Automerge.List
+export import Text = Automerge.Text
+export import ImmutableString = Automerge.ImmutableString
+export import RawString = Automerge.RawString
+export import isImmutableString = Automerge.isImmutableString
+export import isRawString = Automerge.isRawString
+export import Counter = Automerge.Counter
+export import Int = Automerge.Int
+export import Uint = Automerge.Uint
+export import Float64 = Automerge.Float64
+export import ReadonlyTable = Automerge.ReadonlyTable
+export import ReadonlyList = Automerge.ReadonlyList
+export import ReadonlyText = Automerge.ReadonlyText
+export import Frontend = Automerge.Frontend
+export import Backend = Automerge.Backend
+export import Hash = Automerge.Hash
+export import Heads = Automerge.Heads
+export import Prop = Automerge.Prop
+export import Cursor = Automerge.Cursor
+export import CursorPosition = Automerge.CursorPosition
+export import MoveCursor = Automerge.MoveCursor
+export import OpId = Automerge.OpId
+export import ActorId = Automerge.ActorId
+export import ObjID = Automerge.ObjID
+export import UUID = Automerge.UUID
+export import UUIDGenerator = Automerge.UUIDGenerator
+export import UUIDFactory = Automerge.UUIDFactory
+export import uuid = Automerge.uuid
+export import Clock = Automerge.Clock
+export import State = Automerge.State
+export import ApplyOptions = Automerge.ApplyOptions
+export import PatchSource = Automerge.PatchSource
+export import PatchInfo = Automerge.PatchInfo
+export import ChangeAtResult = Automerge.ChangeAtResult
+export import ChangeMetadata = Automerge.ChangeMetadata
+export import Stats = Automerge.Stats
+export import DiffOptions = Automerge.DiffOptions
+export import ReleaseInfo = Automerge.ReleaseInfo
+export import JsReleaseInfo = Automerge.JsReleaseInfo
+export import WasmReleaseInfo = Automerge.WasmReleaseInfo
+export import FragmentLevelRange = Automerge.FragmentLevelRange
+export import FragmentMetadata = Automerge.FragmentMetadata
+export import FragmentMeta = Automerge.FragmentMeta
+export import Commit = Automerge.Commit
+export import Fragment = Automerge.Fragment
+export import CommitBundle = Automerge.CommitBundle
+export import FragmentBundle = Automerge.FragmentBundle
+export import getCommits = Automerge.getCommits
+export import getFragments = Automerge.getFragments
+export import BackendState = Automerge.BackendState
+export import BinaryChange = Automerge.BinaryChange
+export import BinaryDocument = Automerge.BinaryDocument
+export import BinarySyncState = Automerge.BinarySyncState
+export import BinarySyncMessage = Automerge.BinarySyncMessage
+export import SyncState = Automerge.SyncState
+export import SyncMessage = Automerge.SyncMessage
+export import DecodedSyncMessage = Automerge.DecodedSyncMessage
+export import SyncHave = Automerge.SyncHave
+export import Change = Automerge.Change
+export import DecodedChange = Automerge.DecodedChange
+export import ChangeToEncode = Automerge.ChangeToEncode
+export import API = Automerge.API
+export import Op = Automerge.Op
+export import MarkValue = Automerge.MarkValue
+export import MarkSet = Automerge.MarkSet
+export import Mark = Automerge.Mark
+export import MarkRange = Automerge.MarkRange
+export import ScalarValue = Automerge.ScalarValue
+export import AutomergeValue = Automerge.AutomergeValue
+export import MapValue = Automerge.MapValue
+export import ListValue = Automerge.ListValue
+export import MaterializeValue = Automerge.MaterializeValue
+export import Conflicts = Automerge.Conflicts
+export import Span = Automerge.Span
+export import UpdateSpansConfig = Automerge.UpdateSpansConfig
+export import Patch = Automerge.Patch
+export import PatchValue = Automerge.PatchValue
+export import PutPatch = Automerge.PutPatch
+export import DelPatch = Automerge.DelPatch
+export import SpliceTextPatch = Automerge.SpliceTextPatch
+export import IncPatch = Automerge.IncPatch
+export import InsertPatch = Automerge.InsertPatch
+export import MarkPatch = Automerge.MarkPatch
+export import UnmarkPatch = Automerge.UnmarkPatch
+export import ConflictPatch = Automerge.ConflictPatch
+export import BackendPatch = Automerge.BackendPatch
+export import MapDiff = Automerge.MapDiff
+export import ListDiff = Automerge.ListDiff
+export import SingleInsertEdit = Automerge.SingleInsertEdit
+export import MultiInsertEdit = Automerge.MultiInsertEdit
+export import UpdateEdit = Automerge.UpdateEdit
+export import RemoveEdit = Automerge.RemoveEdit
+export import ValueDiff = Automerge.ValueDiff
+export import OpAction = Automerge.OpAction
+export import CollectionType = Automerge.CollectionType
+export import DataType = Automerge.DataType
+export import Freeze = Automerge.Freeze
+export import FreezeTable = Automerge.FreezeTable
+export import FreezeList = Automerge.FreezeList
+export import FreezeArray = Automerge.FreezeArray
+export import FreezeMap = Automerge.FreezeMap
+export import FreezeObject = Automerge.FreezeObject
+export import next = Automerge

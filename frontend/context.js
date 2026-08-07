@@ -1,10 +1,11 @@
-const { CACHE, OBJECT_ID, CONFLICTS, ELEM_IDS, STATE } = require('./constants')
+const { CACHE, OBJECT_ID, CONFLICTS, ELEM_IDS, STATE, OPTIONS } = require('./constants')
 const { interpretPatch } = require('./apply_patch')
 const { Text } = require('./text')
 const { Table } = require('./table')
 const { Counter, getWriteableCounter } = require('./counter')
 const { Int, Uint, Float64 } = require('./numbers')
 const { isObject, parseOpId, createArrayOfNulls } = require('../src/common')
+const { isImmutableString } = require('../src/immutable_string')
 const uuid = require('../src/uuid')
 
 
@@ -20,7 +21,8 @@ class Context {
     this.cache = doc[CACHE]
     this.updated = {}
     this.ops = []
-    this.applyPatch = applyPatch ? applyPatch : interpretPatch
+    this.textV2 = !!(doc[OPTIONS] && doc[OPTIONS].textV2)
+    this.applyPatch = applyPatch || ((patch, object, updated) => interpretPatch(patch, object, updated, this.textV2))
   }
 
   /**
@@ -54,7 +56,11 @@ class Context {
     }
 
     if (isObject(value)) {
-      if (value instanceof Date) {
+      if (isImmutableString(value)) {
+        return {type: 'value', value: value.val}
+      } else if (ArrayBuffer.isView(value)) {
+        return {type: 'value', value: new Uint8Array(value.buffer, value.byteOffset, value.byteLength)}
+      } else if (value instanceof Date) {
         // Date object, represented as milliseconds since epoch
         return {type: 'value', value: value.getTime(), datatype: 'timestamp'}
 
@@ -205,7 +211,7 @@ class Context {
     if (object[key] instanceof Counter) {
       return getWriteableCounter(object[key].value, this, path, objectId, key)
 
-    } else if (isObject(object[key])) {
+    } else if (isObject(object[key]) && object[key][OBJECT_ID] && !ArrayBuffer.isView(object[key])) {
       const childId = object[key][OBJECT_ID]
       const subpath = path.concat([{key, objectId: childId}])
       // The instantiateObject function is added to the context object by rootObjectProxy()
@@ -286,15 +292,15 @@ class Context {
    * `{objectId, type, props}` if `value` is an object, or `{value, datatype}` if it is a
    * primitive value. For string, number, boolean, or null the datatype is omitted.
    */
-  setValue(objectId, key, value, insert, pred, elemId) {
+  setValue(objectId, key, value, insert, pred, elemId, stringValue = false) {
     if (!objectId) {
       throw new RangeError('setValue needs an objectId')
     }
-    if (key === '') {
-      throw new RangeError('The key of a map entry must not be an empty string')
-    }
-
-    if (isObject(value) && !(value instanceof Date) && !(value instanceof Counter) && !(value instanceof Int) && !(value instanceof Uint) && !(value instanceof Float64)) {
+    if (typeof value === 'string' && this.textV2 && !stringValue) {
+      return this.createNestedObjects(objectId, key, new Text(value), insert, pred, elemId)
+    } else if (isObject(value) && !isImmutableString(value) && !ArrayBuffer.isView(value) && !(value instanceof Date) &&
+        !(value instanceof Counter) && !(value instanceof Int) && !(value instanceof Uint) &&
+        !(value instanceof Float64)) {
       // Nested object (map, list, text, or table)
       return this.createNestedObjects(objectId, key, value, insert, pred, elemId)
     } else {
@@ -375,8 +381,11 @@ class Context {
     if (values.length === 0) return
 
     let elemId = getElemId(list, index, true)
-    const allPrimitive = values.every(v => typeof v === 'string' || typeof v === 'number' ||
+    const stringValues = subpatch.type === 'text' || !this.textV2
+    const allPrimitive = values.every(v => stringValues && typeof v === 'string' || typeof v === 'number' ||
                                            typeof v === 'boolean' || v === null ||
+                                           isImmutableString(v) ||
+                                           ArrayBuffer.isView(v) ||
                                            (isObject(v) && (v instanceof Date || v instanceof Counter || v instanceof Int ||
                                                             v instanceof Uint || v instanceof Float64)))
     const allValueDescriptions = allPrimitive ? values.map(v => this.getValueDescription(v)) : []
@@ -397,7 +406,7 @@ class Context {
     } else {
       for (let offset = 0; offset < values.length; offset++) {
         let nextElemId = this.nextOpId()
-        const valuePatch = this.setValue(subpatch.objectId, index + offset, values[offset], true, [], elemId)
+        const valuePatch = this.setValue(subpatch.objectId, index + offset, values[offset], true, [], elemId, subpatch.type === 'text')
         elemId = nextElemId
         subpatch.edits.push({action: 'insert', index: index + offset, elemId, opId: elemId, value: valuePatch})
       }

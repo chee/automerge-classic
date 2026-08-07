@@ -11,6 +11,14 @@
     "parserOptions": {
         "ecmaVersion": 2015
     },
+    "overrides": [
+        {
+            "files": ["*.mjs"],
+            "parserOptions": {
+                "sourceType": "module"
+            }
+        }
+    ],
     "rules": {
         "accessor-pairs": "error",
         "array-bracket-newline": "off",

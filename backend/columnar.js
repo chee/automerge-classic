@@ -49,9 +49,11 @@ const VALUE_TYPE = {
 }
 
 // make* actions must be at even-numbered indexes in this list
-const ACTIONS = ['makeMap', 'set', 'makeList', 'del', 'makeText', 'inc', 'makeTable', 'link']
+const ACTIONS = ['makeMap', 'set', 'makeList', 'del', 'makeText', 'inc', 'makeTable', 'mark']
 
 const OBJECT_TYPE = {makeMap: 'map', makeList: 'list', makeText: 'text', makeTable: 'table'}
+const UNKNOWN_COLUMNS = Symbol('unknownColumns')
+const RAW_VALUE = Symbol('rawValue')
 
 const COMMON_COLUMNS = [
   {columnName: 'objActor',  columnId: 0 << 4 | COLUMN_TYPE.ACTOR_ID},
@@ -72,13 +74,17 @@ const COMMON_COLUMNS = [
 const CHANGE_COLUMNS = COMMON_COLUMNS.concat([
   {columnName: 'predNum',   columnId: 7 << 4 | COLUMN_TYPE.GROUP_CARD},
   {columnName: 'predActor', columnId: 7 << 4 | COLUMN_TYPE.ACTOR_ID},
-  {columnName: 'predCtr',   columnId: 7 << 4 | COLUMN_TYPE.INT_DELTA}
+  {columnName: 'predCtr',   columnId: 7 << 4 | COLUMN_TYPE.INT_DELTA},
+  {columnName: 'expand',    columnId: 9 << 4 | COLUMN_TYPE.BOOLEAN},
+  {columnName: 'markName',  columnId: 10 << 4 | COLUMN_TYPE.STRING_RLE}
 ])
 
 const DOC_OPS_COLUMNS = COMMON_COLUMNS.concat([
   {columnName: 'succNum',   columnId: 8 << 4 | COLUMN_TYPE.GROUP_CARD},
   {columnName: 'succActor', columnId: 8 << 4 | COLUMN_TYPE.ACTOR_ID},
-  {columnName: 'succCtr',   columnId: 8 << 4 | COLUMN_TYPE.INT_DELTA}
+  {columnName: 'succCtr',   columnId: 8 << 4 | COLUMN_TYPE.INT_DELTA},
+  {columnName: 'expand',    columnId: 9 << 4 | COLUMN_TYPE.BOOLEAN},
+  {columnName: 'markName',  columnId: 10 << 4 | COLUMN_TYPE.STRING_RLE}
 ])
 
 const DOCUMENT_COLUMNS = [
@@ -101,8 +107,8 @@ const DOCUMENT_COLUMNS = [
 function actorIdToActorNum(opId, actorIds) {
   if (!opId || !opId.actorId) return opId
   const counter = opId.counter
-  const actorNum = actorIds.indexOf(opId.actorId)
-  if (actorNum < 0) throw new RangeError('missing actorId') // should not happen
+  const actorNum = actorIds instanceof Map ? actorIds.get(opId.actorId) : actorIds.indexOf(opId.actorId)
+  if (actorNum === undefined || actorNum < 0) throw new RangeError('missing actorId') // should not happen
   return {counter, actorNum, actorId: opId.actorId}
 }
 
@@ -130,14 +136,18 @@ function compareParsedOpIds(id1, id2) {
  * the author of the change itself. This special-casing is omitted if `single` is
  * false.
  */
-function parseAllOpIds(changes, single) {
+function parseAllOpIds(changes, single, actorOrder) {
   const actors = {}, newChanges = []
   for (let change of changes) {
     change = copyObject(change)
     actors[change.actor] = true
     change.ops = expandMultiOps(change.ops, change.startOp, change.actor)
     change.ops = change.ops.map(op => {
+      const unknownColumns = op[UNKNOWN_COLUMNS]
+      const rawValue = op[RAW_VALUE]
       op = copyObject(op)
+      if (unknownColumns) op[UNKNOWN_COLUMNS] = unknownColumns
+      if (rawValue) op[RAW_VALUE] = rawValue
       if (op.obj !== '_root') op.obj = parseOpId(op.obj)
       if (op.elemId && op.elemId !== '_head') op.elemId = parseOpId(op.elemId)
       if (op.child) op.child = parseOpId(op.child)
@@ -146,24 +156,50 @@ function parseAllOpIds(changes, single) {
       if (op.elemId && op.elemId.actorId) actors[op.elemId.actorId] = true
       if (op.child && op.child.actorId) actors[op.child.actorId] = true
       for (let pred of op.pred) actors[pred.actorId] = true
+      if (unknownColumns) {
+        for (const [columnId, value] of Object.entries(unknownColumns)) {
+          if ((Number(columnId) & 7) !== COLUMN_TYPE.ACTOR_ID) continue
+          for (const actor of Array.isArray(value) ? value : [value]) {
+            if (actor !== null) actors[actor] = true
+          }
+        }
+      }
       return op
     })
     newChanges.push(change)
   }
 
-  let actorIds = Object.keys(actors).sort()
+  let actorIds
+  if (Array.isArray(actorOrder)) {
+    const remaining = new Set(Object.keys(actors))
+    actorIds = actorOrder.filter(actor => remaining.delete(actor))
+    if (remaining.size > 0) throw new RangeError(`Missing actors: ${Array.from(remaining).join(', ')}`)
+  } else {
+    actorIds = Object.keys(actors).sort()
+  }
   if (single) {
     actorIds = [changes[0].actor].concat(actorIds.filter(actor => actor !== changes[0].actor))
   }
+  const actorIndex = new Map(actorIds.map((actor, index) => [actor, index]))
   for (let change of newChanges) {
-    change.actorNum = actorIds.indexOf(change.actor)
+    change.actorNum = actorIndex.get(change.actor)
     for (let i = 0; i < change.ops.length; i++) {
       let op = change.ops[i]
       op.id = {counter: change.startOp + i, actorNum: change.actorNum, actorId: change.actor}
-      op.obj = actorIdToActorNum(op.obj, actorIds)
-      op.elemId = actorIdToActorNum(op.elemId, actorIds)
-      op.child = actorIdToActorNum(op.child, actorIds)
-      op.pred = op.pred.map(pred => actorIdToActorNum(pred, actorIds))
+      op.obj = actorIdToActorNum(op.obj, actorIndex)
+      op.elemId = actorIdToActorNum(op.elemId, actorIndex)
+      op.child = actorIdToActorNum(op.child, actorIndex)
+      op.pred = op.pred.map(pred => actorIdToActorNum(pred, actorIndex))
+      if (op[UNKNOWN_COLUMNS]) {
+        const columns = {}
+        for (const [columnId, value] of Object.entries(op[UNKNOWN_COLUMNS])) {
+          columns[columnId] = (Number(columnId) & 7) === COLUMN_TYPE.ACTOR_ID
+            ? (Array.isArray(value) ? value.map(actor => (actor === null ? null : actorIndex.get(actor)))
+              : value === null ? null : actorIndex.get(value))
+            : value
+        }
+        op[UNKNOWN_COLUMNS] = columns
+      }
     }
   }
   return {changes: newChanges, actorIds}
@@ -190,7 +226,7 @@ function encodeObjectId(op, columns) {
  * columns `keyActor`, `keyCtr`, and `keyStr`.
  */
 function encodeOperationKey(op, columns) {
-  if (op.key) {
+  if (op.key !== undefined) {
     columns.keyActor.appendValue(null)
     columns.keyCtr.appendValue(null)
     columns.keyStr.appendValue(op.key)
@@ -211,7 +247,9 @@ function encodeOperationKey(op, columns) {
  * Encodes the `action` property of operation `op` into the `action` column.
  */
 function encodeOperationAction(op, columns) {
-  const actionCode = ACTIONS.indexOf(op.action)
+  const actionCode = op.action === 'markBegin' || op.action === 'markEnd'
+    ? ACTIONS.indexOf('mark')
+    : ACTIONS.indexOf(op.action)
   if (actionCode >= 0) {
     columns.action.appendValue(actionCode)
   } else if (typeof op.action === 'number') {
@@ -257,7 +295,14 @@ function getNumberTypeAndValue(op) {
  * `valLen` and `valRaw`.
  */
 function encodeValue(op, columns) {
-  if ((op.action !== 'set' && op.action !== 'inc') || op.value === null) {
+  if (op[RAW_VALUE]) {
+    columns.valLen.appendValue(op[RAW_VALUE].sizeTag)
+    columns.valRaw.appendRawBytes(op[RAW_VALUE].rawValue)
+    return
+  }
+  const hasValue = op.action === 'set' || op.action === 'inc' ||
+    op.action === 'markBegin' || op.action === 'mark' && (op.markName !== undefined || op.name !== undefined)
+  if (!hasValue || op.value === null) {
     columns.valLen.appendValue(VALUE_TYPE.NULL)
   } else if (op.value === false) {
     columns.valLen.appendValue(VALUE_TYPE.FALSE)
@@ -267,7 +312,9 @@ function encodeValue(op, columns) {
     const numBytes = columns.valRaw.appendRawString(op.value)
     columns.valLen.appendValue(numBytes << 4 | VALUE_TYPE.UTF8)
   } else if (ArrayBuffer.isView(op.value)) {
-    const numBytes = columns.valRaw.appendRawBytes(new Uint8Array(op.value.buffer))
+    const numBytes = columns.valRaw.appendRawBytes(
+      new Uint8Array(op.value.buffer, op.value.byteOffset, op.value.byteLength)
+    )
     columns.valLen.appendValue(numBytes << 4 | VALUE_TYPE.BYTES)
   } else if (typeof op.value === 'number') {
     let [typeTag, value] = getNumberTypeAndValue(op)
@@ -336,26 +383,41 @@ function decodeValue(sizeTag, bytes) {
  * in the case of a pair of VALUE_LEN and VALUE_RAW columns, which are processed
  * in one go).
  */
+function setColumnValue(result, columnId, columnName, value) {
+  if (columnName === undefined) {
+    if (!result[UNKNOWN_COLUMNS]) result[UNKNOWN_COLUMNS] = {}
+    result[UNKNOWN_COLUMNS][columnId] = value
+  } else {
+    result[columnName] = value
+  }
+}
+
 function decodeValueColumns(columns, colIndex, actorIds, result) {
   const { columnId, columnName, decoder } = columns[colIndex]
   if (columnId % 8 === COLUMN_TYPE.VALUE_LEN && colIndex + 1 < columns.length &&
       columns[colIndex + 1].columnId === columnId + 1) {
     const sizeTag = decoder.readValue()
     const rawValue = columns[colIndex + 1].decoder.readRawBytes(sizeTag >> 4)
-    const { value, datatype } = decodeValue(sizeTag, rawValue)
-    result[columnName] = value
-    if (datatype) result[columnName + '_datatype'] = datatype
+    if (columnName === undefined) {
+      setColumnValue(result, columnId, columnName, sizeTag)
+      setColumnValue(result, columnId + 1, undefined, rawValue)
+    } else {
+      const { value, datatype } = decodeValue(sizeTag, rawValue)
+      result[columnName] = value
+      if (datatype) result[columnName + '_datatype'] = datatype
+      result[RAW_VALUE] = {sizeTag, rawValue}
+    }
     return 2
   } else if (columnId % 8 === COLUMN_TYPE.ACTOR_ID) {
     const actorNum = decoder.readValue()
     if (actorNum === null) {
-      result[columnName] = null
+      setColumnValue(result, columnId, columnName, null)
     } else {
       if (!actorIds[actorNum]) throw new RangeError(`No actor index ${actorNum}`)
-      result[columnName] = actorIds[actorNum]
+      setColumnValue(result, columnId, columnName, actorIds[actorNum])
     }
   } else {
-    result[columnName] = decoder.readValue()
+    setColumnValue(result, columnId, columnName, decoder.readValue())
   }
   return 1
 }
@@ -379,8 +441,11 @@ function encodeOps(ops, forDocument) {
     valLen    : new RLEEncoder('uint'),
     valRaw    : new Encoder(),
     chldActor : new RLEEncoder('uint'),
-    chldCtr   : new DeltaEncoder()
+    chldCtr   : new DeltaEncoder(),
+    markName  : new RLEEncoder('utf8')
   }
+
+  if (ops.some(op => !!op.expand)) columns.expand = new BooleanEncoder()
 
   if (forDocument) {
     columns.idActor   = new RLEEncoder('uint')
@@ -394,12 +459,24 @@ function encodeOps(ops, forDocument) {
     columns.predActor = new RLEEncoder('uint')
   }
 
+  const unknownColumnIds = new Set()
+  for (const op of ops) {
+    if (op[UNKNOWN_COLUMNS]) {
+      for (const columnId of Object.keys(op[UNKNOWN_COLUMNS])) unknownColumnIds.add(Number(columnId))
+    }
+  }
+  const unknownColumns = Array.from(unknownColumnIds).sort((left, right) => left - right)
+    .map(columnId => ({columnId, encoder: encoderByColumnId(columnId)}))
+
   for (let op of ops) {
     encodeObjectId(op, columns)
     encodeOperationKey(op, columns)
     columns.insert.appendValue(!!op.insert)
     encodeOperationAction(op, columns)
     encodeValue(op, columns)
+    if (columns.expand) columns.expand.appendValue(!!op.expand)
+    const markName = op.markName === undefined ? op.name : op.markName
+    columns.markName.appendValue(markName === undefined ? null : markName)
 
     if (op.child && op.child.counter) {
       columns.chldActor.appendValue(op.child.actorNum)
@@ -426,13 +503,46 @@ function encodeOps(ops, forDocument) {
         columns.predCtr.appendValue(op.pred[i].counter)
       }
     }
+    appendUnknownOperation(unknownColumns, op[UNKNOWN_COLUMNS])
   }
 
   let columnList = []
   for (let {columnName, columnId} of forDocument ? DOC_OPS_COLUMNS : CHANGE_COLUMNS) {
     if (columns[columnName]) columnList.push({columnId, columnName, encoder: columns[columnName]})
   }
-  return columnList.sort((a, b) => a.columnId - b.columnId)
+  return columnList.concat(unknownColumns).sort((a, b) => a.columnId - b.columnId)
+}
+
+function appendUnknownOperation(columns, values) {
+  let lastGroup = -1, lastCardinality = 0
+  for (const column of columns) {
+    const columnId = column.columnId, type = columnId & 7
+    const present = values && Object.prototype.hasOwnProperty.call(values, columnId)
+    const value = present ? values[columnId] : undefined
+    if (type === COLUMN_TYPE.GROUP_CARD) {
+      lastGroup = columnId >> 4
+      lastCardinality = present ? value : 0
+      column.encoder.appendValue(lastCardinality)
+    } else if (type === COLUMN_TYPE.VALUE_RAW) {
+      if (present && Array.isArray(value)) {
+        for (const bytes of value) column.encoder.appendRawBytes(bytes)
+      } else if (present) {
+        column.encoder.appendRawBytes(value)
+      }
+    } else if (Array.isArray(value)) {
+      for (const item of value) column.encoder.appendValue(item)
+    } else if (columnId >> 4 === lastGroup) {
+      let blank = null
+      if (type === COLUMN_TYPE.BOOLEAN) blank = false
+      if (type === COLUMN_TYPE.VALUE_LEN) blank = 0
+      column.encoder.appendValue(blank, lastCardinality)
+    } else {
+      let blank = null
+      if (type === COLUMN_TYPE.BOOLEAN) blank = false
+      if (type === COLUMN_TYPE.VALUE_LEN) blank = 0
+      column.encoder.appendValue(present ? value : blank)
+    }
+  }
 }
 
 function validDatatype(value, datatype) {
@@ -481,17 +591,23 @@ function expandMultiOps(ops, startOp, actor) {
  * individual change.
  */
 function decodeOps(ops, forDocument) {
+  const forBundle = forDocument === 'bundle'
+  forDocument = forDocument === true
   const newOps = []
   for (let op of ops) {
     const obj = (op.objCtr === null) ? '_root' : `${op.objCtr}@${op.objActor}`
-    const elemId = op.keyStr ? undefined : (op.keyCtr === 0 ? '_head' : `${op.keyCtr}@${op.keyActor}`)
-    const action = ACTIONS[op.action] || op.action
+    const elemId = op.keyStr !== null ? undefined : (op.keyCtr === 0 ? '_head' : `${op.keyCtr}@${op.keyActor}`)
+    let action = ACTIONS[op.action] || op.action
+    if (action === 'mark') action = op.markName === null ? 'markEnd' : 'markBegin'
     const newOp = elemId ? {obj, elemId, action} : {obj, key: op.keyStr, action}
     newOp.insert = !!op.insert
-    if (ACTIONS[op.action] === 'set' || ACTIONS[op.action] === 'inc') {
+    if (ACTIONS[op.action] === 'set' || ACTIONS[op.action] === 'inc' || action === 'markBegin') {
       newOp.value = op.valLen
       if (op.valLen_datatype) newOp.datatype = op.valLen_datatype
     }
+    if (op[RAW_VALUE]) Object.defineProperty(newOp, RAW_VALUE, {value: op[RAW_VALUE]})
+    if (action === 'markBegin') newOp.name = op.markName
+    if (action === 'markBegin' || action === 'markEnd') newOp.expand = !!op.expand
     if (!!op.chldCtr !== !!op.chldActor) {
       throw new RangeError(`Mismatched child columns: ${op.chldCtr} and ${op.chldActor}`)
     }
@@ -501,9 +617,11 @@ function decodeOps(ops, forDocument) {
       newOp.succ = op.succNum.map(succ => `${succ.succCtr}@${succ.succActor}`)
       checkSortedOpIds(op.succNum.map(succ => ({counter: succ.succCtr, actorId: succ.succActor})))
     } else {
+      if (forBundle) newOp.id = `${op.idCtr}@${op.idActor}`
       newOp.pred = op.predNum.map(pred => `${pred.predCtr}@${pred.predActor}`)
       checkSortedOpIds(op.predNum.map(pred => ({counter: pred.predCtr, actorId: pred.predActor})))
     }
+    if (op[UNKNOWN_COLUMNS]) Object.defineProperty(newOp, UNKNOWN_COLUMNS, {value: op[UNKNOWN_COLUMNS]})
     newOps.push(newOp)
   }
   return newOps
@@ -588,14 +706,28 @@ function decodeColumns(columns, actorIds, columnSpec) {
 
       if (columnId % 8 === COLUMN_TYPE.GROUP_CARD) {
         const values = [], count = columns[col].decoder.readValue()
+        const groupedUnknown = {}
+        for (let colOffset = 1; colOffset < groupCols; colOffset++) {
+          if (columns[col + colOffset].columnName === undefined) {
+            groupedUnknown[columns[col + colOffset].columnId] = []
+          }
+        }
         for (let i = 0; i < count; i++) {
           let value = {}
-          for (let colOffset = 1; colOffset < groupCols; colOffset++) {
-            decodeValueColumns(columns, col + colOffset, actorIds, value)
+          for (let colOffset = 1; colOffset < groupCols;) {
+            colOffset += decodeValueColumns(columns, col + colOffset, actorIds, value)
+          }
+          if (value[UNKNOWN_COLUMNS]) {
+            for (const [unknownId, unknownValue] of Object.entries(value[UNKNOWN_COLUMNS])) {
+              groupedUnknown[unknownId].push(unknownValue)
+            }
           }
           values.push(value)
         }
-        row[columns[col].columnName] = values
+        setColumnValue(row, columnId, columns[col].columnName, columns[col].columnName === undefined ? count : values)
+        for (const [unknownId, unknownValues] of Object.entries(groupedUnknown)) {
+          setColumnValue(row, Number(unknownId), undefined, unknownValues)
+        }
         col += groupCols
       } else {
         col += decodeValueColumns(columns, col, actorIds, row)
@@ -707,11 +839,23 @@ function decodeContainerHeader(decoder, computeHash) {
   return header
 }
 
-function encodeChange(changeObj) {
-  const { changes, actorIds } = parseAllOpIds([changeObj], true)
+function encodeChange(changeObj, actorOrder) {
+  if (changeObj.hash !== undefined && changeObj.hash !== null &&
+      (typeof changeObj.hash !== 'string' || !/^[0-9a-f]{64}$/i.test(changeObj.hash))) {
+    throw new RangeError('Change hash must be a 32-byte hexadecimal string')
+  }
+  const { changes, actorIds } = parseAllOpIds([changeObj], true, actorOrder)
   const change = changes[0]
+  let extraBytes = change.extraBytes
+  if (change.extra_bytes !== undefined) {
+    if (!Array.isArray(change.extra_bytes) ||
+        change.extra_bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+      throw new RangeError('extra_bytes must be an array of bytes')
+    }
+    extraBytes = new Uint8Array(change.extra_bytes)
+  }
 
-  const { hash, bytes } = encodeContainer(CHUNK_TYPE_CHANGE, encoder => {
+  const { bytes } = encodeContainer(CHUNK_TYPE_CHANGE, encoder => {
     if (!Array.isArray(change.deps)) throw new TypeError('deps is not an array')
     encoder.appendUint53(change.deps.length)
     for (let hash of change.deps.slice().sort()) {
@@ -728,13 +872,9 @@ function encodeChange(changeObj) {
     const columns = encodeOps(change.ops, false)
     encodeColumnInfo(encoder, columns)
     for (let column of columns) encoder.appendRawBytes(column.encoder.buffer)
-    if (change.extraBytes) encoder.appendRawBytes(change.extraBytes)
+    if (extraBytes) encoder.appendRawBytes(extraBytes)
   })
 
-  const hexHash = bytesToHexString(hash)
-  if (changeObj.hash && changeObj.hash !== hexHash) {
-    throw new RangeError(`Change hash does not match encoding: ${changeObj.hash} != ${hexHash}`)
-  }
   return (bytes.byteLength >= DEFLATE_MIN_SIZE) ? deflateChange(bytes) : bytes
 }
 
@@ -767,11 +907,33 @@ function decodeChangeColumns(buffer) {
 /**
  * Decodes one change in binary format into its JS object representation.
  */
-function decodeChange(buffer) {
+function decodeChange(buffer, raw = false) {
   const change = decodeChangeColumns(buffer)
   change.ops = decodeOps(decodeColumns(change.columns, change.actorIds, CHANGE_COLUMNS), false)
   delete change.actorIds
   delete change.columns
+  if (raw !== true) {
+    if (change.message === '') change.message = null
+    if (change.extraBytes) {
+      change.extra_bytes = Array.from(change.extraBytes)
+      delete change.extraBytes
+    }
+    for (const op of change.ops) {
+      delete op[UNKNOWN_COLUMNS]
+      delete op[RAW_VALUE]
+      if (!op.insert) delete op.insert
+      if (typeof op.datatype === 'number' && op.datatype >= VALUE_TYPE.MIN_UNKNOWN &&
+          op.datatype <= VALUE_TYPE.MAX_UNKNOWN) {
+        op.value = {type_code: op.datatype, bytes: Array.from(op.value)}
+        delete op.datatype
+      } else if (op.datatype === VALUE_TYPE.BYTES) {
+        op.value = Array.from(op.value)
+        delete op.datatype
+      } else if (op.action !== 'set') {
+        delete op.datatype
+      }
+    }
+  }
   return change
 }
 
@@ -847,7 +1009,9 @@ function decodeChanges(binaryChanges) {
       if (chunk[8] === CHUNK_TYPE_DOCUMENT) {
         decoded = decoded.concat(decodeDocument(chunk))
       } else if (chunk[8] === CHUNK_TYPE_CHANGE || chunk[8] === CHUNK_TYPE_DEFLATE) {
-        decoded.push(decodeChange(chunk))
+        decoded.push(decodeChange(chunk, true))
+      } else if (chunk[8] === 3) {
+        decoded = decoded.concat(require('./bundle').decodeBundle(chunk).changes)
       } else {
         // ignoring chunk of unknown type
       }
@@ -866,6 +1030,36 @@ function sortOpIds(a, b) {
   if (a_.actorId < b_.actorId) return -1
   if (a_.actorId > b_.actorId) return +1
   return 0
+}
+
+function isBlankUnknownValue(columnId, value) {
+  const type = columnId & 7
+  if (Array.isArray(value)) return value.every(item => isBlankUnknownValue(columnId, item))
+  if (type === COLUMN_TYPE.VALUE_RAW) return !value || value.byteLength === 0
+  if (type === COLUMN_TYPE.GROUP_CARD || type === COLUMN_TYPE.VALUE_LEN) return value === null || value === 0
+  if (type === COLUMN_TYPE.BOOLEAN) return value === false
+  return value === null
+}
+
+function stripBlankUnknownColumns(change) {
+  const columnIds = new Set()
+  for (const op of change.ops) {
+    if (op[UNKNOWN_COLUMNS]) {
+      for (const columnId of Object.keys(op[UNKNOWN_COLUMNS])) columnIds.add(Number(columnId))
+    }
+  }
+  for (const columnId of columnIds) {
+    if (change.ops.every(op => !op[UNKNOWN_COLUMNS] ||
+        !Object.prototype.hasOwnProperty.call(op[UNKNOWN_COLUMNS], columnId) ||
+        isBlankUnknownValue(columnId, op[UNKNOWN_COLUMNS][columnId]))) {
+      for (const op of change.ops) {
+        if (op[UNKNOWN_COLUMNS]) delete op[UNKNOWN_COLUMNS][columnId]
+      }
+    }
+  }
+  for (const op of change.ops) {
+    if (op[UNKNOWN_COLUMNS] && Object.keys(op[UNKNOWN_COLUMNS]).length === 0) delete op[UNKNOWN_COLUMNS]
+  }
 }
 
 /**
@@ -939,6 +1133,7 @@ function groupChangeOps(changes, ops) {
       }
       delete op.id
     }
+    stripBlankUnknownColumns(change)
   }
 }
 
@@ -965,7 +1160,7 @@ function decodeDocumentChanges(changes, expectedHeads) {
     delete change.extraLen_datatype
 
     // Encoding and decoding again to compute the hash of the change
-    changes[i] = decodeChange(encodeChange(change))
+    changes[i] = decodeChange(encodeChange(change), true)
     heads[changes[i].hash] = true
   }
 
@@ -1068,7 +1263,9 @@ function inflateColumn(column) {
 
 module.exports = {
   COLUMN_TYPE, VALUE_TYPE, ACTIONS, OBJECT_TYPE, DOC_OPS_COLUMNS, CHANGE_COLUMNS, DOCUMENT_COLUMNS,
-  encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue,
+  encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue, decodeColumns, decodeOps,
+  parseAllOpIds, encodeObjectId, encodeOperationKey, encodeOperationAction, encodeValue,
+  encodeColumnInfo, decodeColumnInfo, encodeContainer, decodeContainerHeader,
   splitContainers, encodeChange, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
   encodeDocumentHeader, decodeDocumentHeader, decodeDocument
 }

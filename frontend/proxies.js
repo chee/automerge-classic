@@ -1,4 +1,4 @@
-const { OBJECT_ID, CHANGE, STATE } = require('./constants')
+const { OBJECT_ID, CHANGE, STATE, PROXY_PATH } = require('./constants')
 const { isObject, createArrayOfNulls } = require('../src/common')
 const { Text } = require('./text')
 const { Table } = require('./table')
@@ -117,6 +117,7 @@ const MapHandler = {
     if (key === OBJECT_ID) return objectId
     if (key === CHANGE) return context
     if (key === STATE) return {actorId: context.actorId}
+    if (key === PROXY_PATH) return path
     return context.getObjectField(path, objectId, key)
   },
 
@@ -166,6 +167,7 @@ const ListHandler = {
     if (key === Symbol.iterator) return context.getObject(objectId)[Symbol.iterator]
     if (key === OBJECT_ID) return objectId
     if (key === CHANGE) return context
+    if (key === PROXY_PATH) return path
     if (key === 'length') return context.getObject(objectId).length
     if (typeof key === 'string' && /^[0-9]+$/.test(key)) {
       return context.getObjectField(path, objectId, parseListIndex(key))

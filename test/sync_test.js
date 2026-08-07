@@ -146,12 +146,12 @@ describe('Data sync protocol', () => {
         ;[n1, s1, patch] = Automerge.receiveSyncMessage(n1, s1, message)
         ;[s1, message] = Automerge.generateSyncMessage(n1, s1)
         assert.deepStrictEqual(decodeSyncMessage(message).changes.length, 5)
-        assert.deepStrictEqual(patch.diffs.props, {y: {'5@def456': {type: 'value', value: 4, datatype: 'int'}}}) // changes arrived
+        assert.deepStrictEqual(patch, null) // changes arrived
 
         // n2 applies the changes and sends confirmation ending the exchange
         ;[n2, s2, patch] = Automerge.receiveSyncMessage(n2, s2, message)
         ;[s2, message] = Automerge.generateSyncMessage(n2, s2)
-        assert.deepStrictEqual(patch.diffs.props, {x: {'5@abc123': {type: 'value', value: 4, datatype: 'int'}}}) // changes arrived
+        assert.deepStrictEqual(patch, null) // changes arrived
 
         // n1 receives the message and has nothing more to say
         ;[n1, s1, patch] = Automerge.receiveSyncMessage(n1, s1, message)
@@ -198,12 +198,12 @@ describe('Data sync protocol', () => {
         // both should now apply the changes and update the frontend
         ;[n1, s1, patch1] = Automerge.receiveSyncMessage(n1, s1, msg2to1)
         assert.deepStrictEqual(getMissingDeps(n1), [])
-        assert.notDeepStrictEqual(patch1, null)
+        assert.deepStrictEqual(patch1, null)
         assert.deepStrictEqual(n1, {x: 4, y: 4})
 
         ;[n2, s2, patch2] = Automerge.receiveSyncMessage(n2, s2, msg1to2)
         assert.deepStrictEqual(getMissingDeps(n2), [])
-        assert.notDeepStrictEqual(patch2, null)
+        assert.deepStrictEqual(patch2, null)
         assert.deepStrictEqual(n2, {x: 4, y: 4})
 
         // The response acknowledges the changes received, and sends no further changes

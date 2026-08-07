@@ -5,6 +5,18 @@ const { decodeChange } = require('../backend/columnar')
 const UUID_PATTERN = /^[0-9a-f]{32}$/
 const OPID_PATTERN = /^[0-9]+@[0-9a-f]{32}$/
 
+function textDiff(objectId, elemId, value) {
+  return {
+    objectId, type: 'text', edits: [
+      {action: 'multi-insert', index: 0, elemId, values: [...value]}
+    ]
+  }
+}
+
+function conflictsByActor(conflicts) {
+  return Object.fromEntries(Object.entries(conflicts).map(([id, value]) => [id.split('@')[1], value]))
+}
+
 describe('Automerge', () => {
 
   describe('initialization ', () => {
@@ -75,12 +87,17 @@ describe('Automerge', () => {
       const change1 = Automerge.getLastLocalChange(s1)
       s2 = Automerge.change(s1, doc => doc.foo = 'bar')
       const change2 = Automerge.getLastLocalChange(s2)
-      assert.strictEqual(change1, null)
+      assert.strictEqual(change1, undefined)
       const change = decodeChange(change2)
       assert.deepStrictEqual(change, {
         actor: change.actor, deps: [], seq: 1, startOp: 1,
-        hash: change.hash, message: '', time: change.time,
-        ops: [{obj: '_root', key: 'foo', action: 'set', insert: false, value: 'bar', pred: []}]
+        hash: change.hash, message: null, time: change.time,
+        ops: [
+          {obj: '_root', key: 'foo', action: 'makeText', pred: []},
+          {obj: `1@${change.actor}`, elemId: '_head', action: 'set', insert: true, value: 'b', pred: []},
+          {obj: `1@${change.actor}`, elemId: `2@${change.actor}`, action: 'set', insert: true, value: 'a', pred: []},
+          {obj: `1@${change.actor}`, elemId: `3@${change.actor}`, action: 'set', insert: true, value: 'r', pred: []}
+        ]
       })
     })
 
@@ -300,10 +317,11 @@ describe('Automerge', () => {
         })
         assert.strictEqual(callbacks.length, 1)
         assert.deepStrictEqual(callbacks[0].patch, {
-          actor, seq: 1, maxOp: 2, deps: [], clock: {[actor]: 1}, pendingChanges: 0,
+          actor, seq: 1, maxOp: 11, deps: [], clock: {[actor]: 1}, pendingChanges: 0,
           diffs: {objectId: '_root', type: 'map', props: {birds: {[`1@${actor}`]: {
             objectId: `1@${actor}`, type: 'list', edits: [
-              {action: 'insert', index: 0, elemId: `2@${actor}`, opId: `2@${actor}`, value: {'type': 'value', value: 'Goldfinch'}}
+              {action: 'insert', index: 0, elemId: `2@${actor}`, opId: `2@${actor}`,
+                value: textDiff(`2@${actor}`, `3@${actor}`, 'Goldfinch')}
             ]
           }}}}
         })
@@ -321,8 +339,10 @@ describe('Automerge', () => {
         const actor = Automerge.getActorId(s1)
         assert.strictEqual(callbacks.length, 1)
         assert.deepStrictEqual(callbacks[0].patch, {
-          actor, seq: 1, maxOp: 1, deps: [], clock: {[actor]: 1}, pendingChanges: 0,
-          diffs: {objectId: '_root', type: 'map', props: {bird: {[`1@${actor}`]: {type: 'value', value: 'Goldfinch'}}}}
+          actor, seq: 1, maxOp: 10, deps: [], clock: {[actor]: 1}, pendingChanges: 0,
+          diffs: {objectId: '_root', type: 'map', props: {
+            bird: {[`1@${actor}`]: textDiff(`1@${actor}`, `2@${actor}`, 'Goldfinch')}
+          }}
         })
         assert.strictEqual(callbacks[0].before, s1)
         assert.strictEqual(callbacks[0].after, s2)
@@ -422,10 +442,9 @@ describe('Automerge', () => {
         assert.strictEqual(s1.prop, true)
       })
 
-      it('should require property names to be valid', () => {
-        assert.throws(() => {
-          Automerge.change(s1, 'foo', doc => doc[''] = 'x')
-        }, /must not be an empty string/)
+      it('should allow empty property names', () => {
+        s1 = Automerge.change(s1, 'foo', doc => doc[''] = 'x')
+        assert.strictEqual(s1[''], 'x')
       })
 
       it('should not allow assignment of unsupported datatypes', () => {
@@ -565,10 +584,12 @@ describe('Automerge', () => {
         assert.deepStrictEqual(s1, {title: 'Hello'})
       })
 
-      it('should validate field names', () => {
+      it('should allow empty field names', () => {
         s1 = Automerge.change(s1, doc => doc.nested = {})
-        assert.throws(() => { Automerge.change(s1, doc => doc.nested[''] = 'x') }, /must not be an empty string/)
-        assert.throws(() => { Automerge.change(s1, doc => doc.nested = {'': 'x'}) }, /must not be an empty string/)
+        s1 = Automerge.change(s1, doc => doc.nested[''] = 'x')
+        assert.strictEqual(s1.nested[''], 'x')
+        s1 = Automerge.change(s1, doc => doc.nested = {'': 'y'})
+        assert.strictEqual(s1.nested[''], 'y')
       })
     })
 
@@ -802,42 +823,42 @@ describe('Automerge', () => {
         const s1 = Automerge.change(Automerge.init(), doc => doc.number = 1)
         const binChange = Automerge.getLastLocalChange(s1)
         const change = decodeChange(binChange)
-        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'int', insert: false, key: 'number', obj: '_root', pred: [], value: 1 })
+        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'int', key: 'number', obj: '_root', pred: [], value: 1 })
       })
 
       it('should default to int for negative numbers', () => {
         const s1 = Automerge.change(Automerge.init(), doc => doc.number = -1)
         const binChange = Automerge.getLastLocalChange(s1)
         const change = decodeChange(binChange)
-        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'int', insert: false, key: 'number', obj: '_root', pred: [], value: -1 })
+        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'int', key: 'number', obj: '_root', pred: [], value: -1 })
       })
 
       it('should default to float64 for floats', () => {
         const s1 = Automerge.change(Automerge.init(), doc => doc.number = 1.1)
         const binChange = Automerge.getLastLocalChange(s1)
         const change = decodeChange(binChange)
-        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'float64', insert: false, key: 'number', obj: '_root', pred: [], value: 1.1 })
+        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'float64', key: 'number', obj: '_root', pred: [], value: 1.1 })
       })
 
       it('float64 can be specificed manually', () => {
         const s1 = Automerge.change(Automerge.init(), doc => doc.number = new Automerge.Float64(3))
         const binChange = Automerge.getLastLocalChange(s1)
         const change = decodeChange(binChange)
-        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'float64', insert: false, key: 'number', obj: '_root', pred: [], value: 3 })
+        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'float64', key: 'number', obj: '_root', pred: [], value: 3 })
       })
 
       it('int can be specificed manually', () => {
         const s1 = Automerge.change(Automerge.init(), doc => doc.number = new Automerge.Int(3))
         const binChange = Automerge.getLastLocalChange(s1)
         const change = decodeChange(binChange)
-        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'int', insert: false, key: 'number', obj: '_root', pred: [], value: 3 })
+        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'int', key: 'number', obj: '_root', pred: [], value: 3 })
       })
 
       it('uint can be specificed manually', () => {
         const s1 = Automerge.change(Automerge.init(), doc => doc.number = new Automerge.Uint(3))
         const binChange = Automerge.getLastLocalChange(s1)
         const change = decodeChange(binChange)
-        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'uint', insert: false, key: 'number', obj: '_root', pred: [], value: 3 })
+        assert.deepStrictEqual(change.ops[0], { action: 'set', datatype: 'uint', key: 'number', obj: '_root', pred: [], value: 3 })
       })
     })
 
@@ -944,9 +965,9 @@ describe('Automerge', () => {
       } else {
         assert.deepStrictEqual(s3.birds, ['goldfinch'])
       }
-      assert.deepStrictEqual(Automerge.getConflicts(s3.birds, 0), {
-        [`3@${Automerge.getActorId(s1)}`]: 'greenfinch',
-        [`3@${Automerge.getActorId(s2)}`]: 'goldfinch'
+      assert.deepStrictEqual(conflictsByActor(Automerge.getConflicts(s3.birds, 0)), {
+        [Automerge.getActorId(s1)]: 'greenfinch',
+        [Automerge.getActorId(s2)]: 'goldfinch'
       })
     })
 
@@ -988,9 +1009,9 @@ describe('Automerge', () => {
       } else {
         assert.deepStrictEqual(s3.list, [{map2: true, key: 2}])
       }
-      assert.deepStrictEqual(Automerge.getConflicts(s3.list, 0), {
-        [`3@${Automerge.getActorId(s1)}`]: {map1: true, key: 1},
-        [`3@${Automerge.getActorId(s2)}`]: {map2: true, key: 2}
+      assert.deepStrictEqual(conflictsByActor(Automerge.getConflicts(s3.list, 0)), {
+        [Automerge.getActorId(s1)]: {map1: true, key: 1},
+        [Automerge.getActorId(s2)]: {map2: true, key: 2}
       })
     })
 
@@ -1218,9 +1239,10 @@ describe('Automerge', () => {
       const changes12 = Automerge.getAllChanges(s2).map(decodeChange)
       assert.deepStrictEqual(changes12, [{
         hash: changes12[0].hash, actor: '01234567', seq: 1, startOp: 1,
-        time: changes12[0].time, message: '', deps: [], ops: [
-          {obj: '_root', action: 'makeList', key: 'list', insert: false, pred: []},
-          {obj: listId,  action: 'set', elemId: '_head', insert: true, value: 'a', pred: []}
+        time: changes12[0].time, message: null, deps: [], ops: [
+          {obj: '_root', action: 'makeList', key: 'list', pred: []},
+          {obj: listId, action: 'makeText', elemId: '_head', insert: true, pred: []},
+          {obj: '2@01234567', action: 'set', elemId: '_head', insert: true, value: 'a', pred: []}
         ]
       }])
       const s3 = Automerge.change(s2, doc => doc.list.deleteAt(0))
@@ -1229,9 +1251,10 @@ describe('Automerge', () => {
       const changes45 = Automerge.getAllChanges(s5).map(decodeChange)
       assert.deepStrictEqual(s5, {list: ['b']})
       assert.deepStrictEqual(changes45[2], {
-        hash: changes45[2].hash, actor: '01234567', seq: 3, startOp: 4,
-        time: changes45[2].time, message: '', deps: [changes45[1].hash], ops: [
-          {obj: listId, action: 'set', elemId: '_head', insert: true, value: 'b', pred: []}
+        hash: changes45[2].hash, actor: '01234567', seq: 3, startOp: 5,
+        time: changes45[2].time, message: null, deps: [changes45[1].hash], ops: [
+          {obj: listId, action: 'makeText', elemId: '_head', insert: true, pred: []},
+          {obj: '5@01234567', action: 'set', elemId: '_head', insert: true, value: 'b', pred: []}
         ]
       })
     })
@@ -1269,10 +1292,13 @@ describe('Automerge', () => {
       })
       assert.strictEqual(callbacks.length, 1)
       assert.deepStrictEqual(callbacks[0].patch, {
-        maxOp: 3, deps: [decodeChange(Automerge.getAllChanges(s2)[1]).hash], clock: {[actor]: 2}, pendingChanges: 0,
+        maxOp: 21, deps: [decodeChange(Automerge.getAllChanges(s2)[1]).hash], clock: {[actor]: 2}, pendingChanges: 0,
         diffs: {objectId: '_root', type: 'map', props: {birds: {[`1@${actor}`]: {
           objectId: `1@${actor}`, type: 'list', edits: [
-            {action: 'multi-insert', index: 0, elemId: `2@${actor}`, values: ['Goldfinch', 'Chaffinch']}
+            {action: 'insert', index: 0, elemId: `2@${actor}`, opId: `2@${actor}`,
+              value: textDiff(`2@${actor}`, `3@${actor}`, 'Goldfinch')},
+            {action: 'insert', index: 1, elemId: `12@${actor}`, opId: `12@${actor}`,
+              value: textDiff(`12@${actor}`, `13@${actor}`, 'Chaffinch')}
           ]
         }}}}
       })
@@ -1407,10 +1433,10 @@ describe('Automerge', () => {
     })
 
     it('should handle updates to a text object', () => {
-      let s1 = Automerge.change(Automerge.init(), doc => doc.text = new Automerge.Text('ab'))
-      let s2 = Automerge.change(s1, doc => doc.text.set(0, 'A'))
+      let s1 = Automerge.from({text: 'ab'})
+      let s2 = Automerge.change(s1, doc => Automerge.splice(doc, ['text'], 0, 1, 'A'))
       let [s3] = Automerge.applyChanges(Automerge.init(), Automerge.getAllChanges(s2))
-      assert.deepStrictEqual([...s3.text], ['A', 'b'])
+      assert.strictEqual(s3.text, 'Ab')
     })
 
     it('should report missing dependencies', () => {
@@ -1418,15 +1444,13 @@ describe('Automerge', () => {
       let s2 = Automerge.merge(Automerge.init(), s1)
       s2 = Automerge.change(s2, doc => doc.birds.push('Bullfinch'))
       let changes = Automerge.getAllChanges(s2)
-      let [s3, patch] = Automerge.applyChanges(Automerge.init(), [changes[1]])
+      let [s3] = Automerge.applyChanges(Automerge.init(), [changes[1]])
       assert.deepStrictEqual(s3, {})
       assert.deepStrictEqual(Automerge.Backend.getMissingDeps(Automerge.Frontend.getBackendState(s3)),
                              decodeChange(changes[1]).deps)
-      assert.strictEqual(patch.pendingChanges, 1)
-      ;[s3, patch] = Automerge.applyChanges(s3, [changes[0]])
+      ;[s3] = Automerge.applyChanges(s3, [changes[0]])
       assert.deepStrictEqual(s3.birds, ['Chaffinch', 'Bullfinch'])
       assert.deepStrictEqual(Automerge.Backend.getMissingDeps(Automerge.Frontend.getBackendState(s3)), [])
-      assert.strictEqual(patch.pendingChanges, 0)
     })
 
     it('should allow changes to be applied in any order', () => {
@@ -1448,31 +1472,30 @@ describe('Automerge', () => {
       let changes23 = Automerge.getChanges(s2, s3)
       let s4 = Automerge.init()
       let [s5] = Automerge.applyChanges(s4, changes23)
-      let [s6, patch6] = Automerge.applyChanges(s5, changes12)
+      let [s6] = Automerge.applyChanges(s5, changes12)
       assert.deepStrictEqual(Automerge.Backend.getMissingDeps(Automerge.Frontend.getBackendState(s6)),
                              [decodeChange(changes01[0]).hash])
-      assert.strictEqual(patch6.pendingChanges, 2)
     })
 
     it('should call patchCallback if supplied when applying changes', () => {
       const s1 = Automerge.change(Automerge.init(), doc => doc.birds = ['Goldfinch'])
       const callbacks = [], actor = Automerge.getActorId(s1)
       const before = Automerge.init()
-      const [after, patch] = Automerge.applyChanges(before, Automerge.getAllChanges(s1), {
+      const [after] = Automerge.applyChanges(before, Automerge.getAllChanges(s1), {
         patchCallback(patch, before, after, local) {
           callbacks.push({patch, before, after, local})
         }
       })
       assert.strictEqual(callbacks.length, 1)
       assert.deepStrictEqual(callbacks[0].patch, {
-        maxOp: 2, deps: [decodeChange(Automerge.getAllChanges(s1)[0]).hash], clock: {[actor]: 1}, pendingChanges: 0,
+        maxOp: 11, deps: [decodeChange(Automerge.getAllChanges(s1)[0]).hash], clock: {[actor]: 1}, pendingChanges: 0,
         diffs: {objectId: '_root', type: 'map', props: {birds: {[`1@${actor}`]: {
           objectId: `1@${actor}`, type: 'list', edits: [
-            {action: 'insert', index: 0, elemId: `2@${actor}`, opId: `2@${actor}`, value: {type: 'value', value: 'Goldfinch'}}
+            {action: 'insert', index: 0, elemId: `2@${actor}`, opId: `2@${actor}`,
+              value: textDiff(`2@${actor}`, `3@${actor}`, 'Goldfinch')}
           ]
         }}}}
       })
-      assert.strictEqual(callbacks[0].patch, patch)
       assert.strictEqual(callbacks[0].before, before)
       assert.strictEqual(callbacks[0].after, after)
       assert.strictEqual(callbacks[0].local, false)
@@ -1481,28 +1504,26 @@ describe('Automerge', () => {
     it('should merge multiple applied changes into one patch', () => {
       const s1 = Automerge.change(Automerge.init(), doc => doc.birds = ['Goldfinch'])
       const s2 = Automerge.change(s1, doc => doc.birds.push('Chaffinch'))
-      const patches = [], actor = Automerge.getActorId(s2)
+      const patches = []
       Automerge.applyChanges(Automerge.init(), Automerge.getAllChanges(s2),
                              {patchCallback: p => patches.push(p)})
-      assert.deepStrictEqual(patches, [{
-        maxOp: 3, deps: [decodeChange(Automerge.getAllChanges(s2)[1]).hash], clock: {[actor]: 2}, pendingChanges: 0,
-        diffs: {objectId: '_root', type: 'map', props: {birds: {[`1@${actor}`]: {
-          objectId: `1@${actor}`, type: 'list', edits: [
-            {action: 'multi-insert', index: 0, elemId: `2@${actor}`, values: ['Goldfinch', 'Chaffinch']}
-          ]
-        }}}}
-      }])
+      assert.deepStrictEqual(patches, [[
+        {action: 'put', path: ['birds'], value: []},
+        {action: 'insert', path: ['birds', 0], values: ['', '']},
+        {action: 'splice', path: ['birds', 0, 0], value: 'Goldfinch'},
+        {action: 'splice', path: ['birds', 1, 0], value: 'Chaffinch'}
+      ]])
     })
 
     it('should call a patchCallback registered on doc initialisation', () => {
       const s1 = Automerge.change(Automerge.init(), doc => doc.bird = 'Goldfinch')
-      const patches = [], actor = Automerge.getActorId(s1)
+      const patches = []
       const before = Automerge.init({patchCallback: p => patches.push(p)})
       Automerge.applyChanges(before, Automerge.getAllChanges(s1))
-      assert.deepStrictEqual(patches, [{
-        maxOp: 1, deps: [decodeChange(Automerge.getAllChanges(s1)[0]).hash], clock: {[actor]: 1}, pendingChanges: 0,
-        diffs: {objectId: '_root', type: 'map', props: {bird: {[`1@${actor}`]: {type: 'value', value: 'Goldfinch'}}}}
-      }])
+      assert.deepStrictEqual(patches, [[
+        {action: 'put', path: ['bird'], value: ''},
+        {action: 'splice', path: ['bird', 0], value: 'Goldfinch'}
+      ]])
     })
   })
 })

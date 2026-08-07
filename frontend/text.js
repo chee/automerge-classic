@@ -100,7 +100,9 @@ class Text {
    * JSON serialization of an Automerge document represents text nicely.
    */
   toJSON() {
-    return this.toString()
+    let str = ''
+    for (const elem of this.elems) str += typeof elem.value === 'string' ? elem.value : '\ufffc'
+    return str
   }
 
   /**

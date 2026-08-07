@@ -23,6 +23,7 @@ const { copyObject } = require('../src/common')
 
 const HASH_SIZE = 32 // 256 bits = 32 bytes
 const MESSAGE_TYPE_SYNC = 0x42 // first byte of a sync message, for identification
+const MESSAGE_TYPE_SYNC_V2 = 0x43
 const PEER_STATE_TYPE = 0x43 // first byte of an encoded peer state, for identification
 
 // These constants correspond to a 1% false positive rate. The values can be changed without
@@ -168,6 +169,15 @@ function encodeSyncMessage(message) {
   for (let change of message.changes) {
     encoder.appendPrefixedBytes(change)
   }
+  if (Array.isArray(message.supportedCapabilities)) {
+    let capabilities = 0
+    if (message.supportedCapabilities.includes('sync-reset')) capabilities |= 1
+    if (message.supportedCapabilities.includes('read-only')) capabilities |= 2
+    if (message.supportedCapabilities.includes('supports-sync-reset')) capabilities |= 4
+    encoder.appendByte(2)
+    encoder.appendByte(2)
+    encoder.appendByte(0x80 | capabilities)
+  }
   return encoder.buffer
 }
 
@@ -177,7 +187,7 @@ function encodeSyncMessage(message) {
 function decodeSyncMessage(bytes) {
   const decoder = new Decoder(bytes)
   const messageType = decoder.readByte()
-  if (messageType !== MESSAGE_TYPE_SYNC) {
+  if (messageType !== MESSAGE_TYPE_SYNC && messageType !== MESSAGE_TYPE_SYNC_V2) {
     throw new RangeError(`Unexpected message type: ${messageType}`)
   }
   const heads = decodeHashes(decoder)
@@ -193,6 +203,15 @@ function decodeSyncMessage(bytes) {
   for (let i = 0; i < changeCount; i++) {
     const change = decoder.readPrefixedBytes()
     message.changes.push(change)
+  }
+  message.type = messageType === MESSAGE_TYPE_SYNC_V2 ? 'v2' : 'v1'
+  message.supportedCapabilities = []
+  if (decoder.buf.byteLength - decoder.offset === 3 && decoder.buf[decoder.offset] === 2 &&
+      decoder.buf[decoder.offset + 1] === 2) {
+    const capabilities = decoder.buf[decoder.offset + 2] & 0x7f
+    if (capabilities & 1) message.supportedCapabilities.push('sync-reset')
+    if (capabilities & 2) message.supportedCapabilities.push('read-only')
+    if (capabilities & 4) message.supportedCapabilities.push('supports-sync-reset')
   }
   // Ignore any trailing bytes -- they can be used for extensions by future versions of the protocol
   return message
@@ -305,7 +324,7 @@ function getChangesToSend(backend, have, need) {
   return changesToSend
 }
 
-function initSyncState() {
+function initSyncState(options = {}) {
   return {
     sharedHeads: [],
     lastSentHeads: [],
@@ -313,6 +332,9 @@ function initSyncState() {
     theirNeed: null,
     theirHave: null,
     sentHashes: {},
+    readOnly: !!options.readOnly,
+    peerReadOnly: false,
+    haveResponded: false,
   }
 }
 
@@ -337,7 +359,7 @@ function generateSyncMessage(backend, syncState) {
 
   // Hashes to explicitly request from the remote peer: any missing dependencies of unapplied
   // changes, and any of the remote peer's heads that we don't know about
-  const ourNeed = Backend.getMissingDeps(backend, theirHeads || [])
+  const ourNeed = syncState.readOnly ? [] : Backend.getMissingDeps(backend, theirHeads || [])
 
   // There are two reasons why ourNeed may be nonempty: 1. we might be missing dependencies due to
   // Bloom filter false positives; 2. we might be missing heads that the other peer mentioned
@@ -356,19 +378,25 @@ function generateSyncMessage(backend, syncState) {
     const lastSync = theirHave[0].lastSync
     if (!lastSync.every(hash => Backend.getChangeByHash(backend, hash))) {
       // we need to queue them to send us a fresh sync message, the one they sent is uninteligible so we don't know what they need
-      const resetMsg = {heads: ourHeads, need: [], have: [{ lastSync: [], bloom: new Uint8Array(0) }], changes: []}
+      const supportedCapabilities = syncState.readOnly ? ['read-only', 'supports-sync-reset'] : ['supports-sync-reset']
+      const resetMsg = {
+        heads: ourHeads, need: [], have: [{lastSync: [], bloom: new Uint8Array(0)}], changes: [],
+        supportedCapabilities
+      }
       return [syncState, encodeSyncMessage(resetMsg)]
     }
   }
 
   // XXX: we should limit ourselves to only sending a subset of all the messages, probably limited by a total message size
   //      these changes should ideally be RLE encoded but we haven't implemented that yet.
-  let changesToSend = Array.isArray(theirHave) && Array.isArray(theirNeed) ? getChangesToSend(backend, theirHave, theirNeed) : []
+  let changesToSend = !syncState.peerReadOnly && Array.isArray(theirHave) && Array.isArray(theirNeed)
+    ? getChangesToSend(backend, theirHave, theirNeed) : []
 
   // If the heads are equal, we're in sync and don't need to do anything further
   const headsUnchanged = Array.isArray(lastSentHeads) && compareArrays(ourHeads, lastSentHeads)
   const headsEqual = Array.isArray(theirHeads) && compareArrays(ourHeads, theirHeads)
-  if (headsUnchanged && headsEqual && changesToSend.length === 0) {
+  const readOnlySettled = headsUnchanged && (syncState.peerReadOnly || syncState.readOnly && syncState.haveResponded)
+  if (headsUnchanged && changesToSend.length === 0 && (headsEqual || readOnlySettled)) {
     // no need to send a sync message if we know we're synced!
     return [syncState, null]
   }
@@ -380,7 +408,8 @@ function generateSyncMessage(backend, syncState) {
   // Regular response to a sync message: send any changes that the other node
   // doesn't have. We leave the "have" field empty because the previous message
   // generated by `syncStart` already indicated what changes we have.
-  const syncMessage = {heads: ourHeads, have: ourHave, need: ourNeed, changes: changesToSend}
+  const supportedCapabilities = syncState.readOnly ? ['read-only', 'supports-sync-reset'] : ['supports-sync-reset']
+  const syncMessage = {heads: ourHeads, have: ourHave, need: ourNeed, changes: changesToSend, supportedCapabilities}
   if (changesToSend.length > 0) {
     sentHashes = copyObject(sentHashes)
     for (const change of changesToSend) {
@@ -388,7 +417,7 @@ function generateSyncMessage(backend, syncState) {
     }
   }
 
-  syncState = Object.assign({}, syncState, {lastSentHeads: ourHeads, sentHashes})
+  syncState = Object.assign({}, syncState, {lastSentHeads: ourHeads, sentHashes, haveResponded: true})
   return [syncState, encodeSyncMessage(syncMessage)]
 }
 
@@ -427,14 +456,22 @@ function receiveSyncMessage(backend, oldSyncState, binaryMessage) {
 
   let { sharedHeads, lastSentHeads, sentHashes } = oldSyncState, patch = null
   const message = decodeSyncMessage(binaryMessage)
+  const peerReadOnly = message.supportedCapabilities.includes('read-only')
   const beforeHeads = Backend.getHeads(backend)
 
   // If we received changes, we try to apply them to the document. There may still be missing
   // dependencies due to Bloom filter false positives, in which case the backend will enqueue the
   // changes without applying them. The set of changes may also be incomplete if the sender decided
   // to break a large set of changes into chunks.
-  if (message.changes.length > 0) {
-    [backend, patch] = Backend.applyChanges(backend, message.changes)
+  if (message.changes.length > 0 && !oldSyncState.readOnly) {
+    const byteLength = message.changes.reduce((length, change) => length + change.byteLength, 0)
+    const changes = new Uint8Array(byteLength)
+    let offset = 0
+    for (let change of message.changes) {
+      changes.set(change, offset)
+      offset += change.byteLength
+    }
+    [backend, patch] = Backend.loadIncremental(backend, changes)
     sharedHeads = advanceHeads(beforeHeads, Backend.getHeads(backend), sharedHeads)
   }
 
@@ -449,7 +486,7 @@ function receiveSyncMessage(backend, oldSyncState, binaryMessage) {
   if (knownHeads.length === message.heads.length) {
     sharedHeads = message.heads
     // If the remote peer has lost all its data, reset our state to perform a full resync
-    if (message.heads.length === 0) {
+    if (message.heads.length === 0 && !peerReadOnly) {
       lastSentHeads = []
       sentHashes = []
     }
@@ -467,7 +504,10 @@ function receiveSyncMessage(backend, oldSyncState, binaryMessage) {
     theirHave: message.have, // the information we need to calculate the changes they need
     theirHeads: message.heads,
     theirNeed: message.need,
-    sentHashes
+    sentHashes,
+    readOnly: !!oldSyncState.readOnly,
+    peerReadOnly,
+    haveResponded: !!oldSyncState.haveResponded
   }
   return [backend, syncState, patch]
 }

@@ -4,6 +4,7 @@ const { decodeChange } = require('../backend/columnar')
 const { Backend } = require('../src/automerge')
 const uuid = require('../src/uuid')
 const { STATE } = require('../frontend/constants')
+const { ImmutableString, isImmutableString } = require('../src/immutable_string')
 const UUID_PATTERN = /^[0-9a-f]{32}$/
 
 describe('Automerge.Frontend', () => {
@@ -775,5 +776,107 @@ describe('Automerge.Frontend', () => {
     }
     const doc = Frontend.applyPatch(Frontend.init(), patch1)
     assert.deepStrictEqual(doc.text.toString(), '1234')
+  })
+
+  describe('modern strings', () => {
+    it('stores ordinary strings as text objects and exposes primitive values', () => {
+      const actor = 'aaaa'
+      const [doc, change] = Frontend.change(Frontend.init({actorId: actor, textV2: true}), draft => {
+        draft.title = 'a🙂b'
+        draft.items = ['value']
+        draft.raw = new ImmutableString('raw')
+      })
+
+      assert.strictEqual(doc.title, 'a🙂b')
+      assert.strictEqual(typeof doc.items[0], 'string')
+      assert.strictEqual(isImmutableString(doc.raw), true)
+      assert.strictEqual(Frontend.getText(doc, 'title').toString(), doc.title)
+      assert.strictEqual(Frontend.getObjectId(doc, 'title'), `1@${actor}`)
+      assert.deepStrictEqual(change.ops.slice(0, 2), [
+        {action: 'makeText', obj: '_root', key: 'title', insert: false, pred: []},
+        {action: 'set', obj: `1@${actor}`, elemId: '_head', insert: true, values: ['a', '🙂', 'b'], pred: []}
+      ])
+    })
+
+    it('resolves writable hidden text through map and list proxies', () => {
+      let [doc] = Frontend.change(Frontend.init({actorId: 'aaaa', textV2: true}), draft => {
+        draft.title = 'abc'
+        draft.items = ['xyz']
+      })
+
+      ;[doc] = Frontend.change(doc, draft => {
+        assert.strictEqual(typeof draft.title, 'string')
+        assert.strictEqual(Frontend.getObjectId(draft, 'title'), Frontend.getObjectId(doc, 'title'))
+        Frontend.getText(draft, 'title').insertAt(1, 'A')
+        Frontend.getText(draft.items, 0).deleteAt(1)
+      })
+
+      assert.strictEqual(doc.title, 'aAbc')
+      assert.deepStrictEqual(doc.items, ['xz'])
+    })
+
+    it('projects text patches while retaining object identity', () => {
+      const actor = 'aaaa'
+      const patch = {
+        clock: {[actor]: 1},
+        diffs: {objectId: '_root', type: 'map', props: {
+          title: {[`1@${actor}`]: {objectId: `1@${actor}`, type: 'text', edits: [
+            {action: 'multi-insert', index: 0, elemId: `2@${actor}`, values: ['a', '🙂', 'b']}
+          ]}},
+          raw: {[`5@${actor}`]: {type: 'value', value: 'raw'}}
+        }}
+      }
+      const doc = Frontend.applyPatch(Frontend.init({textV2: true}), patch)
+
+      assert.strictEqual(doc.title, 'a🙂b')
+      assert.strictEqual(Frontend.getText(doc, 'title').toString(), doc.title)
+      assert.strictEqual(Frontend.getObjectById(doc, `1@${actor}`).toString(), doc.title)
+      assert.strictEqual(isImmutableString(doc.raw), true)
+    })
+
+    it('merges concurrent edits within ordinary strings', () => {
+      let [left] = Frontend.change(Frontend.init({actorId: 'aaaa', backend: Backend, textV2: true}), draft => {
+        draft.text = 'ab'
+      })
+      const rightState = Backend.clone(Frontend.getBackendState(left))
+      let right = Frontend.applyPatch(
+        Frontend.init({actorId: 'bbbb', backend: Backend, textV2: true}),
+        Backend.getPatch(rightState), rightState
+      )
+
+      ;[left] = Frontend.change(left, draft => Frontend.getText(draft, 'text').insertAt(1, 'L'))
+      ;[right] = Frontend.change(right, draft => Frontend.getText(draft, 'text').insertAt(1, 'R'))
+      const changes = Backend.getChangesAdded(Frontend.getBackendState(left), Frontend.getBackendState(right))
+      const [leftState, patch] = Backend.applyChanges(Frontend.getBackendState(left), changes)
+      left = Frontend.applyPatch(left, patch, leftState)
+
+      assert.strictEqual(left.text, 'aRLb')
+      assert.strictEqual(typeof left.text, 'string')
+      assert.strictEqual(Frontend.getText(left, 'text').toString(), left.text)
+    })
+
+    it('returns writable object conflicts inside changes', () => {
+      let [left] = Frontend.change(Frontend.init({actorId: 'aaaa', backend: Backend, textV2: true}), draft => {
+        draft.user = {name: 'base'}
+      })
+      const rightState = Backend.clone(Frontend.getBackendState(left))
+      let right = Frontend.applyPatch(
+        Frontend.init({actorId: 'bbbb', backend: Backend, textV2: true}),
+        Backend.getPatch(rightState), rightState
+      )
+
+      ;[left] = Frontend.change(left, draft => { draft.user = {name: 'left'} })
+      ;[right] = Frontend.change(right, draft => { draft.user = {name: 'right'} })
+      const changes = Backend.getChangesAdded(Frontend.getBackendState(left), Frontend.getBackendState(right))
+      const [leftState, patch] = Backend.applyChanges(Frontend.getBackendState(left), changes)
+      left = Frontend.applyPatch(left, patch, leftState)
+      Reflect.set(Object.values(Frontend.getConflicts(left, 'user'))[0], 'name', 'ignored')
+      assert.deepStrictEqual(Object.values(Frontend.getConflicts(left, 'user')).map(user => user.name), ['right', 'left'])
+      ;[left] = Frontend.change(left, draft => {
+        for (const conflict of Object.values(Frontend.getConflicts(draft, 'user'))) conflict.name = 'same'
+      })
+
+      assert.deepStrictEqual(Object.values(Frontend.getConflicts(left, 'user')).map(user => user.name), ['same', 'same'])
+    })
   })
 })

@@ -1,11 +1,13 @@
 import * as assert from 'assert'
-import * as Automerge from 'automerge'
-import { Backend, Frontend, Counter, Doc } from 'automerge'
+import * as Automerge from '..'
+import { Backend, Frontend, Counter, Doc } from '..'
+
+const Classic: typeof Automerge = require('../src/classic')
 
 const UUID_PATTERN = /^[0-9a-f]{32}$/
 
 interface BirdList {
-  birds: Automerge.List<string>
+  birds: string[]
 }
 
 interface NumberBox {
@@ -188,9 +190,9 @@ describe('TypeScript support', () => {
       let s1: Doc<BirdList> = Automerge.init<BirdList>()
       s1 = Automerge.change(s1, doc => (doc.birds = ['goldfinch']))
       s1 = Automerge.change(s1, doc => {
-        doc.birds.insertAt(1, 'greenfinch', 'bullfinch', 'chaffinch')
-        doc.birds.deleteAt(0)
-        doc.birds.deleteAt(0, 2)
+        Automerge.insertAt(doc.birds, 1, 'greenfinch', 'bullfinch', 'chaffinch')
+        Automerge.deleteAt(doc.birds, 0)
+        Automerge.deleteAt(doc.birds, 0, 2)
       })
       assert.deepStrictEqual(s1, { birds: ['chaffinch'] })
     })
@@ -289,7 +291,7 @@ describe('TypeScript support', () => {
       s1 = Automerge.change(s1, doc => (doc.birds = []))
       let s2 = Automerge.change(s1, doc => doc.birds.push('goldfinch'))
       const changes = Automerge.getAllChanges(s2)
-      let [s3, patch] = Automerge.applyChanges(Automerge.init<BirdList>(), changes)
+      let [s3] = Automerge.applyChanges(Automerge.init<BirdList>(), changes)
       assert.deepStrictEqual(s3.birds, ['goldfinch'])
     })
 
@@ -336,6 +338,8 @@ describe('TypeScript support', () => {
   })
 
   describe('Automerge.Text', () => {
+    const Automerge = Classic
+
     interface TextDoc {
       text: Automerge.Text
     }
@@ -579,6 +583,8 @@ describe('TypeScript support', () => {
   })
 
   describe('Automerge.Observable', () => {
+    const Automerge = Classic
+
     interface TextDoc {
       text: Automerge.Text
     }

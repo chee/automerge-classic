@@ -1,9 +1,12 @@
 const { parseOpId, copyObject } = require('../src/common')
 const { COLUMN_TYPE, VALUE_TYPE, ACTIONS, OBJECT_TYPE, DOC_OPS_COLUMNS, CHANGE_COLUMNS, DOCUMENT_COLUMNS,
   encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue,
-  encodeChange, decodeChangeColumns, decodeChangeMeta, decodeChanges, decodeDocumentHeader, encodeDocumentHeader } = require('./columnar')
+  encodeChange, decodeChangeColumns, decodeChanges,
+  decodeDocumentHeader, encodeDocumentHeader } = require('./columnar')
+const ColumnData = require('./column_data')
 
 const MAX_BLOCK_SIZE = 600 // operations
+const MAX_MAP_BLOCK_SIZE = 100
 const BLOOM_BITS_PER_ENTRY = 10, BLOOM_NUM_PROBES = 7 // 1% false positive rate
 const BLOOM_FILTER_SIZE = Math.floor(BLOOM_BITS_PER_ENTRY * MAX_BLOCK_SIZE / 8) // bytes
 
@@ -14,6 +17,244 @@ const objActorIdx = 0, objCtrIdx = 1, keyActorIdx = 2, keyCtrIdx = 3, keyStrIdx 
 const PRED_COLUMN_IDS = CHANGE_COLUMNS
   .filter(column => ['predNum', 'predActor', 'predCtr'].includes(column.columnName))
   .map(column => column.columnId)
+
+const COLUMN_OPERATIONS = new WeakMap()
+const COLUMN_DATA = new WeakMap()
+const COLUMN_SLAB_OPTIONS = {slabRows: 24}
+
+function operationValueCount(column, value) {
+  if ((column.columnId & 7) === COLUMN_TYPE.VALUE_RAW) return value ? value.byteLength : 0
+  return Array.isArray(value) ? value.length : 1
+}
+
+function cacheColumnOperations(columns, operations) {
+  const offsets = columns.map(() => [0])
+  for (const operation of operations) {
+    for (let index = 0; index < columns.length; index++) {
+      const count = operationValueCount(columns[index], operation[index])
+      offsets[index].push(offsets[index][offsets[index].length - 1] + count)
+    }
+  }
+  const cache = {operations, offsets}
+  COLUMN_OPERATIONS.set(columns, cache)
+  return cache
+}
+
+function columnOperationCache(columns) {
+  let cache = COLUMN_OPERATIONS.get(columns)
+  if (cache) return cache
+  for (const column of columns) column.decoder.reset()
+  const operations = []
+  while (!columns[actionIdx].decoder.done) operations.push(readOperation(columns))
+  for (const column of columns) column.decoder.reset()
+  return cacheColumnOperations(columns, operations)
+}
+
+function copyOperation(operation) {
+  return operation.map(value => (Array.isArray(value) ? value.slice() : value))
+}
+
+function columnDataType(columnId) {
+  const type = columnId & 7
+  if (type === COLUMN_TYPE.INT_DELTA) return 'delta'
+  if (type === COLUMN_TYPE.BOOLEAN) return 'boolean'
+  if (type === COLUMN_TYPE.STRING_RLE) return 'string'
+  if (type === COLUMN_TYPE.VALUE_RAW) return 'raw'
+  return 'uint'
+}
+
+function operationColumnValues(operations, columnIndex, raw) {
+  const values = []
+  for (const operation of operations) {
+    const value = operation[columnIndex]
+    if (raw) {
+      if (value) values.push(...value)
+    } else if (Array.isArray(value)) {
+      values.push(...value)
+    } else {
+      values.push(value)
+    }
+  }
+  return values
+}
+
+function makeDataColumn(template, data) {
+  let decoder
+  const column = {
+    columnId: template.columnId,
+    get decoder() {
+      if (!decoder) decoder = decoderByColumnId(template.columnId, ColumnData.toBuffer(data))
+      return decoder
+    }
+  }
+  if (template.columnName) column.columnName = template.columnName
+  Object.defineProperty(column, 'columnData', {value: data})
+  return column
+}
+
+function columnDataForColumns(columns) {
+  let data = COLUMN_DATA.get(columns)
+  if (data) return data
+  const operations = columnOperationCache(columns).operations
+  data = columns.map((column, index) => {
+    if (column.columnData) return column.columnData
+    const raw = (column.columnId & 7) === COLUMN_TYPE.VALUE_RAW
+    return ColumnData.createColumn(
+      columnDataType(column.columnId),
+      operationColumnValues(operations, index, raw),
+      COLUMN_SLAB_OPTIONS)
+  })
+  COLUMN_DATA.set(columns, data)
+  return data
+}
+
+function columnsFromOperations(template, operations) {
+  const data = template.map((column, index) => {
+    const raw = (column.columnId & 7) === COLUMN_TYPE.VALUE_RAW
+    return ColumnData.createColumn(
+      columnDataType(column.columnId),
+      operationColumnValues(operations, index, raw),
+      COLUMN_SLAB_OPTIONS)
+  })
+  const columns = template.map((column, index) => makeDataColumn(column, data[index]))
+  COLUMN_DATA.set(columns, data)
+  cacheColumnOperations(columns, operations)
+  return columns
+}
+
+function spliceColumns(columns, startRow, endRow, operations, outputOperations) {
+  const cache = columnOperationCache(columns)
+  const data = columnDataForColumns(columns).map((column, index) => {
+    const raw = (columns[index].columnId & 7) === COLUMN_TYPE.VALUE_RAW
+    const inserted = operationColumnValues(operations, index, raw)
+    const start = cache.offsets[index][startRow]
+    const end = cache.offsets[index][endRow]
+    return ColumnData.splice(column, start, end - start, inserted)
+  })
+  const output = columns.map((column, index) => makeDataColumn(column, data[index]))
+  COLUMN_DATA.set(output, data)
+  const offsets = columns.map((column, columnIndex) => {
+    const oldOffsets = cache.offsets[columnIndex]
+    const result = oldOffsets.slice(0, startRow + 1)
+    let offset = result[result.length - 1]
+    for (const operation of operations) {
+      offset += operationValueCount(column, operation[columnIndex])
+      result.push(offset)
+    }
+    const delta = offset - oldOffsets[endRow]
+    for (let row = endRow + 1; row < oldOffsets.length; row++) result.push(oldOffsets[row] + delta)
+    return result
+  })
+  COLUMN_OPERATIONS.set(output, {operations: outputOperations, offsets})
+  return output
+}
+
+function compareUtf8(left, right) {
+  if (left === right) return 0
+  let leftIndex = 0, rightIndex = 0
+  while (leftIndex < left.length && rightIndex < right.length) {
+    let leftCode = left.charCodeAt(leftIndex++), rightCode = right.charCodeAt(rightIndex++)
+    if (leftCode >= 0xd800 && leftCode <= 0xdbff) {
+      const low = left.charCodeAt(leftIndex)
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        leftCode = 0x10000 + ((leftCode - 0xd800) << 10) + low - 0xdc00
+        leftIndex++
+      } else {
+        leftCode = 0xfffd
+      }
+    } else if (leftCode >= 0xdc00 && leftCode <= 0xdfff) {
+      leftCode = 0xfffd
+    }
+    if (rightCode >= 0xd800 && rightCode <= 0xdbff) {
+      const low = right.charCodeAt(rightIndex)
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        rightCode = 0x10000 + ((rightCode - 0xd800) << 10) + low - 0xdc00
+        rightIndex++
+      } else {
+        rightCode = 0xfffd
+      }
+    } else if (rightCode >= 0xdc00 && rightCode <= 0xdfff) {
+      rightCode = 0xfffd
+    }
+    if (leftCode < rightCode) return -1
+    if (leftCode > rightCode) return 1
+  }
+  if (leftIndex < left.length) return 1
+  if (rightIndex < right.length) return -1
+  return 0
+}
+
+function concatBuffers(buffers) {
+  const byteLength = buffers.reduce((sum, buffer) => sum + buffer.byteLength, 0)
+  const result = new Uint8Array(byteLength)
+  let offset = 0
+  for (let buffer of buffers) {
+    result.set(buffer, offset)
+    offset += buffer.byteLength
+  }
+  return result
+}
+
+function compareBlockObject(block, actorIds, actor, counter) {
+  if (block.lastObjectCtr === undefined) return 1
+  if (block.lastObjectCtr === null) return counter === null ? 0 : -1
+  if (counter === null) return 1
+  if (block.lastObjectCtr < counter) return -1
+  if (block.lastObjectCtr > counter) return 1
+  const blockActor = actorIds[block.lastObjectActor]
+  if (blockActor < actor) return -1
+  if (blockActor > actor) return 1
+  return 0
+}
+
+function findBlock(blocks, actorIds, actor, counter, key, idActor, idCtr) {
+  let left = 0, right = blocks.length - 1
+  while (left < right) {
+    const middle = (left + right) >>> 1
+    const block = blocks[middle]
+    let comparison = compareBlockObject(block, actorIds, actor, counter)
+    if (comparison === 0 && key !== null && block.lastKey !== undefined) {
+      comparison = compareUtf8(block.lastKey, key)
+      if (comparison === 0 && idCtr !== undefined) {
+        if (block.lastIdCtr < idCtr) comparison = -1
+        if (block.lastIdCtr > idCtr) comparison = 1
+        if (comparison === 0 && actorIds[block.lastIdActor] < idActor) comparison = -1
+        if (comparison === 0 && actorIds[block.lastIdActor] > idActor) comparison = 1
+      }
+    }
+    if (comparison < 0) left = middle + 1; else right = middle
+  }
+  return left
+}
+
+function visibleMapOpsCover(visibleMapOps, op) {
+  const property = JSON.stringify([op[objActorIdx], op[objCtrIdx], op[keyStrIdx]])
+  const values = visibleMapOps.changes.has(property)
+    ? visibleMapOps.changes.get(property) : visibleMapOps.base.get(property)
+  if (values === null || (values ? values.size : 0) !== op[predNumIdx]) return false
+  for (let index = 0; index < op[predNumIdx]; index++) {
+    if (!values.has(`${op[predCtrIdx][index]}@${op[predActorIdx][index]}`)) return false
+  }
+  return true
+}
+
+function updateVisibleMapOps(visibleMapOps, op) {
+  if (op[keyStrIdx] === null) return
+  const property = JSON.stringify([op[objActorIdx], op[objCtrIdx], op[keyStrIdx]])
+  const current = visibleMapOps.changes.has(property)
+    ? visibleMapOps.changes.get(property) : visibleMapOps.base.get(property)
+  const action = ACTIONS[op[actionIdx]]
+  if (current === null || !action || action === 'inc') {
+    visibleMapOps.changes.set(property, null)
+    return
+  }
+  const values = new Set(current)
+  for (let index = 0; index < op[predNumIdx]; index++) {
+    values.delete(`${op[predCtrIdx][index]}@${op[predActorIdx][index]}`)
+  }
+  if (action !== 'del') values.add(`${op[idCtrIdx]}@${op[idActorIdx]}`)
+  visibleMapOps.changes.set(property, values)
+}
 
 /**
  * Updates `objectTree`, which is a tree of nested objects, so that afterwards
@@ -29,6 +270,124 @@ function deepCopyUpdate(objectTree, path, value) {
     deepCopyUpdate(child, path.slice(1), value)
     objectTree[path[0]] = child
   }
+}
+
+function seekWithinOperations(target, cache, actorIds, resumeInsertion) {
+  const rows = cache.operations
+  const {objActor, objCtr, keyActor, keyCtr, keyStr, idActor, idCtr, insert} = target
+  let index = 0, visibleCount = 0, elemVisible = false
+
+  if (objCtr !== null && !resumeInsertion) {
+    while (index < rows.length) {
+      const row = rows[index]
+      const rowActor = row[objActorIdx] === null ? null : actorIds[row[objActorIdx]]
+      const rowCtr = row[objCtrIdx]
+      if (rowCtr === null || !rowActor || rowCtr < objCtr || (rowCtr === objCtr && rowActor < objActor)) {
+        index++
+      } else {
+        break
+      }
+    }
+  }
+
+  const first = rows[index]
+  const firstActor = first && first[objActorIdx] !== null ? actorIds[first[objActorIdx]] : null
+  if ((!first || first[objCtrIdx] !== objCtr || firstActor !== objActor) && !resumeInsertion) {
+    return {found: true, skipCount: index, visibleCount}
+  }
+
+  if (keyStr !== null) {
+    const keyStart = index
+    while (index < rows.length) {
+      const row = rows[index]
+      const rowActor = row[objActorIdx] === null ? null : actorIds[row[objActorIdx]]
+      if (row[keyStrIdx] !== null && compareUtf8(row[keyStrIdx], keyStr) < 0 &&
+          row[objCtrIdx] === objCtr && rowActor === objActor) {
+        index++
+      } else {
+        break
+      }
+    }
+    if (target.predRows) {
+      const lastIndex = rows.length - 1
+      const last = rows[lastIndex]
+      const lastActor = last && last[objActorIdx] !== null ? actorIds[last[objActorIdx]] : null
+      if (target.predRows.size === 1 && last && lastIndex >= index && last[objCtrIdx] === objCtr && lastActor === objActor &&
+          last[keyStrIdx] === keyStr && target.predRows.has(`${last[idCtrIdx]}@${last[idActorIdx]}`)) {
+        return {found: true, skipCount: lastIndex, visibleCount}
+      }
+      for (let predIndex = index; predIndex < rows.length; predIndex++) {
+        const row = rows[predIndex]
+        const rowActor = row[objActorIdx] === null ? null : actorIds[row[objActorIdx]]
+        if (row[objCtrIdx] !== objCtr || rowActor !== objActor || row[keyStrIdx] !== keyStr) break
+        if (target.predRows.has(`${row[idCtrIdx]}@${row[idActorIdx]}`)) {
+          return {found: true, skipCount: predIndex, visibleCount}
+        }
+      }
+      index = keyStart
+    }
+    return {found: true, skipCount: index, visibleCount}
+  }
+
+  if (insert) {
+    if (!resumeInsertion && keyCtr !== null && keyCtr > 0 && keyActor !== null) {
+      let found = false
+      while (index < rows.length) {
+        const row = rows[index]
+        const rowActor = row[objActorIdx] === null ? null : actorIds[row[objActorIdx]]
+        if (row[objCtrIdx] !== objCtr || rowActor !== objActor) break
+        index++
+        if (row[insertIdx]) elemVisible = false
+        if (row[succNumIdx] === 0 && ACTIONS[row[actionIdx]] !== 'mark' && !elemVisible) {
+          visibleCount++
+          elemVisible = true
+        }
+        if (row[idCtrIdx] === keyCtr && actorIds[row[idActorIdx]] === keyActor && row[insertIdx]) {
+          found = true
+          break
+        }
+      }
+      if (!found) return {found: false, skipCount: index, visibleCount}
+    }
+
+    while (index < rows.length) {
+      const row = rows[index]
+      const rowActor = row[objActorIdx] === null ? null : actorIds[row[objActorIdx]]
+      const rowIdActor = actorIds[row[idActorIdx]]
+      if (row[objCtrIdx] !== objCtr || rowActor !== objActor ||
+          (row[insertIdx] && row[idCtrIdx] < idCtr) ||
+          (row[insertIdx] && row[idCtrIdx] === idCtr && rowIdActor <= idActor)) break
+      index++
+      if (row[insertIdx]) elemVisible = false
+      if (row[succNumIdx] === 0 && ACTIONS[row[actionIdx]] !== 'mark' && !elemVisible) {
+        visibleCount++
+        elemVisible = true
+      }
+    }
+    return {found: true, skipCount: index, visibleCount}
+  }
+
+  if (keyCtr !== null && keyCtr > 0 && keyActor !== null) {
+    while (index < rows.length) {
+      const row = rows[index]
+      const rowActor = row[objActorIdx] === null ? null : actorIds[row[objActorIdx]]
+      if (row[objCtrIdx] !== objCtr || rowActor !== objActor ||
+          (row[insertIdx] && row[idCtrIdx] === keyCtr && actorIds[row[idActorIdx]] === keyActor)) break
+      index++
+      if (row[insertIdx]) elemVisible = false
+      if (row[succNumIdx] === 0 && ACTIONS[row[actionIdx]] !== 'mark' && !elemVisible) {
+        visibleCount++
+        elemVisible = true
+      }
+    }
+    const row = rows[index]
+    const rowActor = row && row[objActorIdx] !== null ? actorIds[row[objActorIdx]] : null
+    if (!row || row[objCtrIdx] !== objCtr || rowActor !== objActor ||
+        row[idCtrIdx] !== keyCtr || actorIds[row[idActorIdx]] !== keyActor || !row[insertIdx]) {
+      return {found: false, skipCount: index, visibleCount}
+    }
+  }
+  return {found: true, skipCount: index, visibleCount}
 }
 
 /**
@@ -48,12 +407,14 @@ function deepCopyUpdate(objectTree, path, value) {
  *   elements that precede the position where the new operations should be applied.
  */
 function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
+  const cached = COLUMN_OPERATIONS.get(docCols)
+  if (cached) return seekWithinOperations(ops, cached, actorIds, resumeInsertion)
   for (let col of docCols) col.decoder.reset()
   const { objActor, objCtr, keyActor, keyCtr, keyStr, idActor, idCtr, insert } = ops
   const [objActorD, objCtrD, /* keyActorD */, /* keyCtrD */, keyStrD, idActorD, idCtrD, insertD, actionD,
     /* valLenD */, /* valRawD */, /* chldActorD */, /* chldCtrD */, succNumD] = docCols.map(col => col.decoder)
   let skipCount = 0, visibleCount = 0, elemVisible = false, nextObjActor = null, nextObjCtr = null
-  let nextIdActor = null, nextIdCtr = null, nextKeyStr = null, nextInsert = null, nextSuccNum = 0
+  let nextIdActor = null, nextIdCtr = null, nextKeyStr = null, nextInsert = null, nextAction = null, nextSuccNum = 0
 
   // Seek to the beginning of the object being updated
   if (objCtr !== null && !resumeInsertion) {
@@ -81,12 +442,38 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
       nextObjActor = objActorIndex === null ? null : actorIds[objActorIndex]
       nextObjCtr = objCtrD.readValue()
       nextKeyStr = keyStrD.readValue()
-      if (nextKeyStr !== null && nextKeyStr < keyStr &&
+      if (nextKeyStr !== null && compareUtf8(nextKeyStr, keyStr) < 0 &&
           nextObjCtr === objCtr && nextObjActor === objActor) {
         skipCount += 1
       } else {
         break
       }
+    }
+    if (ops.predIds && nextKeyStr === keyStr && nextObjCtr === objCtr && nextObjActor === objActor) {
+      const keyStart = skipCount
+      objActorD.reset()
+      objCtrD.reset()
+      keyStrD.reset()
+      idActorD.reset()
+      idCtrD.reset()
+      objActorD.skipValues(skipCount)
+      objCtrD.skipValues(skipCount)
+      keyStrD.skipValues(skipCount)
+      idActorD.skipValues(skipCount)
+      idCtrD.skipValues(skipCount)
+      while (!idCtrD.done) {
+        nextObjActor = actorIds[objActorD.readValue()]
+        nextObjCtr = objCtrD.readValue()
+        nextKeyStr = keyStrD.readValue()
+        nextIdActor = actorIds[idActorD.readValue()]
+        nextIdCtr = idCtrD.readValue()
+        if (nextObjCtr !== objCtr || nextObjActor !== objActor || nextKeyStr !== keyStr) break
+        if (ops.predIds.has(`${nextIdCtr}@${nextIdActor}`)) {
+          return {found: true, skipCount, visibleCount}
+        }
+        skipCount++
+      }
+      skipCount = keyStart
     }
     return {found: true, skipCount, visibleCount}
   }
@@ -95,9 +482,12 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
   idActorD.skipValues(skipCount)
   insertD.skipValues(skipCount)
   succNumD.skipValues(skipCount)
+  actionD.reset()
+  actionD.skipValues(skipCount)
   nextIdCtr = idCtrD.readValue()
   nextIdActor = actorIds[idActorD.readValue()]
   nextInsert = insertD.readValue()
+  nextAction = actionD.readValue()
   nextSuccNum = succNumD.readValue()
 
   // If we are inserting into a list, an opId key is used, and we need to seek to a position *after*
@@ -109,7 +499,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
       skipCount += 1
       while (!idCtrD.done && !idActorD.done && (nextIdCtr !== keyCtr || nextIdActor !== keyActor)) {
         if (nextInsert) elemVisible = false
-        if (nextSuccNum === 0 && !elemVisible) {
+        if (nextSuccNum === 0 && ACTIONS[nextAction] !== 'mark' && !elemVisible) {
           visibleCount += 1
           elemVisible = true
         }
@@ -118,6 +508,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
         nextObjCtr = objCtrD.readValue()
         nextObjActor = actorIds[objActorD.readValue()]
         nextInsert = insertD.readValue()
+        nextAction = actionD.readValue()
         nextSuccNum = succNumD.readValue()
         if (nextObjCtr === objCtr && nextObjActor === objActor) skipCount += 1; else break
       }
@@ -126,7 +517,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
         return {found: false, skipCount, visibleCount}
       }
       if (nextInsert) elemVisible = false
-      if (nextSuccNum === 0 && !elemVisible) {
+      if (nextSuccNum === 0 && ACTIONS[nextAction] !== 'mark' && !elemVisible) {
         visibleCount += 1
         elemVisible = true
       }
@@ -138,6 +529,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
       nextObjCtr = objCtrD.readValue()
       nextObjActor = actorIds[objActorD.readValue()]
       nextInsert = insertD.readValue()
+      nextAction = actionD.readValue()
       nextSuccNum = succNumD.readValue()
     }
 
@@ -146,7 +538,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
            nextObjCtr === objCtr && nextObjActor === objActor) {
       skipCount += 1
       if (nextInsert) elemVisible = false
-      if (nextSuccNum === 0 && !elemVisible) {
+      if (nextSuccNum === 0 && ACTIONS[nextAction] !== 'mark' && !elemVisible) {
         visibleCount += 1
         elemVisible = true
       }
@@ -156,6 +548,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
         nextObjCtr = objCtrD.readValue()
         nextObjActor = actorIds[objActorD.readValue()]
         nextInsert = insertD.readValue()
+        nextAction = actionD.readValue()
         nextSuccNum = succNumD.readValue()
       } else {
         break
@@ -168,7 +561,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
            nextObjCtr === objCtr && nextObjActor === objActor) {
       skipCount += 1
       if (nextInsert) elemVisible = false
-      if (nextSuccNum === 0 && !elemVisible) {
+      if (nextSuccNum === 0 && ACTIONS[nextAction] !== 'mark' && !elemVisible) {
         visibleCount += 1
         elemVisible = true
       }
@@ -178,6 +571,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
         nextObjCtr = objCtrD.readValue()
         nextObjActor = actorIds[objActorD.readValue()]
         nextInsert = insertD.readValue()
+        nextAction = actionD.readValue()
         nextSuccNum = succNumD.readValue()
       } else {
         break
@@ -224,32 +618,15 @@ function visibleListElements(docState, blockIndex, objActorNum, objCtr) {
  * - `visibleCount`: if modifying a list object, the number of visible (i.e. non-deleted) list
  *   elements that precede the position where the new operations should be applied.
  */
-function seekToOp(docState, ops) {
+function seekToOp(docState, ops, startBlockIndex) {
   const { objActor, objActorNum, objCtr, keyActor, keyCtr, keyStr } = ops
-  let blockIndex = 0, totalVisible = 0
-
   // Skip any blocks that contain only objects with lower objectIds
-  if (objCtr !== null) {
-    while (blockIndex < docState.blocks.length - 1) {
-      const blockActor = docState.blocks[blockIndex].lastObjectActor === undefined ? undefined
-        : docState.actorIds[docState.blocks[blockIndex].lastObjectActor]
-      const blockCtr = docState.blocks[blockIndex].lastObjectCtr
-      if (blockCtr === null || blockCtr < objCtr || (blockCtr === objCtr && blockActor < objActor)) {
-        blockIndex++
-      } else {
-        break
-      }
-    }
-  }
+  let blockIndex = startBlockIndex === undefined
+    ? findBlock(docState.blocks, docState.actorIds, objActor, objCtr, keyStr) : startBlockIndex
+  let totalVisible = 0
 
   if (keyStr !== null) {
     // String key is used. First skip any blocks that contain only lower keys
-    while (blockIndex < docState.blocks.length - 1) {
-      const { lastObjectActor, lastObjectCtr, lastKey } = docState.blocks[blockIndex]
-      if (objCtr === lastObjectCtr && objActorNum === lastObjectActor &&
-          lastKey !== undefined && lastKey < keyStr) blockIndex++; else break
-    }
-
     // When we have a candidate block, decode it to find the exact insertion position
     const {skipCount} = seekWithinBlock(ops, docState.blocks[blockIndex].columns, docState.actorIds, false)
     return {blockIndex, skipCount, visibleCount: 0}
@@ -257,7 +634,7 @@ function seekToOp(docState, ops) {
   } else {
     // List operation
     const insertAtHead = keyCtr === null || keyCtr === 0 || keyActor === null
-    const keyActorNum = keyActor === null ? null : docState.actorIds.indexOf(keyActor)
+    const keyActorNum = keyActor === null ? null : docState.actorIndexById.get(keyActor)
     let resumeInsertion = false
 
     while (true) {
@@ -367,7 +744,7 @@ function bloomFilterContains(bloom, elemIdActor, elemIdCtr) {
  * Reads the relevant columns of a block of operations and updates that block to contain the
  * metadata we need to efficiently figure out where to insert new operations.
  */
-function updateBlockMetadata(block) {
+function updateBlockMetadata(block, visibleMapOps) {
   block.bloom = new Uint8Array(BLOOM_FILTER_SIZE)
   block.numOps = 0
   block.lastKey = undefined
@@ -378,9 +755,65 @@ function updateBlockMetadata(block) {
   block.firstVisibleCtr = undefined
   block.lastVisibleActor = undefined
   block.lastVisibleCtr = undefined
+  block.lastIdActor = undefined
+  block.lastIdCtr = undefined
+  block.hasListOps = false
+
+  const cached = COLUMN_OPERATIONS.get(block.columns)
+  if (cached) {
+    for (const op of cached.operations) {
+      block.numOps += 1
+      const objActor = op[objActorIdx], objCtr = op[objCtrIdx]
+      const keyActor = op[keyActorIdx], keyCtr = op[keyCtrIdx], keyStr = op[keyStrIdx]
+      const idActor = op[idActorIdx], idCtr = op[idCtrIdx]
+      const insert = op[insertIdx], action = op[actionIdx], succNum = op[succNumIdx]
+      block.lastIdActor = idActor
+      block.lastIdCtr = idCtr
+
+      if (block.lastObjectActor !== objActor || block.lastObjectCtr !== objCtr) {
+        block.numVisible = 0
+        block.lastObjectActor = objActor
+        block.lastObjectCtr = objCtr
+      }
+
+      if (keyStr !== null) {
+        if (visibleMapOps) {
+          const property = JSON.stringify([objActor, objCtr, keyStr])
+          const actionName = ACTIONS[action]
+          if (!actionName || actionName === 'inc') {
+            visibleMapOps.set(property, null)
+          } else if (succNum === 0 && visibleMapOps.get(property) !== null) {
+            let values = visibleMapOps.get(property)
+            if (!values) {
+              values = new Set()
+              visibleMapOps.set(property, values)
+            }
+            values.add(`${idCtr}@${idActor}`)
+          }
+        }
+        block.lastKey = keyStr
+      } else if (insert || keyCtr !== null) {
+        block.hasListOps = true
+        block.lastKey = undefined
+        const elemIdActor = insert ? idActor : keyActor
+        const elemIdCtr = insert ? idCtr : keyCtr
+        bloomFilterAdd(block.bloom, elemIdActor, elemIdCtr)
+        if (succNum === 0 && ACTIONS[action] !== 'mark') {
+          if (block.firstVisibleActor === undefined) block.firstVisibleActor = elemIdActor
+          if (block.firstVisibleCtr === undefined) block.firstVisibleCtr = elemIdCtr
+          if (block.lastVisibleActor !== elemIdActor || block.lastVisibleCtr !== elemIdCtr) {
+            block.numVisible += 1
+            block.lastVisibleActor = elemIdActor
+            block.lastVisibleCtr = elemIdCtr
+          }
+        }
+      }
+    }
+    return
+  }
 
   for (let col of block.columns) col.decoder.reset()
-  const [objActorD, objCtrD, keyActorD, keyCtrD, keyStrD, idActorD, idCtrD, insertD, /* actionD */,
+  const [objActorD, objCtrD, keyActorD, keyCtrD, keyStrD, idActorD, idCtrD, insertD, actionD,
     /* valLenD */, /* valRawD */, /* chldActorD */, /* chldCtrD */, succNumD] = block.columns.map(col => col.decoder)
 
   while (!idCtrD.done) {
@@ -388,7 +821,9 @@ function updateBlockMetadata(block) {
     const objActor = objActorD.readValue(), objCtr = objCtrD.readValue()
     const keyActor = keyActorD.readValue(), keyCtr = keyCtrD.readValue(), keyStr = keyStrD.readValue()
     const idActor = idActorD.readValue(), idCtr = idCtrD.readValue()
-    const insert = insertD.readValue(), succNum = succNumD.readValue()
+    const insert = insertD.readValue(), action = actionD.readValue(), succNum = succNumD.readValue()
+    block.lastIdActor = idActor
+    block.lastIdCtr = idCtr
 
     if (block.lastObjectActor !== objActor || block.lastObjectCtr !== objCtr) {
       block.numVisible = 0
@@ -397,9 +832,24 @@ function updateBlockMetadata(block) {
     }
 
     if (keyStr !== null) {
+      if (visibleMapOps) {
+        const property = JSON.stringify([objActor, objCtr, keyStr])
+        const actionName = ACTIONS[action]
+        if (!actionName || actionName === 'inc') {
+          visibleMapOps.set(property, null)
+        } else if (succNum === 0 && visibleMapOps.get(property) !== null) {
+          let values = visibleMapOps.get(property)
+          if (!values) {
+            values = new Set()
+            visibleMapOps.set(property, values)
+          }
+          values.add(`${idCtr}@${idActor}`)
+        }
+      }
       // Map key: for each object, record the highest key contained in the block
       block.lastKey = keyStr
     } else if (insert || keyCtr !== null) {
+      block.hasListOps = true
       // List element
       block.lastKey = undefined
       const elemIdActor = insert ? idActor : keyActor
@@ -407,7 +857,7 @@ function updateBlockMetadata(block) {
       bloomFilterAdd(block.bloom, elemIdActor, elemIdCtr)
 
       // If the list element is visible, update the block metadata accordingly
-      if (succNum === 0) {
+      if (succNum === 0 && ACTIONS[action] !== 'mark') {
         if (block.firstVisibleActor === undefined) block.firstVisibleActor = elemIdActor
         if (block.firstVisibleCtr === undefined) block.firstVisibleCtr = elemIdCtr
         if (block.lastVisibleActor !== elemIdActor || block.lastVisibleCtr !== elemIdCtr) {
@@ -424,13 +874,16 @@ function updateBlockMetadata(block) {
  * Updates a block's metadata based on an operation being added to a block.
  */
 function addBlockOperation(block, op, actorIds, isChangeOp) {
+  block.lastIdActor = op[idActorIdx]
+  block.lastIdCtr = op[idCtrIdx]
   if (op[keyStrIdx] !== null) {
     // TODO this comparison should use UTF-8 encoding, not JavaScript's UTF-16
     if (block.lastObjectCtr === op[objCtrIdx] && block.lastObjectActor === op[objActorIdx] &&
-        (block.lastKey === undefined || block.lastKey < op[keyStrIdx])) {
+        (block.lastKey === undefined || compareUtf8(block.lastKey, op[keyStrIdx]) < 0)) {
       block.lastKey = op[keyStrIdx]
     }
   } else {
+    block.hasListOps = true
     // List element
     const elemIdActor = op[insertIdx] ? op[idActorIdx] : op[keyActorIdx]
     const elemIdCtr = op[insertIdx] ? op[idCtrIdx] : op[keyCtrIdx]
@@ -438,7 +891,7 @@ function addBlockOperation(block, op, actorIds, isChangeOp) {
 
     // Set lastVisible on the assumption that this is the last op in the block; if there are further
     // ops after this one in the block, lastVisible will be overwritten again later.
-    if (op[succNumIdx] === 0 || isChangeOp) {
+    if ((op[succNumIdx] === 0 || isChangeOp) && ACTIONS[op[actionIdx]] !== 'mark') {
       if (block.firstVisibleActor === undefined) block.firstVisibleActor = elemIdActor
       if (block.firstVisibleCtr === undefined) block.firstVisibleCtr = elemIdCtr
       block.lastVisibleActor = elemIdActor
@@ -462,15 +915,28 @@ function addBlockOperation(block, op, actorIds, isChangeOp) {
  * Takes a block containing too many operations, and splits it into a sequence of adjacent blocks of
  * roughly equal size.
  */
-function splitBlock(block) {
-  for (let col of block.columns) col.decoder.reset()
-
+function splitBlock(block, maxBlockSize, operations) {
+  if (maxBlockSize === undefined) maxBlockSize = MAX_BLOCK_SIZE
   // Make each of the resulting blocks between 50% and 80% full (leaving a bit of space in each
   // block so that it doesn't get split again right away the next time an operation is added).
   // The upper bound cannot be lower than 75% since otherwise we would end up with a block less than
   // 50% full when going from two to three blocks.
-  const numBlocks = Math.ceil(block.numOps / (0.8 * MAX_BLOCK_SIZE))
+  const numBlocks = Math.ceil(block.numOps / (0.8 * maxBlockSize))
   let blocks = [], opsSoFar = 0
+
+  if (operations) {
+    for (let i = 1; i <= numBlocks; i++) {
+      const opsToCopy = Math.ceil(i * block.numOps / numBlocks) - opsSoFar
+      const blockOps = operations.slice(opsSoFar, opsSoFar + opsToCopy)
+      const newBlock = {columns: columnsFromOperations(block.columns, blockOps)}
+      updateBlockMetadata(newBlock)
+      blocks.push(newBlock)
+      opsSoFar += opsToCopy
+    }
+    return blocks
+  }
+
+  for (let col of block.columns) col.decoder.reset()
 
   for (let i = 1; i <= numBlocks; i++) {
     const opsToCopy = Math.ceil(i * block.numOps / numBlocks) - opsSoFar
@@ -497,10 +963,29 @@ function concatBlocks(blocks) {
   const encoders = blocks[0].columns.map(col => ({columnId: col.columnId, encoder: encoderByColumnId(col.columnId)}))
 
   for (let block of blocks) {
-    for (let col of block.columns) col.decoder.reset()
-    copyColumns(encoders, block.columns, block.numOps)
+    if (block.columns.every(column => column.columnData)) {
+      for (let index = 0; index < block.columns.length; index++) {
+        appendColumnData(encoders[index].encoder, block.columns[index])
+      }
+    } else {
+      for (let col of block.columns) col.decoder.reset()
+      copyColumns(encoders, block.columns, block.numOps)
+    }
   }
   return encoders
+}
+
+function appendColumnData(encoder, column) {
+  const type = column.columnId & 7
+  for (const slab of column.columnData.slabs) {
+    if (type === COLUMN_TYPE.VALUE_RAW) {
+      encoder.appendRawBytes(slab.data)
+    } else if (slab.data.byteLength === 0 && type !== COLUMN_TYPE.BOOLEAN) {
+      encoder.appendValue(null, slab.rows)
+    } else {
+      encoder.copyFrom(decoderByColumnId(column.columnId, slab.data), {count: slab.rows})
+    }
+  }
 }
 
 /**
@@ -589,7 +1074,7 @@ function readOperation(columns, actorTable) {
           value = actorTable[value]
         }
         if (col.columnId % 8 === COLUMN_TYPE.VALUE_LEN) {
-          valueBytes += colValue >>> 4
+          valueBytes += value >>> 4
         }
         colValue.push(value)
       }
@@ -609,6 +1094,40 @@ function readOperation(columns, actorTable) {
   return operation
 }
 
+function mapOperation(outCols, inCols, operation) {
+  let inIndex = 0, lastGroup = -1, lastCardinality = 0
+  const output = []
+  for (const outCol of outCols) {
+    while (inIndex < inCols.length && inCols[inIndex].columnId < outCol.columnId) inIndex++
+    if (inIndex < inCols.length && inCols[inIndex].columnId === outCol.columnId) {
+      const value = operation[inIndex]
+      if (outCol.columnId % 8 === COLUMN_TYPE.GROUP_CARD) {
+        lastGroup = outCol.columnId >> 4
+        lastCardinality = value
+      }
+      output.push(value)
+    } else if (outCol.columnId % 8 === COLUMN_TYPE.GROUP_CARD) {
+      lastGroup = outCol.columnId >> 4
+      lastCardinality = 0
+      output.push(0)
+    } else if (outCol.columnId % 8 === COLUMN_TYPE.VALUE_RAW) {
+      output.push(new Uint8Array(0))
+    } else if (outCol.columnId >> 4 === lastGroup) {
+      let blank = null
+      if (outCol.columnId % 8 === COLUMN_TYPE.BOOLEAN) blank = false
+      if (outCol.columnId % 8 === COLUMN_TYPE.VALUE_LEN) blank = 0
+      output.push(new Array(lastCardinality).fill(blank))
+    } else if (outCol.columnId % 8 === COLUMN_TYPE.BOOLEAN) {
+      output.push(false)
+    } else if (outCol.columnId % 8 === COLUMN_TYPE.VALUE_LEN) {
+      output.push(0)
+    } else {
+      output.push(null)
+    }
+  }
+  return output
+}
+
 /**
  * Appends `operation`, in the form returned by `readOperation()`, to the columns in `outCols`. The
  * argument `inCols` provides metadata about the types of columns in `operation`; the value
@@ -625,13 +1144,13 @@ function appendOperation(outCols, inCols, operation) {
         lastGroup = outCol.columnId >> 4
         lastCardinality = colValue
         outCol.encoder.appendValue(colValue)
+      } else if (outCol.columnId % 8 === COLUMN_TYPE.VALUE_RAW) {
+        if (colValue) outCol.encoder.appendRawBytes(colValue)
       } else if (outCol.columnId >> 4 === lastGroup) {
         if (!Array.isArray(colValue) || colValue.length !== lastCardinality) {
           throw new RangeError('bad group value')
         }
         for (let v of colValue) outCol.encoder.appendValue(v)
-      } else if (outCol.columnId % 8 === COLUMN_TYPE.VALUE_RAW) {
-        if (colValue) outCol.encoder.appendRawBytes(colValue)
       } else {
         outCol.encoder.appendValue(colValue)
       }
@@ -656,17 +1175,32 @@ function appendOperation(outCols, inCols, operation) {
  * we reach the end of the current block). `docOp` is null if there are no more operations.
  */
 function readNextDocOp(docState, blockIndex) {
-  let block = docState.blocks[blockIndex]
-  if (!block.columns[actionIdx].decoder.done) {
-    return {docOp: readOperation(block.columns), blockIndex}
-  } else if (blockIndex === docState.blocks.length - 1) {
-    return {docOp: null, blockIndex}
-  } else {
-    blockIndex += 1
-    block = docState.blocks[blockIndex]
-    for (let col of block.columns) col.decoder.reset()
-    return {docOp: readOperation(block.columns), blockIndex}
+  if (docState.readFromColumns) {
+    let block = docState.blocks[blockIndex]
+    if (!block.columns[actionIdx].decoder.done) {
+      return {docOp: readOperation(block.columns), blockIndex}
+    } else if (blockIndex === docState.blocks.length - 1) {
+      return {docOp: null, blockIndex}
+    } else {
+      blockIndex += 1
+      block = docState.blocks[blockIndex]
+      for (const column of block.columns) column.decoder.reset()
+      return {docOp: readOperation(block.columns), blockIndex}
+    }
   }
+  let row = docState.readBlockIndex === blockIndex ? docState.readRow : 0
+  while (blockIndex < docState.blocks.length) {
+    const operations = columnOperationCache(docState.blocks[blockIndex].columns).operations
+    if (row < operations.length) {
+      docState.readBlockIndex = blockIndex
+      docState.readRow = row + 1
+      return {docOp: copyOperation(operations[row]), blockIndex}
+    }
+    if (blockIndex === docState.blocks.length - 1) return {docOp: null, blockIndex}
+    blockIndex += 1
+    row = 0
+  }
+  return {docOp: null, blockIndex: docState.blocks.length - 1}
 }
 
 /**
@@ -691,10 +1225,10 @@ function readNextChangeOp(docState, changeState) {
 
     // Update docState based on the information in the change
     updateBlockColumns(docState, changeState.columns)
-    const {actorIds, actorTable} = getActorTable(docState.actorIds, change)
+    const {actorIds, actorTable} = getActorTable(docState.actorIds, docState.actorIndexById, change)
     docState.actorIds = actorIds
     changeState.actorTable = actorTable
-    changeState.actorIndex = docState.actorIds.indexOf(change.actorIds[0])
+    changeState.actorIndex = docState.actorIndexById.get(change.actorIds[0])
   }
 
   // Reached the end of the last change?
@@ -882,12 +1416,13 @@ function convertInsertToUpdate(edits, index, elemId) {
  * block. `newBlock` should be null if we are creating a patch for the whole document.
  */
 function updatePatchProperty(patches, newBlock, objectId, op, docState, propState, listIndex, oldSuccNum) {
+  if (ACTIONS[op[actionIdx]] === 'mark') return
   const isWholeDoc = !newBlock
   const type = op[actionIdx] < ACTIONS.length ? OBJECT_TYPE[ACTIONS[op[actionIdx]]] : null
   const opId = `${op[idCtrIdx]}@${docState.actorIds[op[idActorIdx]]}`
   const elemIdActor = op[insertIdx] ? op[idActorIdx] : op[keyActorIdx]
   const elemIdCtr = op[insertIdx] ? op[idCtrIdx] : op[keyCtrIdx]
-  const elemId = op[keyStrIdx] ? op[keyStrIdx] : `${elemIdCtr}@${docState.actorIds[elemIdActor]}`
+  const elemId = op[keyStrIdx] !== null ? op[keyStrIdx] : `${elemIdCtr}@${docState.actorIds[elemIdActor]}`
 
   // When the change contains a new make* operation (i.e. with an even-numbered action), record the
   // new parent-child relationship in objectMeta. TODO: also handle link/move operations.
@@ -1049,7 +1584,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
  * is the number of visible elements that precede the position at which we start merging.
  * `blockIndex` is the document block number from which we are currently reading.
  */
-function mergeDocChangeOps(patches, newBlock, outCols, changeState, docState, listIndex, blockIndex) {
+function mergeDocChangeOps(patches, newBlock, outCols, outOps, changeState, docState, listIndex, blockIndex) {
   const firstOp = changeState.nextOp, insert = firstOp[insertIdx]
   const objActor = firstOp[objActorIdx], objCtr = firstOp[objCtrIdx]
   const objectId = objActor === null ? '_root' : `${objCtr}@${docState.actorIds[objActor]}`
@@ -1123,12 +1658,13 @@ function mergeDocChangeOps(patches, newBlock, outCols, changeState, docState, li
           // When updating/deleting list elements, keep going if the next elemId in the change
           // equals the next elemId in the doc (i.e. we're updating several consecutive elements)
         } else if (!insert && lastOp === null && nextOp[keyStrIdx] !== null &&
-                   lastChangeKey !== null && lastChangeKey < nextOp[keyStrIdx]) {
+                   lastChangeKey !== null && compareUtf8(lastChangeKey, nextOp[keyStrIdx]) < 0) {
           // Allow a single mergeDocChangeOps call to process changes to several keys in the same
           // object, provided that they appear in ascending order
         } else break
 
         lastChangeKey = (nextOp !== null) ? nextOp[keyStrIdx] : null
+        updateVisibleMapOps(docState.visibleMapOps, changeState.nextOp)
         changeOps.push(changeState.nextOp)
         changeCols.push(changeState.columns)
         predSeen.push(new Array(changeState.nextOp[predNumIdx]))
@@ -1156,7 +1692,8 @@ function mergeDocChangeOps(patches, newBlock, outCols, changeState, docState, li
     // lexicographically first (TODO check ordering of keys beyond the basic multilingual plane).
     if (insert || !inCorrectObject ||
         (docOp[keyStrIdx] === null && changeOp[keyStrIdx] !== null) ||
-        (docOp[keyStrIdx] !== null && changeOp[keyStrIdx] !== null && changeOp[keyStrIdx] < docOp[keyStrIdx])) {
+        (docOp[keyStrIdx] !== null && changeOp[keyStrIdx] !== null &&
+         compareUtf8(changeOp[keyStrIdx], docOp[keyStrIdx]) < 0)) {
       // Take the operations from the change
       takeChangeOps = changeOps.length
       if (!inCorrectObject && !foundListElem && changeOp[keyStrIdx] === null && !changeOp[insertIdx]) {
@@ -1230,14 +1767,15 @@ function mergeDocChangeOps(patches, newBlock, outCols, changeState, docState, li
     }
 
     if (takeDocOp) {
-      appendOperation(outCols, docState.blocks[blockIndex].columns, docOp)
+      if (outCols) appendOperation(outCols, docState.blocks[blockIndex].columns, docOp)
+      if (outOps) outOps.push(docOp)
       addBlockOperation(newBlock, docOp, docState.actorIds, false)
 
       if (docOp[insertIdx] && elemVisible) {
         elemVisible = false
         listIndex++
       }
-      if (docOp[succNumIdx] === 0) elemVisible = true
+      if (docOp[succNumIdx] === 0 && ACTIONS[docOp[actionIdx]] !== 'mark') elemVisible = true
       newBlock.numOps++
       ;({ docOp, blockIndex } = readNextDocOp(docState, blockIndex))
       if (docOp !== null) {
@@ -1256,11 +1794,14 @@ function mergeDocChangeOps(patches, newBlock, outCols, changeState, docState, li
             throw new RangeError(`no matching operation for pred: ${op[predCtrIdx][j]}@${docState.actorIds[op[predActorIdx][j]]}`)
           }
         }
-        appendOperation(outCols, changeCols[i], op)
+        if (outCols) appendOperation(outCols, changeCols[i], op)
+        if (outOps) outOps.push(mapOperation(docState.blocks[blockIndex].columns, changeCols[i], op))
         addBlockOperation(newBlock, op, docState.actorIds, true)
         updatePatchProperty(patches, newBlock, objectId, op, docState, propState, listIndex)
 
-        if (op[insertIdx]) {
+        if (ACTIONS[op[actionIdx]] === 'mark') {
+          elemVisible = false
+        } else if (op[insertIdx]) {
           elemVisible = false
           listIndex++
         } else {
@@ -1282,7 +1823,8 @@ function mergeDocChangeOps(patches, newBlock, outCols, changeState, docState, li
   }
 
   if (docOp) {
-    appendOperation(outCols, docState.blocks[blockIndex].columns, docOp)
+    if (outCols) appendOperation(outCols, docState.blocks[blockIndex].columns, docOp)
+    if (outOps) outOps.push(docOp)
     newBlock.numOps++
     addBlockOperation(newBlock, docOp, docState.actorIds, false)
   }
@@ -1311,9 +1853,36 @@ function applyOps(patches, changeState, docState) {
     objId: objActor === null ? '_root' : `${objCtr}@${objActor}`
   }
 
-  const {blockIndex, skipCount, visibleCount} = seekToOp(docState, ops)
+  let startBlockIndex
+  let predIds
+  let predRows
+  if (keyStr !== null && changeState.nextOp[predNumIdx] > 0 &&
+      visibleMapOpsCover(docState.visibleMapOps, changeState.nextOp)) {
+    predIds = new Set()
+    predRows = new Set()
+    for (let index = 0; index < changeState.nextOp[predNumIdx]; index++) {
+      const predActor = docState.actorIds[changeState.nextOp[predActorIdx][index]]
+      const predCtr = changeState.nextOp[predCtrIdx][index]
+      predIds.add(`${predCtr}@${predActor}`)
+      predRows.add(`${predCtr}@${changeState.nextOp[predActorIdx][index]}`)
+      const predBlockIndex = findBlock(
+        docState.blocks, docState.actorIds, objActor, objCtr, keyStr, predActor, predCtr)
+      if (startBlockIndex === undefined || predBlockIndex < startBlockIndex) {
+        startBlockIndex = predBlockIndex
+      }
+    }
+  }
+  ops.predIds = predIds
+  ops.predRows = predRows
+  const {blockIndex, skipCount, visibleCount} = seekToOp(docState, ops, startBlockIndex)
   const block = docState.blocks[blockIndex]
-  for (let col of block.columns) col.decoder.reset()
+  const useSlabs = keyStr !== null && !block.hasListOps &&
+    (changeState.nextOp[predNumIdx] > 0 || changeState.changes.length > 1)
+  docState.readFromColumns = !useSlabs
+  if (useSlabs) {
+    docState.readBlockIndex = blockIndex
+    docState.readRow = skipCount
+  }
 
   const resetFirstVisible = (skipCount === 0) || (block.firstVisibleActor === undefined) ||
     (!insert && block.firstVisibleActor === keyActorNum && block.firstVisibleCtr === keyCtr)
@@ -1328,35 +1897,58 @@ function applyOps(patches, changeState, docState) {
     firstVisibleActor: resetFirstVisible ? undefined : block.firstVisibleActor,
     firstVisibleCtr: resetFirstVisible ? undefined : block.firstVisibleCtr,
     lastVisibleActor: undefined,
-    lastVisibleCtr: undefined
+    lastVisibleCtr: undefined,
+    lastIdActor: block.lastIdActor,
+    lastIdCtr: block.lastIdCtr,
+    hasListOps: block.hasListOps
   }
 
   // Copy the operations up to the insertion position (the first skipCount operations)
-  const outCols = block.columns.map(col => ({columnId: col.columnId, encoder: encoderByColumnId(col.columnId)}))
-  copyColumns(outCols, block.columns, skipCount)
+  const outCols = useSlabs ? null : block.columns.map(column => ({
+    columnId: column.columnId,
+    encoder: encoderByColumnId(column.columnId)
+  }))
+  const outOps = useSlabs ? columnOperationCache(block.columns).operations.slice(0, skipCount) : null
+  if (outCols) {
+    for (const column of block.columns) column.decoder.reset()
+    copyColumns(outCols, block.columns, skipCount)
+  }
 
   // Apply the operations from the change. This may cause blockIndex to move forwards if the
   // property being updated straddles a block boundary.
   const {blockIndex: lastBlockIndex, docOpsConsumed} =
-    mergeDocChangeOps(patches, newBlock, outCols, changeState, docState, visibleCount, blockIndex)
+    mergeDocChangeOps(patches, newBlock, outCols, outOps, changeState, docState, visibleCount, blockIndex)
 
   // Copy the remaining operations after the insertion position
   const lastBlock = docState.blocks[lastBlockIndex]
   let copyAfterMerge = -skipCount - docOpsConsumed
   for (let i = blockIndex; i <= lastBlockIndex; i++) copyAfterMerge += docState.blocks[i].numOps
-  copyColumns(outCols, lastBlock.columns, copyAfterMerge)
-  newBlock.numOps += copyAfterMerge
-
-  for (let col of lastBlock.columns) {
-    if (!col.decoder.done) throw new RangeError(`excess ops in column ${col.columnId}`)
+  const suffixStart = lastBlock.numOps - copyAfterMerge
+  if (useSlabs) {
+    const lastOperations = columnOperationCache(lastBlock.columns).operations
+    for (let index = suffixStart; index < lastOperations.length; index++) outOps.push(lastOperations[index])
   }
+  if (outCols) {
+    copyColumns(outCols, lastBlock.columns, copyAfterMerge)
+    for (const column of lastBlock.columns) {
+      if (!column.decoder.done) throw new RangeError(`excess ops in column ${column.columnId}`)
+    }
+  }
+  newBlock.numOps += copyAfterMerge
+  if (copyAfterMerge > 0 && lastBlock.hasListOps) newBlock.hasListOps = true
 
-  newBlock.columns = outCols.map(col => {
-    const decoder = decoderByColumnId(col.columnId, col.encoder.buffer)
-    return {columnId: col.columnId, decoder}
-  })
-
-  if (blockIndex === lastBlockIndex && newBlock.numOps <= MAX_BLOCK_SIZE) {
+  const maxBlockSize = keyStr === null || newBlock.hasListOps ? MAX_BLOCK_SIZE : MAX_MAP_BLOCK_SIZE
+  if (blockIndex === lastBlockIndex && newBlock.numOps <= maxBlockSize) {
+    if (outCols) {
+      newBlock.columns = outCols.map(column => ({
+        columnId: column.columnId,
+        decoder: decoderByColumnId(column.columnId, column.encoder.buffer)
+      }))
+    } else {
+      const insertedEnd = outOps.length - copyAfterMerge
+      newBlock.columns = spliceColumns(
+        block.columns, skipCount, suffixStart, outOps.slice(skipCount, insertedEnd), outOps)
+    }
     // The result is just one output block
     if (copyAfterMerge > 0 && block.lastVisibleActor !== undefined && block.lastVisibleCtr !== undefined) {
       // It's possible that none of the ops after the merge point are visible, in which case the
@@ -1369,12 +1961,26 @@ function applyOps(patches, changeState, docState) {
       newBlock.lastVisibleActor = block.lastVisibleActor
       newBlock.lastVisibleCtr = block.lastVisibleCtr
     }
+    if (copyAfterMerge > 0) {
+      newBlock.lastIdActor = block.lastIdActor
+      newBlock.lastIdCtr = block.lastIdCtr
+    }
 
     docState.blocks[blockIndex] = newBlock
 
   } else {
     // Oversized output block must be split into smaller blocks
-    const newBlocks = splitBlock(newBlock)
+    let newBlocks
+    if (outCols) {
+      newBlock.columns = outCols.map(column => ({
+        columnId: column.columnId,
+        decoder: decoderByColumnId(column.columnId, column.encoder.buffer)
+      }))
+      newBlocks = splitBlock(newBlock, maxBlockSize)
+    } else {
+      newBlock.columns = block.columns
+      newBlocks = splitBlock(newBlock, maxBlockSize, outOps)
+    }
     docState.blocks.splice(blockIndex, lastBlockIndex - blockIndex + 1, ...newBlocks)
   }
 }
@@ -1431,18 +2037,19 @@ function updateBlockColumns(docState, changeCols) {
  * `actorTable[i]` contains the document's actor index for the actor that has index `i` in the
  * change (`i == 0` is the author of the change).
  */
-function getActorTable(actorIds, change) {
-  if (actorIds.indexOf(change.actorIds[0]) < 0) {
+function getActorTable(actorIds, actorIndexById, change) {
+  if (!actorIndexById.has(change.actorIds[0])) {
     if (change.seq !== 1) {
       throw new RangeError(`Seq ${change.seq} is the first change for actor ${change.actorIds[0]}`)
     }
     // Use concat, not push, so that the original array is not mutated
     actorIds = actorIds.concat([change.actorIds[0]])
+    actorIndexById.set(change.actorIds[0], actorIds.length - 1)
   }
   const actorTable = [] // translate from change's actor index to doc's actor index
   for (let actorId of change.actorIds) {
-    const index = actorIds.indexOf(actorId)
-    if (index < 0) {
+    const index = actorIndexById.get(actorId)
+    if (index === undefined) {
       throw new RangeError(`actorId ${actorId} is not known to document`)
     }
     actorTable.push(index)
@@ -1480,8 +2087,8 @@ function setupPatches(patches, objectIds, docState) {
             const seekPos = {
               objActor: obj.actorId,  objCtr: obj.counter,
               keyActor: elem.actorId, keyCtr: elem.counter,
-              objActorNum: docState.actorIds.indexOf(obj.actorId),
-              keyActorNum: docState.actorIds.indexOf(elem.actorId),
+              objActorNum: docState.actorIndexById.get(obj.actorId),
+              keyActorNum: docState.actorIndexById.get(elem.actorId),
               keyStr:   null,         insert: false,
               objId:    objectId
             }
@@ -1586,6 +2193,13 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
   }
 
   if (applied.length > 0) {
+    for (const change of applied) {
+      const docCols = docState.blocks[0].columns
+      if (change.columns.some(changeCol => !PRED_COLUMN_IDS.includes(changeCol.columnId) &&
+          !docCols.some(docCol => docCol.columnId === changeCol.columnId))) {
+        updateBlockColumns(docState, makeDecoders(change.columns, CHANGE_COLUMNS))
+      }
+    }
     let changeState = {changes: applied, changeIndex: -1, objectIds}
     readNextChangeOp(docState, changeState)
     while (!changeState.done) applyOps(patches, changeState, docState)
@@ -1602,6 +2216,7 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
  * about the parent and children of each object in the document.
  */
 function documentPatch(docState) {
+  docState.readFromColumns = true
   for (let col of docState.blocks[0].columns) col.decoder.reset()
   let propState = {}, docOp = null, blockIndex = 0
   let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
@@ -1623,7 +2238,7 @@ function documentPatch(docState) {
       elemVisible = false
       listIndex++
     }
-    if (docOp[succNumIdx] === 0) elemVisible = true
+    if (docOp[succNumIdx] === 0 && ACTIONS[docOp[actionIdx]] !== 'mark') elemVisible = true
     if (docOp[idCtrIdx] > docState.maxOp) docState.maxOp = docOp[idCtrIdx]
     for (let i = 0; i < docOp[succNumIdx]; i++) {
       if (docOp[succCtrIdx][i] > docState.maxOp) docState.maxOp = docOp[succCtrIdx][i]
@@ -1668,18 +2283,28 @@ function readDocumentChanges(doc) {
   }
   const headActors = [...headIndexes].map(index => doc.actorIds[actorNums[index]]).sort()
 
-  for (let col of columns) col.decoder.reset()
-  const encoders = columns.map(col => ({columnId: col.columnId, encoder: encoderByColumnId(col.columnId)}))
-  copyColumns(encoders, columns, numChanges)
-  return {clock, headActors, encoders, numChanges}
+  for (const column of columns) column.decoder.reset()
+  for (let index = 0; index < numChanges; index++) readOperation(columns)
+  for (const column of columns) {
+    if (!column.decoder.done) throw new RangeError(`excess values in column ${column.columnId}`)
+  }
+
+  return {clock, headActors, numChanges}
+}
+
+function copyDocumentChanges(columns, numChanges) {
+  const decoders = makeDecoders(columns, DOCUMENT_COLUMNS)
+  const encoders = decoders.map(col => ({columnId: col.columnId, encoder: encoderByColumnId(col.columnId)}))
+  copyColumns(encoders, decoders, numChanges)
+  return encoders
 }
 
 /**
  * Records the metadata about a change in the appropriate columns.
  */
-function appendChange(columns, change, actorIds, changeIndexByHash) {
+function appendChange(columns, change, actorIndexById, changeIndexByHash) {
   appendOperation(columns, DOCUMENT_COLUMNS, [
-    actorIds.indexOf(change.actor), // actor
+    actorIndexById.get(change.actor), // actor
     change.seq, // seq
     change.maxOp, // maxOp
     change.time, // time
@@ -1691,30 +2316,74 @@ function appendChange(columns, change, actorIds, changeIndexByHash) {
   ])
 }
 
+function buildCursorIndex(blocks, actorIds, objectId) {
+  const object = parseOpId(objectId)
+  const elements = [], byId = new Map()
+  for (const block of blocks) {
+    for (const column of block.columns) column.decoder.reset()
+    while (!block.columns[actionIdx].decoder.done) {
+      const op = readOperation(block.columns, actorIds)
+      const matches = objectId === '_root'
+        ? op[objCtrIdx] === null
+        : op[objCtrIdx] === object.counter && op[objActorIdx] === object.actorId
+      if (!matches || op[keyStrIdx] !== null || op[actionIdx] === ACTIONS.indexOf('mark')) continue
+      if (op[insertIdx]) {
+        const id = `${op[idCtrIdx]}@${op[idActorIdx]}`
+        const key = op[keyCtrIdx] === 0 ? '_head' : `${op[keyCtrIdx]}@${op[keyActorIdx]}`
+        elements.push(id)
+        byId.set(id, {key, visible: op[succNumIdx] === 0})
+      } else {
+        const id = `${op[keyCtrIdx]}@${op[keyActorIdx]}`
+        const element = byId.get(id)
+        if (element && op[succNumIdx] === 0) element.visible = true
+      }
+    }
+  }
+  let visibleIndex = 0
+  for (const id of elements) {
+    const element = byId.get(id)
+    element.after = visibleIndex
+    if (element.visible) element.position = visibleIndex++
+  }
+  return byId
+}
+
 class BackendDoc {
   constructor(buffer) {
     this.maxOp = 0
+    this.numChangeOps = 0
     this.haveHashGraph = false
     this.changes = []
+    this.historyHashes = []
     this.changeIndexByHash = {}
     this.dependenciesByHash = {}
     this.dependentsByHash = {}
     this.hashesByActor = {}
     this.actorIds = []
+    this.actorIndexById = new Map()
     this.heads = []
     this.clock = {}
     this.queue = []
+    this.saveCursor = 0
+    this.historyMeta = null
     this.objectMeta = {_root: {parentObj: null, parentKey: null, opId: null, type: 'map', children: {}}}
+    this.visibleMapOps = new Map()
+    this.cursorIndex = new Map()
 
     if (buffer) {
       const doc = decodeDocumentHeader(buffer)
-      const {clock, headActors, encoders, numChanges} = readDocumentChanges(doc)
+      const {clock, headActors, numChanges} = readDocumentChanges(doc)
       this.binaryDoc = buffer
+      this.numChangeOps = null
       this.changes = new Array(numChanges)
+      this.historyHashes = new Array(numChanges)
+      this.saveCursor = numChanges
       this.actorIds = doc.actorIds
+      this.actorIndexById = new Map(this.actorIds.map((actor, index) => [actor, index]))
       this.heads = doc.heads
       this.clock = clock
-      this.changesEncoders = encoders
+      this.changesColumns = doc.changesColumns
+      this.changesEncoders = null
       this.extraBytes = doc.extraBytes
 
       // If there is a single head, we can unambiguously point at the actorId and sequence number of
@@ -1739,10 +2408,7 @@ class BackendDoc {
       }
 
       this.blocks = [{columns: makeDecoders(doc.opsColumns, DOC_OPS_COLUMNS)}]
-      updateBlockMetadata(this.blocks[0])
-      if (this.blocks[0].numOps > MAX_BLOCK_SIZE) {
-        this.blocks = splitBlock(this.blocks[0])
-      }
+      updateBlockMetadata(this.blocks[0], this.visibleMapOps)
 
       let docState = {blocks: this.blocks, actorIds: this.actorIds, objectMeta: this.objectMeta, maxOp: 0}
       this.initPatch = documentPatch(docState)
@@ -1751,6 +2417,7 @@ class BackendDoc {
     } else {
       this.haveHashGraph = true
       this.changesEncoders = DOCUMENT_COLUMNS.map(col => ({columnId: col.columnId, encoder: encoderByColumnId(col.columnId)}))
+      this.changesColumns = null
       this.blocks = [{
         columns: makeDecoders([], DOC_OPS_COLUMNS),
         bloom: new Uint8Array(BLOOM_FILTER_SIZE),
@@ -1762,7 +2429,10 @@ class BackendDoc {
         firstVisibleActor: undefined,
         firstVisibleCtr: undefined,
         lastVisibleActor: undefined,
-        lastVisibleCtr: undefined
+        lastVisibleCtr: undefined,
+        lastIdActor: undefined,
+        lastIdCtr: undefined,
+        hasListOps: false
       }]
     }
   }
@@ -1771,21 +2441,33 @@ class BackendDoc {
    * Makes a copy of this BackendDoc that can be independently modified.
    */
   clone() {
-    if (!this.haveHashGraph) this.computeHashGraph()
     let copy = new BackendDoc()
     copy.maxOp = this.maxOp
+    copy.numChangeOps = this.numChangeOps
     copy.haveHashGraph = this.haveHashGraph
     copy.changes = this.changes.slice()
+    copy.historyHashes = this.historyHashes.slice()
     copy.changeIndexByHash = copyObject(this.changeIndexByHash)
     copy.dependenciesByHash = copyObject(this.dependenciesByHash)
     copy.dependentsByHash = Object.entries(this.dependentsByHash).reduce((acc, [k, v]) => { acc[k] = v.slice(); return acc }, {})
     copy.hashesByActor = Object.entries(this.hashesByActor).reduce((acc, [k, v]) => { acc[k] = v.slice(); return acc }, {})
     copy.actorIds = this.actorIds // immutable, no copying needed
+    copy.actorIndexById = this.actorIndexById
     copy.heads = this.heads // immutable, no copying needed
     copy.clock = this.clock // immutable, no copying needed
     copy.blocks = this.blocks // immutable, no copying needed
     copy.objectMeta = this.objectMeta // immutable, no copying needed
+    copy.visibleMapOps = new Map(this.visibleMapOps)
+    copy.cursorIndex = this.cursorIndex
     copy.queue = this.queue // immutable, no copying needed
+    copy.saveCursor = this.saveCursor
+    copy.changesEncoders = this.changesEncoders &&
+      this.changesEncoders.map(col => ({columnId: col.columnId, encoder: col.encoder.clone()}))
+    copy.changesColumns = this.changesColumns
+    copy.binaryDoc = this.binaryDoc
+    copy.initPatch = this.initPatch
+    copy.extraBytes = this.extraBytes
+    copy.historyMeta = this.historyMeta
     return copy
   }
 
@@ -1812,11 +2494,13 @@ class BackendDoc {
     let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
     let docState = {
       maxOp: this.maxOp,
-      changeIndexByHash: this.changeIndexByHash,
+      changeIndexByHash: Object.create(this.changeIndexByHash),
       actorIds: this.actorIds,
+      actorIndexById: new Map(this.actorIndexById),
       heads: this.heads,
       clock: this.clock,
       blocks: this.blocks.slice(),
+      visibleMapOps: {base: this.visibleMapOps, changes: new Map()},
       objectMeta: Object.assign({}, this.objectMeta)
     }
     let queue = (this.queue.length === 0) ? decodedChanges : decodedChanges.concat(this.queue)
@@ -1836,15 +2520,24 @@ class BackendDoc {
       if (applied.length === 0) {
         if (this.haveHashGraph) break
         this.computeHashGraph()
-        docState.changeIndexByHash = this.changeIndexByHash
+        docState.changeIndexByHash = Object.create(this.changeIndexByHash)
+        for (let i = 0; i < allApplied.length; i++) {
+          docState.changeIndexByHash[allApplied[i].hash] = this.changes.length + i
+        }
       }
     }
 
     setupPatches(patches, objectIds, docState)
 
+    if (allApplied.length > 0 && !this.changesEncoders) {
+      this.changesEncoders = copyDocumentChanges(this.changesColumns, this.changes.length)
+      this.changesColumns = null
+    }
+
     // Update the document state only if `applyChanges` does not throw an exception
     for (let change of allApplied) {
       this.changes.push(change.buffer)
+      this.historyHashes.push(change.hash)
       if (!this.hashesByActor[change.actor]) this.hashesByActor[change.actor] = []
       this.hashesByActor[change.actor][change.seq - 1] = change.hash
       this.changeIndexByHash[change.hash] = this.changes.length - 1
@@ -1854,18 +2547,29 @@ class BackendDoc {
         if (!this.dependentsByHash[dep]) this.dependentsByHash[dep] = []
         this.dependentsByHash[dep].push(change.hash)
       }
-      appendChange(this.changesEncoders, change, docState.actorIds, this.changeIndexByHash)
+      appendChange(this.changesEncoders, change, docState.actorIndexById, this.changeIndexByHash)
+      if (this.numChangeOps !== null) this.numChangeOps += change.maxOp - change.startOp + 1
     }
 
     this.maxOp        = docState.maxOp
     this.actorIds     = docState.actorIds
+    this.actorIndexById = docState.actorIndexById
     this.heads        = docState.heads
     this.clock        = docState.clock
     this.blocks       = docState.blocks
     this.objectMeta   = docState.objectMeta
+    for (const [property, values] of docState.visibleMapOps.changes) {
+      if (values && values.size === 0) this.visibleMapOps.delete(property)
+      else this.visibleMapOps.set(property, values)
+    }
     this.queue        = queue
     this.binaryDoc    = null
     this.initPatch    = null
+    if (objectIds.size > 0) {
+      this.cursorIndex = new Map(this.cursorIndex)
+      for (const objectId of objectIds) this.cursorIndex.delete(objectId)
+    }
+    if (allApplied.length > 0) this.historyMeta = null
 
     let patch = {
       maxOp: this.maxOp, clock: this.clock, deps: this.heads,
@@ -1885,30 +2589,49 @@ class BackendDoc {
    * graph is later needed (e.g. for the sync protocol), this function fills it in.
    */
   computeHashGraph() {
-    const binaryDoc = this.save()
-    this.haveHashGraph = true
-    this.changes = []
-    this.changeIndexByHash = {}
-    this.dependenciesByHash = {}
-    this.dependentsByHash = {}
-    this.hashesByActor = {}
-    this.clock = {}
+    const saveCursor = this.saveCursor
+    let binaryDoc
+    try {
+      binaryDoc = this.save()
+    } finally {
+      this.saveCursor = saveCursor
+    }
+    const changes = []
+    const historyHashes = []
+    const changeIndexByHash = {}
+    const dependenciesByHash = {}
+    const dependentsByHash = {}
+    const hashesByActor = {}
+    const clock = {}
+    let numChangeOps = 0
 
     for (let change of decodeChanges([binaryDoc])) {
       const binaryChange = encodeChange(change) // TODO: avoid decoding and re-encoding again
-      this.changes.push(binaryChange)
-      this.changeIndexByHash[change.hash] = this.changes.length - 1
-      this.dependenciesByHash[change.hash] = change.deps
-      this.dependentsByHash[change.hash] = []
-      for (let dep of change.deps) this.dependentsByHash[dep].push(change.hash)
-      if (change.seq === 1) this.hashesByActor[change.actor] = []
-      this.hashesByActor[change.actor].push(change.hash)
-      const expectedSeq = (this.clock[change.actor] || 0) + 1
+      changes.push(binaryChange)
+      historyHashes.push(change.hash)
+      changeIndexByHash[change.hash] = changes.length - 1
+      dependenciesByHash[change.hash] = change.deps
+      dependentsByHash[change.hash] = []
+      for (let dep of change.deps) dependentsByHash[dep].push(change.hash)
+      if (change.seq === 1) hashesByActor[change.actor] = []
+      hashesByActor[change.actor].push(change.hash)
+      const expectedSeq = (clock[change.actor] || 0) + 1
       if (change.seq !== expectedSeq) {
         throw new RangeError(`Expected seq ${expectedSeq}, got seq ${change.seq} from actor ${change.actor}`)
       }
-      this.clock[change.actor] = change.seq
+      clock[change.actor] = change.seq
+      numChangeOps += change.ops.length
     }
+    this.haveHashGraph = true
+    this.changes = changes
+    this.historyHashes = historyHashes
+    this.changeIndexByHash = changeIndexByHash
+    this.dependenciesByHash = dependenciesByHash
+    this.dependentsByHash = dependentsByHash
+    this.hashesByActor = hashesByActor
+    this.clock = clock
+    this.numChangeOps = numChangeOps
+    this.historyMeta = null
   }
 
   /**
@@ -1938,6 +2661,7 @@ class BackendDoc {
     // Depth-first traversal of the hash graph to find all changes that depend on `haveDeps`
     while (stack.length > 0) {
       const hash = stack.pop()
+      if (seenHashes[hash]) continue
       seenHashes[hash] = true
       toReturn.push(hash)
       if (!this.dependenciesByHash[hash].every(dep => seenHashes[dep])) {
@@ -1969,7 +2693,7 @@ class BackendDoc {
       }
     }
 
-    return this.changes.filter(change => !seenHashes[decodeChangeMeta(change, true).hash])
+    return this.changes.filter((change, index) => !seenHashes[this.historyHashes[index]])
   }
 
   /**
@@ -2001,6 +2725,35 @@ class BackendDoc {
     return this.changes[this.changeIndexByHash[hash]]
   }
 
+  getHistoryMeta() {
+    if (!this.haveHashGraph) this.computeHashGraph()
+    if (!this.historyMeta) {
+      this.historyMeta = Object.freeze(this.historyHashes.map((hash, index) => Object.freeze({
+        index,
+        hash,
+        deps: Object.freeze(this.dependenciesByHash[hash].slice())
+      })))
+    }
+    return this.historyMeta
+  }
+
+  getChangesByHash(hashes) {
+    if (!Array.isArray(hashes)) throw new TypeError('Pass an array of hashes to Backend.getChangesByHash()')
+    if (!this.haveHashGraph) this.computeHashGraph()
+    const seen = new Set(), indexes = []
+    for (const hash of hashes) {
+      if (seen.has(hash)) throw new RangeError('Backend.getChangesByHash() hashes must be unique')
+      seen.add(hash)
+      const index = this.changeIndexByHash[hash]
+      if (!Number.isInteger(index) || this.historyHashes[index] !== hash) {
+        throw new RangeError(`Unknown change hash: ${hash}`)
+      }
+      indexes.push(index)
+    }
+    indexes.sort((left, right) => left - right)
+    return indexes.map(index => this.changes[index])
+  }
+
   /**
    * Returns the hashes of any missing dependencies, i.e. where we have tried to apply a change that
    * has a dependency on a change we have not seen.
@@ -2012,6 +2765,7 @@ class BackendDoc {
    * the returned array.
    */
   getMissingDeps(heads = []) {
+    if (heads.length === 0 && this.queue.length === 0) return []
     if (!this.haveHashGraph) this.computeHashGraph()
 
     let allDeps = new Set(heads), inQueue = new Set()
@@ -2027,30 +2781,105 @@ class BackendDoc {
     return missing.sort()
   }
 
+  hasHeads(heads) {
+    if (!this.haveHashGraph) this.computeHashGraph()
+    return heads.every(hash => this.changeIndexByHash[hash] !== undefined)
+  }
+
+  getCursorPosition(objectId, elemId, move) {
+    let index = this.cursorIndex.get(objectId)
+    if (!index) {
+      index = buildCursorIndex(this.blocks, this.actorIds, objectId)
+      this.cursorIndex.set(objectId, index)
+    }
+    const element = index.get(elemId)
+    if (!element) throw new RangeError('getCursorPosition() received an unknown cursor')
+    if (element.visible) return element.position
+    if (move === 'after') return element.after
+    if (element.before !== undefined) return element.before
+    let key = element.key
+    while (key !== '_head') {
+      const parent = index.get(key)
+      if (!parent) break
+      if (parent.visible) {
+        element.before = parent.position
+        return element.before
+      }
+      key = parent.key
+    }
+    element.before = 0
+    return element.before
+  }
+
+  getChangesMeta(heads) {
+    return this.getChanges(heads).map(buffer => {
+      const change = decodeChangeColumns(buffer)
+      const actionColumn = change.columns.find(column => column.columnId === CHANGE_COLUMNS[actionIdx].columnId)
+      if (!actionColumn) throw new RangeError('change is missing action column')
+      const actions = decoderByColumnId(actionColumn.columnId, actionColumn.buffer)
+      let numOps = 0
+      while (!actions.done) {
+        actions.readValue()
+        numOps++
+      }
+      return {
+        actor: change.actor,
+        seq: change.seq,
+        startOp: change.startOp,
+        maxOp: change.startOp + numOps - 1,
+        time: change.time,
+        message: change.message,
+        deps: change.deps,
+        hash: change.hash
+      }
+    })
+  }
+
+  topoHistoryTraversal() {
+    if (!this.haveHashGraph) this.computeHashGraph()
+    return this.historyHashes.slice()
+  }
+
+  stats() {
+    if (!this.haveHashGraph) this.computeHashGraph()
+    return {numChanges: this.changes.length, numOps: this.numChangeOps, numActors: this.actorIds.length}
+  }
+
+  saveIncremental() {
+    if (this.saveCursor === this.changes.length) return new Uint8Array()
+    if (this.changes.slice(this.saveCursor).some(change => !change)) this.computeHashGraph()
+    const bytes = concatBuffers(this.changes.slice(this.saveCursor))
+    this.saveCursor = this.changes.length
+    return bytes
+  }
+
+  saveSince(heads) {
+    return concatBuffers(this.getChanges(heads))
+  }
+
   /**
    * Serialises the current document state into a single byte array.
    */
   save() {
+    this.saveCursor = this.changes.length
     if (this.binaryDoc) return this.binaryDoc
+    if (!this.changesEncoders) {
+      this.changesEncoders = copyDocumentChanges(this.changesColumns, this.changes.length)
+      this.changesColumns = null
+    }
 
     // Getting the byte array for the changes columns finalises their encoders, after which we can
     // no longer append values to them. We therefore copy their data over to fresh encoders.
-    const newEncoders = this.changesEncoders.map(col => ({columnId: col.columnId, encoder: encoderByColumnId(col.columnId)}))
-    const decoders = this.changesEncoders.map(col => {
-      const decoder = decoderByColumnId(col.columnId, col.encoder.buffer)
-      return {columnId: col.columnId, decoder}
-    })
-    copyColumns(newEncoders, decoders, this.changes.length)
+    const changesColumns = this.changesEncoders.map(col => ({columnId: col.columnId, encoder: col.encoder.clone()}))
 
     this.binaryDoc = encodeDocumentHeader({
-      changesColumns: this.changesEncoders,
+      changesColumns,
       opsColumns: concatBlocks(this.blocks),
       actorIds: this.actorIds, // TODO: sort actorIds (requires transforming all actorId columns in opsColumns)
       heads: this.heads,
       headsIndexes: this.heads.map(hash => this.changeIndexByHash[hash]),
       extraBytes: this.extraBytes
     })
-    this.changesEncoders = newEncoders
     return this.binaryDoc
   }
 
@@ -2068,4 +2897,4 @@ class BackendDoc {
   }
 }
 
-module.exports = { MAX_BLOCK_SIZE, BackendDoc, bloomFilterContains }
+module.exports = { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, bloomFilterContains }

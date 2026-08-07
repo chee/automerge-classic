@@ -1,0 +1,1 @@
+module.exports = {automergeWasmBase64: ''}

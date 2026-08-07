@@ -36,7 +36,15 @@ describe('change encoding', () => {
       0x7f, 2 // predCtr column: 2
     ])
     const decoded = decodeChange(encodeChange(change1))
-    assert.deepStrictEqual(decoded, Object.assign({hash: decoded.hash}, change1))
+    const expected = Object.assign({hash: decoded.hash}, change1, {
+      message: null,
+      ops: change1.ops.map(op => {
+        const normalized = Object.assign({}, op)
+        if (!normalized.insert) delete normalized.insert
+        return normalized
+      })
+    })
+    assert.deepStrictEqual(decoded, expected)
   })
 
   it('should require strict ordering of preds', () => {
@@ -49,6 +57,41 @@ describe('change encoding', () => {
       126, 139, 1, 0
     ])
     assert.throws(() => { decodeChange(change) }, /operation IDs are not in ascending order/)
+  })
+
+  it('should decode unknown scalar types like 3.2', () => {
+    const change = new Uint8Array([
+      0x85, 0x6f, 0x4a, 0x83, 0xc4, 0x72, 0x47, 0xf0, 1, 51, 0, 2, 0x12, 0x34, 1, 1, 0, 0, 0, 9,
+      0x15, 3, 0x34, 1, 0x42, 2, 0x56, 2, 0x57, 4, 0x70, 2, 0xf0, 1, 2, 0xf1, 1, 2, 0xf3, 1, 2,
+      0x7f, 1, 0x78, 1, 0x7f, 1, 0x7f, 0x4e, 1, 2, 3, 4, 0x7f, 0, 0x7f, 2, 2, 0, 2, 1
+    ])
+    assert.deepStrictEqual(decodeChange(change), {
+      actor: '1234',
+      seq: 1,
+      startOp: 1,
+      time: 0,
+      message: null,
+      deps: [],
+      ops: [{action: 'set', obj: '_root', key: 'x', value: {type_code: 14, bytes: [1, 2, 3, 4]}, pred: []}],
+      hash: 'c47247f01a9cc36830473660932f9d866f766efd73f6ebdf30d9c95755c4c705'
+    })
+    assert.deepStrictEqual(decodeChange(change, true).ops, [{
+      action: 'set', obj: '_root', key: 'x', insert: false,
+      value: new Uint8Array([1, 2, 3, 4]), datatype: 14, pred: []
+    }])
+  })
+
+  it('should validate but not compare a supplied hash', () => {
+    const change = {actor: 'aaaa', seq: 1, startOp: 1, time: 0, message: null, deps: [], ops: [
+      {action: 'set', obj: '_root', key: 'x', value: 1, datatype: 'uint', pred: []}
+    ]}
+    const encoded = encodeChange(change)
+    checkEncoded(encoded, encodeChange(Object.assign({}, change, {hash: '0'.repeat(64)})))
+    checkEncoded(encoded, encodeChange(Object.assign({}, change, {hash: 'A'.repeat(64)})))
+    checkEncoded(encoded, encodeChange(Object.assign({}, change, {hash: null})))
+    assert.throws(() => { encodeChange(Object.assign({}, change, {hash: ''})) }, /32-byte hexadecimal string/)
+    assert.throws(() => { encodeChange(Object.assign({}, change, {hash: '0'.repeat(63)})) }, /32-byte hexadecimal string/)
+    assert.throws(() => { encodeChange(Object.assign({}, change, {hash: 0})) }, /32-byte hexadecimal string/)
   })
 
   describe('with trailing bytes', () => {
@@ -73,7 +116,21 @@ describe('change encoding', () => {
     it('should allow decoding and re-encoding', () => {
       // NOTE: This calls the JavaScript encoding and decoding functions, even when the WebAssembly
       // backend is loaded. Should the wasm backend export its own functions for testing?
-      checkEncoded(change, encodeChange(decodeChange(change)))
+      const decoded = decodeChange(change)
+      assert.deepStrictEqual(decoded.extra_bytes, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+      assert.strictEqual(decoded.extraBytes, undefined)
+      checkEncoded(change, encodeChange(decoded))
+
+      const raw = decodeChange(change, true)
+      assert(raw.extraBytes instanceof Uint8Array)
+      assert.strictEqual(raw.extra_bytes, undefined)
+      checkEncoded(change, encodeChange(raw))
+    })
+
+    it('should validate extra_bytes', () => {
+      const decoded = decodeChange(change)
+      assert.throws(() => { encodeChange(Object.assign({}, decoded, {extra_bytes: new Uint8Array([1])})) }, /array of bytes/)
+      assert.throws(() => { encodeChange(Object.assign({}, decoded, {extra_bytes: [256]})) }, /array of bytes/)
     })
 
     it('should be preserved in document encoding', () => {

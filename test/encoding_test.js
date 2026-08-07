@@ -4,6 +4,29 @@ const { Encoder, Decoder, RLEEncoder, RLEDecoder, DeltaEncoder, DeltaDecoder, Bo
 
 describe('Binary encoding', () => {
   describe('Encoder and Decoder', () => {
+    it('should clone unfinished encoder state', () => {
+      const cases = [
+        {make: () => new RLEEncoder('utf8'), first: ['a', 'a', 'b'], second: ['c']},
+        {make: () => new DeltaEncoder(), first: [10, 11, 12], second: [20]},
+        {make: () => new BooleanEncoder(), first: [false, false, true], second: [false]}
+      ]
+      for (let example of cases) {
+        const encoder = example.make(), before = example.make(), after = example.make()
+        for (let value of example.first) {
+          encoder.appendValue(value)
+          before.appendValue(value)
+          after.appendValue(value)
+        }
+        const clone = encoder.clone()
+        for (let value of example.second) {
+          encoder.appendValue(value)
+          after.appendValue(value)
+        }
+        assert.deepStrictEqual([...clone.buffer], [...before.buffer])
+        assert.deepStrictEqual([...encoder.buffer], [...after.buffer])
+      }
+    })
+
     describe('32-bit LEB128 encoding', () => {
       it('should encode unsigned integers', () => {
         function encode(value) {

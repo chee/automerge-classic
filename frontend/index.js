@@ -1,7 +1,7 @@
-const { OPTIONS, CACHE, STATE, OBJECT_ID, CONFLICTS, CHANGE, ELEM_IDS } = require('./constants')
+const { OPTIONS, CACHE, STATE, OBJECT_ID, CONFLICTS, CHANGE, ELEM_IDS, PROXY_PATH } = require('./constants')
 const { isObject, copyObject } = require('../src/common')
 const uuid = require('../src/uuid')
-const { interpretPatch, cloneRootObject } = require('./apply_patch')
+const { interpretPatch, cloneRootObject, lamportCompare } = require('./apply_patch')
 const { rootObjectProxy } = require('./proxies')
 const { Context } = require('./context')
 const { Text } = require('./text')
@@ -95,7 +95,7 @@ function makeChange(doc, context, options) {
   }
 
   if (doc[OPTIONS].backend) {
-    const [backendState, patch, binaryChange] = doc[OPTIONS].backend.applyLocalChange(state.backendState, change)
+    const [backendState, patch, binaryChange, localChangeOnly] = doc[OPTIONS].backend.applyLocalChange(state.backendState, change)
     state.backendState = backendState
     state.lastLocalChange = binaryChange
     // NOTE: When performing a local change, the patch is effectively applied twice -- once by the
@@ -103,7 +103,15 @@ function makeChange(doc, context, options) {
     // (after a round-trip through the backend). This is perhaps more robust, as changes only take
     // effect in the form processed by the backend, but the downside is a performance cost.
     // Should we change this?
-    const newDoc = applyPatchToDoc(doc, patch, state, true)
+    let newDoc
+    if (localChangeOnly) {
+      state.clock = patch.clock
+      state.deps = patch.deps
+      state.maxOp = Math.max(state.maxOp, patch.maxOp)
+      newDoc = updateRootObject(doc, context.updated, state)
+    } else {
+      newDoc = applyPatchToDoc(doc, patch, state, true)
+    }
     const patchCallback = options && options.patchCallback || doc[OPTIONS].patchCallback
     if (patchCallback) patchCallback(patch, doc, newDoc, true, [binaryChange])
     return [newDoc, change]
@@ -146,7 +154,7 @@ function getLastLocalChange(doc) {
 function applyPatchToDoc(doc, patch, state, fromBackend) {
   const actor = getActorId(doc)
   const updated = {}
-  interpretPatch(patch.diffs, doc, updated)
+  interpretPatch(patch.diffs, doc, updated, !!doc[OPTIONS].textV2)
 
   if (fromBackend) {
     if (!patch.clock) throw new RangeError('patch is missing clock field')
@@ -329,8 +337,30 @@ function applyPatch(doc, patch, backendState = undefined) {
 /**
  * Returns the Automerge object ID of the given object.
  */
-function getObjectId(object) {
-  return object[OBJECT_ID]
+function internalValue(object, key) {
+  const context = object && object[CHANGE]
+  const container = context ? context.getObject(object[OBJECT_ID]) : object
+  const values = container && container[CONFLICTS] && container[CONFLICTS][key]
+  if (!values) return container && container[key]
+  const opIds = Object.keys(values).sort(lamportCompare).reverse()
+  return values[opIds[0]]
+}
+
+function getObjectId(object, prop) {
+  if (arguments.length > 1) {
+    const value = internalValue(object, prop)
+    return value && value[OBJECT_ID]
+  }
+  return object && object[OBJECT_ID]
+}
+
+function getText(object, prop) {
+  const value = internalValue(object, prop)
+  if (!(value instanceof Text)) return
+  const context = object && object[CHANGE]
+  if (!context) return value
+  const path = object[PROXY_PATH].concat([{key: prop, objectId: value[OBJECT_ID]}])
+  return context.instantiateObject(path, value[OBJECT_ID])
 }
 
 /**
@@ -366,16 +396,55 @@ function setActorId(doc, actorId) {
   return updateRootObject(doc, {}, state)
 }
 
+function readonlyConflict(value, proxies) {
+  if (!isObject(value) || !value[OBJECT_ID] || value instanceof Text || value instanceof Table) return value
+  if (proxies.has(value)) return proxies.get(value)
+  const proxy = new Proxy(value, {
+    get(target, key) {
+      const descriptor = Object.getOwnPropertyDescriptor(target, key)
+      if (descriptor && !descriptor.configurable && !descriptor.writable) return target[key]
+      return readonlyConflict(target[key], proxies)
+    },
+    set() {
+      return false
+    },
+    deleteProperty() {
+      return false
+    },
+    defineProperty() {
+      return false
+    }
+  })
+  proxies.set(value, proxy)
+  return proxy
+}
+
 /**
  * Fetches the conflicts on the property `key` of `object`, which may be any
  * object in a document. If `object` is a list, then `key` must be a list
  * index; if `object` is a map, then `key` must be a property name.
  */
 function getConflicts(object, key) {
-  if (object[CONFLICTS] && object[CONFLICTS][key] &&
-      Object.keys(object[CONFLICTS][key]).length > 1) {
-    return object[CONFLICTS][key]
+  const context = object && object[CHANGE]
+  const container = context ? context.getObject(object[OBJECT_ID]) : object
+  const values = container && container[CONFLICTS] && container[CONFLICTS][key]
+  if (!values || Object.keys(values).length <= 1) return
+  if (!context) {
+    const conflicts = {}, proxies = new WeakMap()
+    for (const opId of Object.keys(values)) conflicts[opId] = readonlyConflict(values[opId], proxies)
+    return conflicts
   }
+  const conflicts = {}
+  for (const opId of Object.keys(values)) {
+    const value = values[opId]
+    if (isObject(value) && value[OBJECT_ID]) {
+      const path = object[PROXY_PATH].concat([{key, objectId: value[OBJECT_ID]}])
+      conflicts[opId] = context.instantiateObject(path, value[OBJECT_ID])
+    } else {
+      conflicts[opId] = value
+    }
+  }
+  return conflicts
 }
 
 /**
@@ -410,7 +479,7 @@ function getElementIds(list) {
 
 module.exports = {
   init, from, change, emptyChange, applyPatch,
-  getObjectId, getObjectById, getActorId, setActorId, getConflicts, getLastLocalChange,
+  getObjectId, getObjectById, getText, getActorId, setActorId, getConflicts, getLastLocalChange,
   getBackendState, getElementIds,
   Text, Table, Counter, Observable, Float64, Int, Uint
 }

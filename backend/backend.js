@@ -1,4 +1,5 @@
-const { encodeChange } = require('./columnar')
+const { encodeChange, splitContainers } = require('./columnar')
+const { encodeBundle, decodeBundle } = require('./bundle')
 const { BackendDoc } = require('./new')
 const { backendState } = require('./util')
 
@@ -53,6 +54,7 @@ function hashByActor(state, actorId, index) {
  */
 function applyLocalChange(backend, change) {
   const state = backendState(backend)
+  const changesBefore = state.changes.length
   if (change.seq <= state.clock[change.actor] || 0) {
     throw new RangeError('Change request has already been applied')
   }
@@ -87,7 +89,7 @@ function applyLocalChange(backend, change) {
   // On the patch we send out, omit the last local change hash
   const lastHash = hashByActor(state, change.actor, change.seq - 1)
   patch.deps = patch.deps.filter(head => head !== lastHash)
-  return [{state, heads: state.heads}, patch, binaryChange]
+  return [{state, heads: state.heads}, patch, binaryChange, state.changes.length === changesBefore + 1]
 }
 
 /**
@@ -97,13 +99,25 @@ function save(backend) {
   return backendState(backend).save()
 }
 
+function saveIncremental(backend) {
+  return backendState(backend).saveIncremental()
+}
+
+function saveSince(backend, heads) {
+  return backendState(backend).saveSince(heads)
+}
+
 /**
  * Loads the document and/or changes contained in an Uint8Array, and returns a
  * backend initialised with this state.
  */
 function load(data) {
-  const state = new BackendDoc(data)
-  return {state, heads: state.heads}
+  const chunks = splitContainers(data)
+  if (chunks.length === 1 && chunks[0][8] === 0) {
+    const state = new BackendDoc(data)
+    return {state, heads: state.heads}
+  }
+  return loadIncremental(init(), data)[0]
 }
 
 /**
@@ -118,6 +132,34 @@ function loadChanges(backend, changes) {
   state.applyChanges(changes)
   backend.frozen = true
   return {state, heads: state.heads}
+}
+
+function loadIncremental(backend, data) {
+  const current = backendState(backend)
+  const chunks = splitContainers(data)
+  if (chunks.length === 0) return [backend, null]
+
+  let state = current, replaced = false, changes = []
+  for (let chunk of chunks) {
+    if (chunk[8] === 0 && current.changes.length === 0 && current.heads.length === 0 && changes.length === 0) {
+      state = new BackendDoc(chunk)
+      replaced = true
+    } else if (chunk[8] === 0) {
+      const loaded = new BackendDoc(chunk)
+      loaded.computeHashGraph()
+      changes.push(...loaded.changes)
+    } else if (chunk[8] === 1 || chunk[8] === 2) {
+      changes.push(chunk)
+    } else if (chunk[8] === 3) {
+      changes.push(...decodeBundle(chunk).changeBytes)
+    }
+  }
+
+  let patch = null
+  if (changes.length > 0) patch = state.applyChanges(changes)
+  if (replaced) patch = state.getPatch()
+  backend.frozen = true
+  return [{state, heads: state.heads}, patch]
 }
 
 /**
@@ -191,7 +233,49 @@ function getMissingDeps(backend, heads = []) {
   return backendState(backend).getMissingDeps(heads)
 }
 
+function hasHeads(backend, heads) {
+  return backendState(backend).hasHeads(heads)
+}
+
+function getCursorPosition(backend, objectId, elemId, move) {
+  return backendState(backend).getCursorPosition(objectId, elemId, move)
+}
+
+function getChangesMeta(backend, heads = []) {
+  return backendState(backend).getChangesMeta(heads)
+}
+
+function getHistoryMeta(backend) {
+  return backendState(backend).getHistoryMeta()
+}
+
+function getChangesByHash(backend, hashes) {
+  return backendState(backend).getChangesByHash(hashes)
+}
+
+function topoHistoryTraversal(backend) {
+  return backendState(backend).topoHistoryTraversal()
+}
+
+function stats(backend) {
+  return backendState(backend).stats()
+}
+
+function saveBundle(changes) {
+  return encodeBundle(changes)
+}
+
+function saveBundleByHash(backend, hashes) {
+  return encodeBundle(backendState(backend).getChangesByHash(hashes))
+}
+
+function readBundle(data) {
+  return decodeBundle(data)
+}
+
 module.exports = {
-  init, clone, free, applyChanges, applyLocalChange, save, load, loadChanges, getPatch,
-  getHeads, getAllChanges, getChanges, getChangesAdded, getChangeByHash, getMissingDeps
+  init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
+  load, loadChanges, loadIncremental, getPatch, getHeads, getAllChanges, getChanges,
+  getChangesAdded, getChangeByHash, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta,
+  getHistoryMeta, getChangesByHash, topoHistoryTraversal, stats, saveBundle, saveBundleByHash, readBundle
 }

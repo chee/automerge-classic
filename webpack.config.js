@@ -1,8 +1,28 @@
 const path = require('path')
 
-module.exports = {
-  entry: './src/automerge.js',
+const common = {
   mode: 'development',
+  devtool: 'source-map',
+  module: {rules: []},
+  target: 'browserslist:web'
+}
+
+function moduleConfig(entry, filename) {
+  return Object.assign({}, common, {
+    entry,
+    experiments: {outputModule: true},
+    output: {
+      filename,
+      library: {type: 'module'},
+      path: path.resolve(__dirname, 'dist'),
+      chunkLoading: false,
+      module: true
+    }
+  })
+}
+
+module.exports = [Object.assign({}, common, {
+  entry: './src/automerge.js',
   output: {
     filename: 'automerge.js',
     library: 'Automerge',
@@ -12,8 +32,5 @@ module.exports = {
     globalObject: 'this',
     // https://github.com/webpack/webpack/issues/11660
     chunkLoading: false,
-  },
-  devtool: 'source-map',
-  module: {rules: []},
-  target: "browserslist:web"
-}
+  }
+}), moduleConfig('./src/automerge.mjs', 'automerge.mjs'), moduleConfig('./src/classic.mjs', 'classic.mjs')]

@@ -60,6 +60,21 @@ class Encoder {
     this.offset = 0
   }
 
+  clone() {
+    const copy = Object.create(Object.getPrototypeOf(this))
+    for (let key of Object.keys(this)) {
+      if (key === 'buf') {
+        copy.buf = new Uint8Array(Math.max(16, this.offset))
+        copy.buf.set(this.buf.subarray(0, this.offset))
+      } else if (Array.isArray(this[key])) {
+        copy[key] = this[key].slice()
+      } else {
+        copy[key] = this[key]
+      }
+    }
+    return copy
+  }
+
   /**
    * Returns the byte array containing the encoded data.
    */

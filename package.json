@@ -1,14 +1,75 @@
 {
-  "name": "automerge",
+  "name": "@automerge/automerge-classic",
   "version": "1.0.1-preview.7",
   "description": "Data structures for building collaborative applications",
-  "main": "src/automerge.js",
-  "browser": "dist/automerge.js",
+  "main": "./src/automerge.js",
+  "module": "./dist/automerge.mjs",
+  "browser": "./dist/automerge.mjs",
   "types": "@types/automerge/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./@types/automerge/index.d.ts",
+      "workerd": {
+        "import": "./dist/automerge.mjs",
+        "require": "./src/automerge.js"
+      },
+      "node": {
+        "import": "./src/automerge.mjs",
+        "require": "./src/automerge.js"
+      },
+      "browser": {
+        "import": "./dist/automerge.mjs",
+        "require": "./src/automerge.js"
+      },
+      "import": "./dist/automerge.mjs",
+      "require": "./src/automerge.js"
+    },
+    "./slim": {
+      "types": "./@types/automerge/index.d.ts",
+      "workerd": {
+        "import": "./dist/automerge.mjs",
+        "require": "./src/slim.js"
+      },
+      "node": {
+        "import": "./src/slim.mjs",
+        "require": "./src/slim.js"
+      },
+      "browser": {
+        "import": "./dist/automerge.mjs",
+        "require": "./src/slim.js"
+      },
+      "import": "./dist/automerge.mjs",
+      "require": "./src/slim.js"
+    },
+    "./classic": {
+      "types": "./@types/automerge/index.d.ts",
+      "workerd": {
+        "import": "./dist/classic.mjs",
+        "require": "./src/classic.js"
+      },
+      "node": {
+        "import": "./src/classic.mjs",
+        "require": "./src/classic.js"
+      },
+      "browser": {
+        "import": "./dist/classic.mjs",
+        "require": "./src/classic.js"
+      },
+      "import": "./dist/classic.mjs",
+      "require": "./src/classic.js"
+    },
+    "./automerge.wasm": "./src/automerge.wasm",
+    "./automerge.wasm.base64": {
+      "types": "./@types/automerge/automerge_wasm_base64.d.ts",
+      "import": "./src/automerge_wasm_base64.mjs",
+      "require": "./src/automerge_wasm_base64.js"
+    }
+  },
   "scripts": {
     "browsertest": "karma start",
     "coverage": "nyc --reporter=html --reporter=text mocha",
-    "test": "mocha",
+    "test:esm": "webpack && node --experimental-vm-modules test/esm_smoke.js",
+    "test": "tsc --noEmit && mocha",
     "testwasm": "mocha --file test/wasm.js",
     "build": "webpack && copyfiles --flat @types/automerge/index.d.ts dist",
     "prepublishOnly": "npm run-script build",
