@@ -4,7 +4,7 @@ const { Text } = require('./text')
 const { Table } = require('./table')
 const { Counter, getWriteableCounter } = require('./counter')
 const { Int, Uint, Float64 } = require('./numbers')
-const { isObject, parseOpId, createArrayOfNulls } = require('../src/common')
+const { isObject, parseOpId, createArrayOfNulls, wellFormedString } = require('../src/common')
 const { isImmutableString } = require('../src/immutable_string')
 const uuid = require('../src/uuid')
 
@@ -54,10 +54,11 @@ class Context {
     if (!['object', 'boolean', 'number', 'string'].includes(typeof value)) {
       throw new TypeError(`Unsupported type of value: ${typeof value}`)
     }
+    if (typeof value === 'string') value = wellFormedString(value)
 
     if (isObject(value)) {
       if (isImmutableString(value)) {
-        return {type: 'value', value: value.val}
+        return {type: 'value', value: wellFormedString(value.val)}
       } else if (ArrayBuffer.isView(value)) {
         return {type: 'value', value: new Uint8Array(value.buffer, value.byteOffset, value.byteLength)}
       } else if (value instanceof Date) {
@@ -269,7 +270,7 @@ class Context {
       this.addOp(elemId ? {action: 'makeMap', obj, elemId, insert, pred}
                         : {action: 'makeMap', obj, key, insert, pred})
       let props = {}
-      for (let nested of Object.keys(value).sort()) {
+      for (let nested of Object.keys(value)) {
         const opId = this.nextOpId()
         const valuePatch = this.setValue(objectId, nested, value[nested], false, [])
         props[nested] = {[opId]: valuePatch}
@@ -296,6 +297,7 @@ class Context {
     if (!objectId) {
       throw new RangeError('setValue needs an objectId')
     }
+    if (typeof value === 'string') value = wellFormedString(value)
     if (typeof value === 'string' && this.textV2 && !stringValue) {
       return this.createNestedObjects(objectId, key, new Text(value), insert, pred, elemId)
     } else if (isObject(value) && !isImmutableString(value) && !ArrayBuffer.isView(value) && !(value instanceof Date) &&

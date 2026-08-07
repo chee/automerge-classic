@@ -62,24 +62,31 @@ Measured in one local process before the current adaptive-slab change:
 
 A global 100-operation block experiment reduced the 6,000-write case to 411 ms, list appends to 148 ms, map growth to 319 ms, and text appends to 97 ms. Seven fresh-process adaptive medians before live operation slabs were 478.316 ms, 226.698 ms, 388.032 ms, and 158.000 ms respectively while preserving the large text/list blocks and their raw encoding tests. Rust/WASM 3.2 medians were 182.266 ms, 168.893 ms, 437.112 ms, and 84.901 ms.
 
-Current seven-process medians after selective live slabs:
+Current paired seven-process medians after selective live slabs:
 
-| Workload | Classic JS | Rust/WASM 3.2 | Ratio |
+Each sample ran in a fresh Node process. Implementation order alternated between samples. Module initialization and workload setup were outside the timed regions.
+
+| Workload | Classic JS | Rust/WASM 3.2.5 | Classic/WASM |
 | --- | ---: | ---: | ---: |
-| 6,000 writes to one numeric map property | 376.896 ms | 182.266 ms | 2.07× |
-| 3,000 numeric list appends | 224.797 ms | 168.893 ms | 1.33× |
-| 2,000 distinct numeric map properties | 369.849 ms | 437.112 ms | 0.85× |
-| 2,000 one-character text appends | 168.788 ms | 84.901 ms | 1.99× |
+| 6,000 writes to one numeric map property | 433.712 ms | 174.101 ms | 2.49× |
+| 3,000 numeric list appends | 248.245 ms | 168.843 ms | 1.47× |
+| 2,000 distinct numeric map properties | 417.135 ms | 434.996 ms | 0.96× |
+| 2,000 one-character text appends | 196.303 ms | 80.910 ms | 2.43× |
 
-Additional seven-process medians:
+Additional paired seven-process medians:
 
-| Workload | Classic adaptive | Rust/WASM 3.2 | Ratio |
+| Workload | Classic adaptive | Rust/WASM 3.2.5 | Classic/WASM |
+| --- | ---: | ---: | ---: |
+| Cold save after 6,000 overwrites | 6.163 ms | 2.661 ms | 2.32× |
+| Load that document | 13.374 ms | 17.351 ms | 0.77× |
+| Merge two 1,000-write branches | 16.465 ms | 18.076 ms | 0.91× |
+
+Earlier independent seven-process medians:
+
+| Workload | Classic adaptive | Rust/WASM 3.2 | Classic/WASM |
 | --- | ---: | ---: | ---: |
 | 1,000 cursors in a 21,000-character edited text | 15.049 ms | 6.802 ms | 2.21× |
-| Cold save after 6,000 overwrites | 5.734 ms | 2.011 ms | 2.85× |
-| Load that document | 13.365 ms | 17.683 ms | 0.76× |
 | Warm cached save | 0.002 ms | 0.408 ms | 0.005× |
-| Merge two 1,000-write branches | 16.592 ms | 13.444 ms | 1.23× |
 
 The cursor index improved the repeated lookup fixture by 14.05×. A representative first lookup builds the index and UTF-16 table in about 13.7 ms; the next 999 lookups total about 0.5 ms. Lazy load improved the 6,000-overwrite fixture by 20.56×. The first mutation after load pays about 8 ms locally to materialize mutable structures.
 
@@ -118,6 +125,22 @@ The cursor index improved the repeated lookup fixture by 14.05×. A representati
 - Automerge Repo and solid-primitives source typechecks have passed against the classic package declarations.
 - Strict package-consumer TypeScript resolves the override and accepts 3.2 list helpers, insert patch metadata, open operation actions, and the base64 wasm subpath.
 
+### Rust behavior parity
+
+- Map key enumeration matches the Rust implementation: each apply adds its new keys in UTF-8 order after existing keys, load and `toJS` produce fully sorted keys, and object-literal insertion order is preserved in generated operations.
+- `getConflicts` returns conflicting values in ascending opId order.
+- Semantic patches carry `conflict: true` on conflicted puts and `conflicts` arrays on conflicted list inserts, and patch emission for new and changed objects is ordered by object creation, matching Rust output for load, applyChanges, sync, and diff.
+- `updateText` is a port of the Rust Myers diff over graphemes, producing identical operations and change hashes, and tolerating inline block markers.
+- `updateSpans` is a port of the Rust Myers block diff with the replace combiner, the `after` default expand, and mark reconciliation against the updated document.
+- Mark boundaries honor the `expand` flags when resolving positions, so text inserted at an expanding boundary joins the mark exactly as in Rust.
+- Strings are stored well-formed: unpaired surrogates become U+FFFD at ingestion, so live documents match their saved-and-reloaded form and the Rust in-memory representation.
+- `getChanges` ignores heads unknown to the new document instead of throwing.
+- `from()` no longer sets an "Initialization" change message.
+- `updateBlock` deletes and reinserts the block marker, and `splitBlock` emits the `type` property first.
+- `test/rust_parity_test.js` pins these behaviors with expectations captured from the Rust implementation; `test/live_interop_test.js` runs 16 cross-implementation integration tests (identical hashes for identical API calls, cross loads, bidirectional sync with concurrent edits, rich text and marks over sync, patch and diff parity, cursors, incremental saves, an automerge-repo-style lifecycle, and export-surface coverage) against `AUTOMERGE_MODERN_PATH` or a built `../automerge/javascript`, and skips when neither is available.
+- Read-only backend operations (`stats`, `hasHeads`, `save`, `saveSince`, `getChanges`, `getChangeByHash`, `getMissingDeps`, cursor and history/fragment reads, `getChangesAdded`) accept outdated document snapshots, reading the live state like the Rust implementation. Mutating operations still reject them. Automerge Repo calls these on old snapshots while handling inbound sync.
+- Every document root also carries the wasm implementation's globally registered symbols: `Symbol.for('_am_objectId')` is `'_root'`, and `Symbol.for('_am_meta')` exposes `{handle, heads, ...}` with a read-only handle facade (`getHeads`, `diff`, `materialize`, `stats`, `save`, `saveSince`, `getChangesMeta`, `topoHistoryTraversal`). Plugin bundles that ship their own copy of the wasm `@automerge/automerge` (for example Patchwork package bundles) read documents through these symbols; the facade lets them project classic documents. Verified with Patchwork's Playwright end-to-end suite: 12 of 13 chromium tests pass over the classic override; the remaining failure (cross-profile sync via the live sync server) also fails — earlier — with the wasm fragment-branch build, so it is not a classic regression.
+
 ### Tests currently present
 
 - JS/Rust document, change, bundle, sync, bytes, Unicode, table, and conflict fixtures.
@@ -136,7 +159,9 @@ The cursor index improved the repeated lookup fixture by 14.05×. A representati
 - Randomized staged/current comparison across sequential map edits and concurrent branches, using both batched and one-change-at-a-time application.
 - Batched future-column retention, grouped future value/raw columns, exact future-column history reconstruction, and transactional failure recovery.
 - Exact semantic patches for local changes, load, applyChanges, merge, and sync.
-- Current source result: 668 passing, 1 pending, no failures; TypeScript passes.
+- Rust parity regressions for key ordering, conflicts, patch order, updateText, updateSpans, mark boundaries, surrogate handling, and getChanges.
+- Live cross-implementation integration tests against the built `../automerge/javascript` package.
+- Current source result: 707 passing, 1 pending, no failures; TypeScript passes; lint passes; ESM smoke passes.
 
 ## Implementation checklist
 
@@ -255,6 +280,8 @@ The packed override passes CommonJS root, Node ESM root, slim, classic, raw zero
 - `getBackend()` returns the classic opaque backend wrapper rather than a wasm object. Automerge Repo does not inspect this boundary.
 - Exact history reconstruction after loading a saved document is impossible for a hypothetical future column whose values are all encoding defaults within a change. The document format stores the merged column values but no per-change column-presence bit. `getChanges()` detects the hash mismatch and leaves the loaded backend unchanged.
 - `backend/column_data.js` is internal. Its immutable slab sharing relies on internal callers not mutating returned slab objects or byte arrays.
+- The Rust implementation iterates a `std::collections::HashMap` when generating the property operations of a block marker, so the operation order of a multi-property block (and therefore the change hash) is nondeterministic in Rust itself. Classic uses a fixed deterministic order (`type` first for `splitBlock`, sorted for `updateBlock`); either order interoperates.
+- `diff()` emits the same patch set with the same per-object grouping and object ordering as Rust, but within one object Rust orders patches by the operation order of the underlying changes, while classic orders deletions first and then keys in sorted order. Patches on distinct keys commute, so applying the patches yields the same result.
 
 ## Known non-goals unless a consumer requires them
 

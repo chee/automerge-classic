@@ -1,5 +1,5 @@
-const { isObject, copyObject, parseOpId } = require('../src/common')
-const { OBJECT_ID, CONFLICTS, ELEM_IDS } = require('./constants')
+const { isObject, copyObject, parseOpId, compareUtf8 } = require('../src/common')
+const { OBJECT_ID, CONFLICTS, ELEM_IDS, NEW_KEYS } = require('./constants')
 const { Text, instantiateText } = require('./text')
 const { instantiateTable } = require('./table')
 const { Counter } = require('./counter')
@@ -58,8 +58,11 @@ function lamportCompare(ts1, ts2) {
 function applyProperties(props, object, conflicts, updated, textV2) {
   if (!props) return
 
-  for (let key of Object.keys(props)) {
-    const values = {}, opIds = Object.keys(props[key]).sort(lamportCompare).reverse()
+  // Keys are applied in UTF-8 order and conflicting values are kept in
+  // ascending opId order, so that the key enumeration order of the updated
+  // object and of getConflicts() matches the Rust implementation.
+  for (let key of Object.keys(props).sort(compareUtf8)) {
+    const values = {}, opIds = Object.keys(props[key]).sort(lamportCompare)
     for (let opId of opIds) {
       const subpatch = props[key][opId]
       if (conflicts[key] && conflicts[key][opId]) {
@@ -74,7 +77,8 @@ function applyProperties(props, object, conflicts, updated, textV2) {
       delete object[key]
       delete conflicts[key]
     } else {
-      const value = values[opIds[0]]
+      const value = values[opIds[opIds.length - 1]]
+      if (object[NEW_KEYS] && !Object.prototype.hasOwnProperty.call(object, key)) object[NEW_KEYS].add(key)
       object[key] = textV2 && value instanceof Text ? value.toJSON() : value
       conflicts[key] = values
     }
@@ -90,6 +94,7 @@ function cloneMapObject(originalObject, objectId) {
   const conflicts = copyObject(originalObject ? originalObject[CONFLICTS] : undefined)
   Object.defineProperty(object, OBJECT_ID, {value: objectId})
   Object.defineProperty(object, CONFLICTS, {value: conflicts})
+  Object.defineProperty(object, NEW_KEYS,  {value: new Set()})
   return object
 }
 
@@ -299,6 +304,24 @@ function cloneRootObject(root) {
   return cloneMapObject(root, '_root')
 }
 
+/**
+ * Moves the keys added to the map object `object` since it was cloned to the
+ * end of its enumeration order, sorted by UTF-8 encoding. This matches the
+ * Rust implementation, where each apply appends its new keys in sorted order
+ * while existing keys keep their position.
+ */
+function reorderNewKeys(object) {
+  const newKeys = object[NEW_KEYS]
+  if (!newKeys || newKeys.size === 0) return
+  const keys = [...newKeys].filter(key => Object.prototype.hasOwnProperty.call(object, key)).sort(compareUtf8)
+  for (const key of keys) {
+    const value = object[key]
+    delete object[key]
+    object[key] = value
+  }
+  newKeys.clear()
+}
+
 module.exports = {
-  interpretPatch, cloneRootObject, lamportCompare
+  interpretPatch, cloneRootObject, lamportCompare, reorderNewKeys
 }

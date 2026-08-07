@@ -50,6 +50,74 @@ function createArrayOfNulls(length) {
   return array
 }
 
+/**
+ * Compares two strings by the UTF-8 encoding of their content, matching the
+ * key ordering used by the Rust implementation. Unpaired surrogates compare
+ * as the replacement character U+FFFD.
+ */
+function compareUtf8(left, right) {
+  if (left === right) return 0
+  let leftIndex = 0, rightIndex = 0
+  while (leftIndex < left.length && rightIndex < right.length) {
+    let leftCode = left.charCodeAt(leftIndex++), rightCode = right.charCodeAt(rightIndex++)
+    if (leftCode >= 0xd800 && leftCode <= 0xdbff) {
+      const low = left.charCodeAt(leftIndex)
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        leftCode = 0x10000 + ((leftCode - 0xd800) << 10) + low - 0xdc00
+        leftIndex++
+      } else {
+        leftCode = 0xfffd
+      }
+    } else if (leftCode >= 0xdc00 && leftCode <= 0xdfff) {
+      leftCode = 0xfffd
+    }
+    if (rightCode >= 0xd800 && rightCode <= 0xdbff) {
+      const low = right.charCodeAt(rightIndex)
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        rightCode = 0x10000 + ((rightCode - 0xd800) << 10) + low - 0xdc00
+        rightIndex++
+      } else {
+        rightCode = 0xfffd
+      }
+    } else if (rightCode >= 0xdc00 && rightCode <= 0xdfff) {
+      rightCode = 0xfffd
+    }
+    if (leftCode < rightCode) return -1
+    if (leftCode > rightCode) return 1
+  }
+  if (leftIndex < left.length) return 1
+  if (rightIndex < right.length) return -1
+  return 0
+}
+
+/**
+ * Returns `string` with unpaired surrogates replaced by U+FFFD, matching how
+ * the Rust implementation stores strings as UTF-8. The document encoders
+ * already perform this replacement on the wire; applying it to in-memory
+ * values keeps a live document identical to its saved-and-reloaded form.
+ */
+function wellFormedString(string) {
+  if (string.toWellFormed) return string.toWellFormed()
+  let result = ''
+  for (let i = 0; i < string.length; i++) {
+    const code = string.charCodeAt(i)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = string.charCodeAt(i + 1)
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        result += string[i] + string[i + 1]
+        i++
+      } else {
+        result += '�'
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      result += '�'
+    } else {
+      result += string[i]
+    }
+  }
+  return result
+}
+
 module.exports = {
-  isObject, copyObject, parseOpId, equalBytes, createArrayOfNulls
+  isObject, copyObject, parseOpId, equalBytes, createArrayOfNulls, compareUtf8, wellFormedString
 }

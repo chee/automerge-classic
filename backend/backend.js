@@ -96,15 +96,15 @@ function applyLocalChange(backend, change) {
  * Returns the state of the document serialised to an Uint8Array.
  */
 function save(backend) {
-  return backendState(backend).save()
+  return backendState(backend, true).save()
 }
 
 function saveIncremental(backend) {
-  return backendState(backend).saveIncremental()
+  return backendState(backend, true).saveIncremental()
 }
 
 function saveSince(backend, heads) {
-  return backendState(backend).saveSince(heads)
+  return backendState(backend, true).saveSince(heads)
 }
 
 /**
@@ -167,7 +167,7 @@ function loadIncremental(backend, data) {
  * document tree in the state described by the node state `backend`.
  */
 function getPatch(backend) {
-  return backendState(backend).getPatch()
+  return backendState(backend, true).getPatch()
 }
 
 /**
@@ -194,19 +194,17 @@ function getChanges(backend, haveDeps) {
   if (!Array.isArray(haveDeps)) {
     throw new TypeError('Pass an array of hashes to Backend.getChanges()')
   }
-  return backendState(backend).getChanges(haveDeps)
+  return backendState(backend, true).getChanges(haveDeps)
 }
 
 /**
  * Returns all changes that are present in `backend2` but not in `backend1`.
  * Intended for use in situations where the two backends are for different actors.
  * To get the changes added between an older and a newer document state of the same
- * actor, use `getChanges()` instead. `getChangesAdded()` throws an exception if
- * one of the backend states is frozen (i.e. if it is not the latest state of that
- * backend instance; this distinction matters when the backend is mutable).
+ * actor, use `getChanges()` instead.
  */
 function getChangesAdded(backend1, backend2) {
-  return backendState(backend2).getChangesAdded(backendState(backend1))
+  return backendState(backend2, true).getChangesAdded(backendState(backend1, true))
 }
 
 /**
@@ -216,7 +214,7 @@ function getChangesAdded(backend1, backend2) {
  * dependencies does not count as having been applied.
  */
 function getChangeByHash(backend, hash) {
-  return backendState(backend).getChangeByHash(hash)
+  return backendState(backend, true).getChangeByHash(hash)
 }
 
 /**
@@ -230,35 +228,35 @@ function getChangeByHash(backend, hash) {
  * arrived. Any missing heads hashes are included in the returned array.
  */
 function getMissingDeps(backend, heads = []) {
-  return backendState(backend).getMissingDeps(heads)
+  return backendState(backend, true).getMissingDeps(heads)
 }
 
 function hasHeads(backend, heads) {
-  return backendState(backend).hasHeads(heads)
+  return backendState(backend, true).hasHeads(heads)
 }
 
 function getCursorPosition(backend, objectId, elemId, move) {
-  return backendState(backend).getCursorPosition(objectId, elemId, move)
+  return backendState(backend, true).getCursorPosition(objectId, elemId, move)
 }
 
 function getChangesMeta(backend, heads = []) {
-  return backendState(backend).getChangesMeta(heads)
+  return backendState(backend, true).getChangesMeta(heads)
 }
 
 function getHistoryMeta(backend) {
-  return backendState(backend).getHistoryMeta()
+  return backendState(backend, true).getHistoryMeta()
 }
 
 function getChangesByHash(backend, hashes) {
-  return backendState(backend).getChangesByHash(hashes)
+  return backendState(backend, true).getChangesByHash(hashes)
 }
 
 function topoHistoryTraversal(backend) {
-  return backendState(backend).topoHistoryTraversal()
+  return backendState(backend, true).topoHistoryTraversal()
 }
 
 function stats(backend) {
-  return backendState(backend).stats()
+  return backendState(backend, true).stats()
 }
 
 function saveBundle(changes) {
@@ -266,7 +264,7 @@ function saveBundle(changes) {
 }
 
 function saveBundleByHash(backend, hashes) {
-  return encodeBundle(backendState(backend).getChangesByHash(hashes))
+  return encodeBundle(backendState(backend, true).getChangesByHash(hashes))
 }
 
 function readBundle(data) {

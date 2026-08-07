@@ -871,7 +871,7 @@ describe('Automerge.Frontend', () => {
       const [leftState, patch] = Backend.applyChanges(Frontend.getBackendState(left), changes)
       left = Frontend.applyPatch(left, patch, leftState)
       Reflect.set(Object.values(Frontend.getConflicts(left, 'user'))[0], 'name', 'ignored')
-      assert.deepStrictEqual(Object.values(Frontend.getConflicts(left, 'user')).map(user => user.name), ['right', 'left'])
+      assert.deepStrictEqual(Object.values(Frontend.getConflicts(left, 'user')).map(user => user.name), ['left', 'right'])
       ;[left] = Frontend.change(left, draft => {
         for (const conflict of Object.values(Frontend.getConflicts(draft, 'user'))) conflict.name = 'same'
       })

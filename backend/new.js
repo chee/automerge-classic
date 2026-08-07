@@ -1,4 +1,4 @@
-const { parseOpId, copyObject } = require('../src/common')
+const { parseOpId, copyObject, compareUtf8 } = require('../src/common')
 const { COLUMN_TYPE, VALUE_TYPE, ACTIONS, OBJECT_TYPE, DOC_OPS_COLUMNS, CHANGE_COLUMNS, DOCUMENT_COLUMNS,
   encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue,
   encodeChange, decodeChangeColumns, decodeChanges,
@@ -147,41 +147,6 @@ function spliceColumns(columns, startRow, endRow, operations, outputOperations) 
   })
   COLUMN_OPERATIONS.set(output, {operations: outputOperations, offsets})
   return output
-}
-
-function compareUtf8(left, right) {
-  if (left === right) return 0
-  let leftIndex = 0, rightIndex = 0
-  while (leftIndex < left.length && rightIndex < right.length) {
-    let leftCode = left.charCodeAt(leftIndex++), rightCode = right.charCodeAt(rightIndex++)
-    if (leftCode >= 0xd800 && leftCode <= 0xdbff) {
-      const low = left.charCodeAt(leftIndex)
-      if (low >= 0xdc00 && low <= 0xdfff) {
-        leftCode = 0x10000 + ((leftCode - 0xd800) << 10) + low - 0xdc00
-        leftIndex++
-      } else {
-        leftCode = 0xfffd
-      }
-    } else if (leftCode >= 0xdc00 && leftCode <= 0xdfff) {
-      leftCode = 0xfffd
-    }
-    if (rightCode >= 0xd800 && rightCode <= 0xdbff) {
-      const low = right.charCodeAt(rightIndex)
-      if (low >= 0xdc00 && low <= 0xdfff) {
-        rightCode = 0x10000 + ((rightCode - 0xd800) << 10) + low - 0xdc00
-        rightIndex++
-      } else {
-        rightCode = 0xfffd
-      }
-    } else if (rightCode >= 0xdc00 && rightCode <= 0xdfff) {
-      rightCode = 0xfffd
-    }
-    if (leftCode < rightCode) return -1
-    if (leftCode > rightCode) return 1
-  }
-  if (leftIndex < left.length) return 1
-  if (rightIndex < right.length) return -1
-  return 0
 }
 
 function concatBuffers(buffers) {
@@ -2639,10 +2604,12 @@ class BackendDoc {
    * hashes (as hex strings) of the heads that the other replica has. The changes in `haveDeps` and
    * any of their transitive dependencies will not be returned; any changes later than or concurrent
    * to the hashes in `haveDeps` will be returned. If `haveDeps` is an empty array, all changes are
-   * returned. Throws an exception if any of the given hashes are not known to this replica.
+   * returned. Hashes that are not known to this replica are ignored, matching
+   * the Rust implementation.
    */
   getChanges(haveDeps) {
     if (!this.haveHashGraph) this.computeHashGraph()
+    haveDeps = haveDeps.filter(hash => this.dependentsByHash[hash])
 
     // If the other replica has nothing, return all changes in history order
     if (haveDeps.length === 0) {

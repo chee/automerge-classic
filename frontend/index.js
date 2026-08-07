@@ -1,7 +1,7 @@
 const { OPTIONS, CACHE, STATE, OBJECT_ID, CONFLICTS, CHANGE, ELEM_IDS, PROXY_PATH } = require('./constants')
 const { isObject, copyObject } = require('../src/common')
 const uuid = require('../src/uuid')
-const { interpretPatch, cloneRootObject, lamportCompare } = require('./apply_patch')
+const { interpretPatch, cloneRootObject, lamportCompare, reorderNewKeys } = require('./apply_patch')
 const { rootObjectProxy } = require('./proxies')
 const { Context } = require('./context')
 const { Text } = require('./text')
@@ -37,9 +37,13 @@ function updateRootObject(doc, updated, state) {
     newDoc = cloneRootObject(doc[CACHE]._root)
     updated._root = newDoc
   }
+  for (let objectId of Object.keys(updated)) {
+    reorderNewKeys(updated[objectId])
+  }
   Object.defineProperty(newDoc, OPTIONS,  {value: doc[OPTIONS]})
   Object.defineProperty(newDoc, CACHE,    {value: updated})
   Object.defineProperty(newDoc, STATE,    {value: state})
+  if (interopAttach) interopAttach(newDoc)
 
   if (doc[OPTIONS].freeze) {
     for (let objectId of Object.keys(updated)) {
@@ -206,7 +210,18 @@ function init(options) {
   Object.defineProperty(root, CONFLICTS, {value: Object.freeze({})})
   Object.defineProperty(root, CACHE,     {value: Object.freeze(cache)})
   Object.defineProperty(root, STATE,     {value: Object.freeze(state)})
+  if (interopAttach) interopAttach(root)
   return Object.freeze(root)
+}
+
+// Code bundled against the wasm implementation reads document internals
+// through globally registered symbols (Symbol.for('_am_meta') and friends).
+// The modern facade registers a function here that attaches equivalents to
+// every document root, so such code can operate on classic documents.
+let interopAttach = null
+
+function setInteropAttach(attach) {
+  interopAttach = attach
 }
 
 /**
@@ -478,7 +493,7 @@ function getElementIds(list) {
 }
 
 module.exports = {
-  init, from, change, emptyChange, applyPatch,
+  init, from, change, emptyChange, applyPatch, setInteropAttach,
   getObjectId, getObjectById, getText, getActorId, setActorId, getConflicts, getLastLocalChange,
   getBackendState, getElementIds,
   Text, Table, Counter, Observable, Float64, Int, Uint

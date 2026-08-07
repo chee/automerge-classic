@@ -9,7 +9,8 @@ const CONFLICTS = Symbol('_conflicts') // map or list (depending on object type)
 const CHANGE    = Symbol('_change')    // the context object on proxy objects used in change callback
 const ELEM_IDS  = Symbol('_elemIds')   // list containing the element ID of each list element
 const PROXY_PATH = Symbol('_proxyPath')
+const NEW_KEYS  = Symbol('_newKeys')   // keys added to a map object since it was last materialized
 
 module.exports = {
-  OPTIONS, CACHE, STATE, OBJECT_ID, CONFLICTS, CHANGE, ELEM_IDS, PROXY_PATH
+  OPTIONS, CACHE, STATE, OBJECT_ID, CONFLICTS, CHANGE, ELEM_IDS, PROXY_PATH, NEW_KEYS
 }
