@@ -653,6 +653,40 @@ function sameTextElement(left, right) {
   return Boolean(leftId) && leftId === rightId
 }
 
+/**
+ * Emits a run of text elements as `splice` patches, starting a new patch
+ * whenever the mark set changes, and calling `onBlock` for each non-string
+ * element after emitting its placeholder insert. Returns the index reached.
+ */
+function emitTextRuns(target, path, startIndex, items, marksOf, onBlock) {
+  let index = startIndex, text = '', textMarks
+  function flushText() {
+    if (text.length === 0) return
+    const patch = {action: 'splice', path: path.concat(index), value: text}
+    if (textMarks && Object.keys(textMarks).length > 0) patch.marks = Object.assign({}, textMarks)
+    target.push(patch)
+    index += text.length
+    text = ''
+    textMarks = undefined
+  }
+  for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+    const item = items[itemIndex]
+    const itemMarks = marksOf(itemIndex) || {}
+    if (typeof item === 'string') {
+      if (text.length > 0 && !sameValue(textMarks, itemMarks)) flushText()
+      if (text.length === 0) textMarks = itemMarks
+      text += item
+      continue
+    }
+    flushText()
+    target.push({action: 'insert', path: path.concat(index), values: [{}]})
+    onBlock(item, index)
+    index++
+  }
+  flushText()
+  return index
+}
+
 function appendRichTextDiff(patches, beforeText, afterText, path, afterDoc) {
   const before = textElements(beforeText), after = textElements(afterText)
   const updatedPrefix = [], updatedSuffix = []
@@ -686,27 +720,7 @@ function appendRichTextDiff(patches, beforeText, afterText, path, afterDoc) {
   const insertBeforeDelete = removed > 0 && inserted.length > 0 && inserted.every(value => typeof value === 'string')
   if (removed > 0 && !insertBeforeDelete) appendDelete(patches, path.concat(offset), deleteLength)
   const markState = afterDoc ? markRanges(afterDoc, path).values : []
-  let index = offset, text = '', textMarks
-  function flushText() {
-    if (text.length === 0) return
-    const patch = {action: 'splice', path: path.concat(index), value: text}
-    if (textMarks && Object.keys(textMarks).length > 0) patch.marks = Object.assign({}, textMarks)
-    patches.push(patch)
-    index += text.length
-    text = ''
-    textMarks = undefined
-  }
-  for (let insertedIndex = 0; insertedIndex < inserted.length; insertedIndex++) {
-    const value = inserted[insertedIndex]
-    const valueMarks = markState[prefix + insertedIndex] || {}
-    if (typeof value === 'string') {
-      if (text.length > 0 && !sameValue(textMarks, valueMarks)) flushText()
-      if (text.length === 0) textMarks = valueMarks
-      text += value
-      continue
-    }
-    flushText()
-    patches.push({action: 'insert', path: path.concat(index), values: [{}]})
+  const index = emitTextRuns(patches, path, offset, inserted, i => markState[prefix + i], (value, at) => {
     const updatingBlock = removed === 1 && inserted.length === 1 &&
       isRecord(before[prefix].value) && isRecord(value)
     const keys = updatingBlock ? Object.keys(value).sort((left, right) => {
@@ -714,10 +728,8 @@ function appendRichTextDiff(patches, beforeText, afterText, path, afterDoc) {
       if (right === 'type') return 1
       return left.localeCompare(right)
     }) : undefined
-    appendRecordDiff(patches, {}, value, path.concat(index), afterDoc, keys)
-    index++
-  }
-  flushText()
+    appendRecordDiff(patches, {}, value, path.concat(at), afterDoc, keys)
+  })
   if (insertBeforeDelete) appendDelete(patches, path.concat(index), deleteLength)
   appendUpdated(updatedSuffix)
 }
@@ -821,31 +833,10 @@ function collectTextInitialization(units, queue, value, path, afterDoc) {
   const unit = {opId: opIdOfObject(value), patches: []}
   units.push(unit)
   const markState = afterDoc ? markRangesForText(afterDoc, value).values : []
-  let index = 0, text = '', textMarks
-  function flushText() {
-    if (text.length === 0) return
-    const patch = {action: 'splice', path: path.concat(index), value: text}
-    if (textMarks && Object.keys(textMarks).length > 0) patch.marks = Object.assign({}, textMarks)
-    unit.patches.push(patch)
-    index += text.length
-    text = ''
-    textMarks = undefined
-  }
-  for (let itemIndex = 0; itemIndex < value.length; itemIndex++) {
-    const item = value.get(itemIndex)
-    const itemMarks = markState[itemIndex] || {}
-    if (typeof item === 'string') {
-      if (text.length > 0 && !sameValue(textMarks, itemMarks)) flushText()
-      if (text.length === 0) textMarks = itemMarks
-      text += item
-      continue
-    }
-    flushText()
-    unit.patches.push({action: 'insert', path: path.concat(index), values: [{}]})
-    queue.push({value: item, path: path.concat(index)})
-    index++
-  }
-  flushText()
+  const items = Array.from({length: value.length}, (_, index) => value.get(index))
+  emitTextRuns(unit.patches, path, 0, items, index => markState[index], (item, at) => {
+    queue.push({value: item, path: path.concat(at)})
+  })
 }
 
 function collectInitializations(units, initial, afterDoc) {
@@ -1483,22 +1474,37 @@ function computeMarkRanges(doc, text, excluded) {
     const leftId = left.id.split('@'), rightId = right.id.split('@')
     return parseInt(leftId[0], 10) - parseInt(rightId[0], 10) || leftId[1].localeCompare(rightId[1])
   })
-  const values = operations.length === 0
-    ? new Array(text.length).fill(NO_MARKS)
-    : Array.from({length: text.length}, () => ({}))
+  const values = markValuesPerElement(operations, text.length)
+  return {text, values, ranges: markRangesFromValues(values, text)}
+}
+
+/**
+ * Applies resolved mark operations in order, producing the mark set that
+ * applies to each element of the text. A null value removes the mark.
+ */
+function markValuesPerElement(operations, length) {
+  if (operations.length === 0) return new Array(length).fill(NO_MARKS)
+  const values = Array.from({length}, () => ({}))
   for (const operation of operations) {
     for (let index = operation.start; index < operation.end; index++) {
       if (operation.value === null) delete values[index][operation.name]
       else values[index][operation.name] = operation.value
     }
   }
+  return values
+}
+
+/**
+ * Run-length encodes per-element mark sets into ranges, one run per mark
+ * name, with bounds in text offsets rather than element indexes.
+ */
+function markRangesFromValues(values, text) {
   const offsets = [0]
   for (let index = 0; index < text.length; index++) {
     offsets.push(offsets[index] + textElementWidth(text.get(index)))
   }
   const ranges = []
-  const names = new Set(values.flatMap(value => Object.keys(value)))
-  for (const name of names) {
+  for (const name of new Set(values.flatMap(value => Object.keys(value)))) {
     let start = 0
     while (start < values.length) {
       if (!Object.prototype.hasOwnProperty.call(values[start], name)) {
@@ -1513,7 +1519,7 @@ function computeMarkRanges(doc, text, excluded) {
     }
   }
   ranges.sort((left, right) => left.start - right.start || left.end - right.end || left.name.localeCompare(right.name))
-  return {text, values, ranges}
+  return ranges
 }
 
 export function marks(doc, path) {

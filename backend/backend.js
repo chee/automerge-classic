@@ -158,6 +158,13 @@ function loadIncremental(backend, data) {
   let patch = null
   if (changes.length > 0) patch = state.applyChanges(changes)
   if (replaced) patch = state.getPatch()
+  // Nothing was applied, so the caller's document is still current and must
+  // not be frozen: a sync message that carries only changes we already have
+  // leaves the document unchanged
+  if (!patch && state === current && backend.heads.length === state.heads.length &&
+      backend.heads.every((head, index) => head === state.heads[index])) {
+    return [backend, null]
+  }
   backend.frozen = true
   return [{state, heads: state.heads}, patch]
 }
@@ -243,10 +250,6 @@ function getChangesMeta(backend, heads = []) {
   return backendState(backend, true).getChangesMeta(heads)
 }
 
-function getHistoryMeta(backend) {
-  return backendState(backend, true).getHistoryMeta()
-}
-
 function getChangesByHash(backend, hashes) {
   return backendState(backend, true).getChangesByHash(hashes)
 }
@@ -275,5 +278,5 @@ export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
   load, loadChanges, loadIncremental, getPatch, getHeads, getAllChanges, getChanges,
   getChangesAdded, getChangeByHash, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta,
-  getHistoryMeta, getChangesByHash, topoHistoryTraversal, stats, saveBundle, saveBundleByHash, readBundle
+  getChangesByHash, topoHistoryTraversal, stats, saveBundle, saveBundleByHash, readBundle
 }

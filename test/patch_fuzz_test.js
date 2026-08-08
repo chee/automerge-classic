@@ -413,8 +413,8 @@ describe('rich text patch fuzzing', () => {
   it('keeps patch streams, diffs from the root, and reloads in agreement', () => {
     const seeds = process.env.FUZZ_SEEDS
       ? process.env.FUZZ_SEEDS.split(',').map(Number)
-      : Array.from({length: 20}, (unused, index) => index + 1)
-    for (const seed of seeds) fuzzRun(seed, Number(process.env.FUZZ_STEPS) || 40)
+      : Array.from({length: 25}, (unused, index) => index + 1)
+    for (const seed of seeds) fuzzRun(seed, Number(process.env.FUZZ_STEPS) || 60)
   }, 240000)
 
   it('applies an insertion into a mark that is concurrently deleted', () => {

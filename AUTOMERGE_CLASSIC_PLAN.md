@@ -2,7 +2,9 @@
 
 ## Goal
 
-Make `@automerge/automerge-classic` a practical plain-JavaScript replacement for `@automerge/automerge` through a pnpm override. Preserve the current Automerge binary formats and JavaScript behavior, including modern primitive-string text, rich text, sync v2, bundles, fragments, incremental loading, package subpaths, and the intentionally empty `automerge.wasm` export.
+Make `@automerge/automerge-classic` a practical plain-JavaScript replacement for `@automerge/automerge` through a pnpm override. Preserve the current Automerge binary formats and JavaScript behavior, including modern primitive-string text, rich text, sync v2, bundles, incremental loading, package subpaths, and the intentionally empty `automerge.wasm` export.
+
+The exported API surface is exactly the modern package's surface — a breaking change from earlier revisions of this package. Everything that was not a feature of `../automerge` has been removed: the v1 classic entry point (`Text`/`Table` value classes, `Observable`, the split `Frontend`/`Backend` API, `setDefaultBackend`, `getObjectById`, `setActorId`, `uuid`, `releaseInfo`) and the sedimentree fragment-metadata surface that classic grew while it was also standing in for `@automerge/automerge-subduction` (`getFragmentMetadata`, `getFragmentMeta`, `bundleFragmentMetadata`, `getCommits`, `getFragments`, `addCommits`, `addFragments`, `diffPath`). `saveBundle`/`readBundle` remain (they are modern exports). Documents containing v1 tables still load, materializing each table as a plain map of rows, and re-save byte-identically. The live interop suite asserts exact export equality with the modern package in both directions.
 
 The performance target is practical parity for normal document workloads. Exact Rust throughput is not required. Pathological quadratic behavior is not acceptable.
 
@@ -20,14 +22,13 @@ The performance target is practical parity for normal document workloads. Exact 
 - Current change and document containers load in both implementations.
 - Bundle encoding and decoding are implemented.
 - Bundle operation IDs use the normal counter column accepted by Rust 3.2.
-- Fragment metadata, fragment hierarchy, bundling, commits, and fragment import are implemented.
+- Bundling is implemented (`saveBundle`/`readBundle`); the fragment-metadata surface was removed when the API was narrowed to the modern package surface.
 - Incremental save, incremental load, and save-since are implemented.
 - Empty map keys encode and decode correctly.
 - Bytes use `Uint8Array` at the public API.
 - UTF-8 key ordering matches the Rust ordering, including astral characters and invalid surrogate replacement.
 - Actor lookup uses an ID-to-index map.
 - Loaded documents defer full change-graph reconstruction, history-column materialization, and operation-block splitting.
-- History metadata and fragment metadata are cached.
 - Loaded clones retain the deferred representation. The first mutation materializes mutable history columns and splits the touched oversized block.
 - `backend/column_data.js` implements immutable slabbed RLE, delta, boolean, integer, string, and raw byte columns with get, range, splice, save, load, and canonical validation. It has focused and randomized tests.
 - Live operation blocks use immutable compressed slabs for repeated map overwrites and batched map merges. Untouched slabs are shared across document snapshots.
@@ -152,7 +153,6 @@ The cursor index improved the repeated lookup fixture by 14.05×. A representati
 - Column slab operations and canonical encoding.
 - Modern API and TypeScript compatibility.
 - Direct package assertions for the zero-byte wasm and empty base64 exports.
-- Legacy `Text` and Observable behavior through the classic facade.
 - Native ESM evaluation with no CommonJS imports.
 - Lazy loaded-state materialization and indexed live/deleted cursors.
 - Immutable operation-slab sharing across cloned document snapshots.

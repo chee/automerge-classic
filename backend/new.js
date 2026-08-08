@@ -2399,7 +2399,6 @@ class BackendDoc {
     this.clock = {}
     this.queue = []
     this.saveCursor = 0
-    this.historyMeta = null
     this.objectMeta = {_root: {parentObj: null, parentKey: null, opId: null, type: 'map', children: {}}}
     this.visibleMapOps = new Map()
     this.cursorIndex = new Map()
@@ -2602,7 +2601,6 @@ class BackendDoc {
     copy.binaryDoc = this.binaryDoc
     copy.initPatch = this.initPatch
     copy.extraBytes = this.extraBytes
-    copy.historyMeta = this.historyMeta
     return copy
   }
 
@@ -2706,7 +2704,6 @@ class BackendDoc {
       this.cursorIndex = new Map(this.cursorIndex)
       for (const objectId of objectIds) this.cursorIndex.delete(objectId)
     }
-    if (allApplied.length > 0) this.historyMeta = null
 
     let patch = {
       maxOp: this.maxOp, clock: this.clock, deps: this.heads,
@@ -2768,7 +2765,6 @@ class BackendDoc {
     this.hashesByActor = hashesByActor
     this.clock = clock
     this.numChangeOps = numChangeOps
-    this.historyMeta = null
   }
 
   /**
@@ -2866,18 +2862,6 @@ class BackendDoc {
   getChangeByHash(hash) {
     if (!this.haveHashGraph) this.computeHashGraph()
     return this.changes[this.changeIndexByHash[hash]]
-  }
-
-  getHistoryMeta() {
-    if (!this.haveHashGraph) this.computeHashGraph()
-    if (!this.historyMeta) {
-      this.historyMeta = Object.freeze(this.historyHashes.map((hash, index) => Object.freeze({
-        index,
-        hash,
-        deps: Object.freeze(this.dependenciesByHash[hash].slice())
-      })))
-    }
-    return this.historyMeta
   }
 
   getChangesByHash(hashes) {
