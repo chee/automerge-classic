@@ -1,7 +1,7 @@
 const path = require('path')
 
 const common = {
-  mode: 'development',
+  mode: 'production',
   devtool: 'source-map',
   module: {rules: []},
   target: 'browserslist:web'

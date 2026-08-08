@@ -1,4 +1,4 @@
-const pako = require('pako')
+const { deflateSync: deflateRaw, inflateSync: inflateRaw } = require('fflate')
 const { parseOpId } = require('../src/common')
 const {
   hexStringToBytes, bytesToHexString,
@@ -56,7 +56,7 @@ function appendColumns(encoder, columns) {
   const encoded = columns.map(col => {
     const buffer = col.encoder.buffer
     if (buffer.byteLength < 256) return col
-    return Object.assign({}, col, {columnId: col.columnId | 8, encoder: {buffer: pako.deflateRaw(buffer)}})
+    return Object.assign({}, col, {columnId: col.columnId | 8, encoder: {buffer: deflateRaw(buffer)}})
   })
   encodeColumnInfo(encoder, encoded)
   for (const col of encoded) encoder.appendRawBytes(col.encoder.buffer)
@@ -71,7 +71,7 @@ function readColumns(decoder, spec) {
     if (!validIds.has(columnId)) throw new RangeError(`Unexpected bundle column: ${col.columnId}`)
     const buffer = decoder.readRawBytes(col.bufferLen)
     col.columnId = columnId
-    col.buffer = compressed ? pako.inflateRaw(buffer) : buffer
+    col.buffer = compressed ? inflateRaw(buffer) : buffer
     col.bufferLen = col.buffer.byteLength
   }
   return columns

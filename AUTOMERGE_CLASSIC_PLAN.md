@@ -177,7 +177,8 @@ The cursor index improved the repeated lookup fixture by 14.05×. A representati
 - A third fuzzing pass (100 seeds × 100 steps in both plain and blocks modes, all clean) found and fixed two more bugs:
   - insertions at sticky mark boundaries anchored on the preceding character instead of the boundary element, diverging from the Rust wire format (fixed by porting Rust's `InsertQuery` authoring-time anchor adjustment and switching mark resolution to plain RGA ordering — this also resolved the previously open stacked marks/blocks divergence);
   - deleting two consecutive list elements where the first survives through a concurrent overwrite removed the survivor instead of the second element in the incremental patch (the list index now advances past the surviving element before the removal patch is generated, matching the load path).
-- Current source result: 786 passing, 1 pending (env-gated live interop), no failures; TypeScript passes; lint passes; ESM smoke passes.
+- Current source result: 786 passing, 1 pending (env-gated live interop), no failures; TypeScript passes; lint passes; ESM smoke passes; the full suite also passes against the built bundle (`TEST_DIST=1 mocha`).
+- Bundle size: webpack builds in production mode (minified, external source maps), and the runtime dependencies are down to `fflate` (raw DEFLATE, replacing pako — output verified cross-loadable with the Rust implementation in both directions, including compressed change chunks and compressed document columns) and `fast-sha256` (uuid replaced by `crypto.getRandomValues`). `dist/automerge.js` is ~207 KB minified (~61 KB gzipped), down from ~752 KB.
 
 ## Implementation checklist
 

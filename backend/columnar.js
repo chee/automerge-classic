@@ -1,4 +1,4 @@
-const pako = require('pako')
+const { deflateSync: deflateRaw, inflateSync: inflateRaw } = require('fflate')
 const { copyObject, parseOpId, equalBytes } = require('../src/common')
 const {
   utf8ToString, hexStringToBytes, bytesToHexString,
@@ -960,7 +960,7 @@ function decodeChangeMeta(buffer, computeHash) {
 function deflateChange(buffer) {
   const header = decodeContainerHeader(new Decoder(buffer), false)
   if (header.chunkType !== CHUNK_TYPE_CHANGE) throw new RangeError(`Unexpected chunk type: ${header.chunkType}`)
-  const compressed = pako.deflateRaw(header.chunkData)
+  const compressed = deflateRaw(header.chunkData)
   const encoder = new Encoder()
   encoder.appendRawBytes(buffer.subarray(0, 8)) // copy MAGIC_BYTES and checksum
   encoder.appendByte(CHUNK_TYPE_DEFLATE)
@@ -975,7 +975,7 @@ function deflateChange(buffer) {
 function inflateChange(buffer) {
   const header = decodeContainerHeader(new Decoder(buffer), false)
   if (header.chunkType !== CHUNK_TYPE_DEFLATE) throw new RangeError(`Unexpected chunk type: ${header.chunkType}`)
-  const decompressed = pako.inflateRaw(header.chunkData)
+  const decompressed = inflateRaw(header.chunkData)
   const encoder = new Encoder()
   encoder.appendRawBytes(buffer.subarray(0, 8)) // copy MAGIC_BYTES and checksum
   encoder.appendByte(CHUNK_TYPE_CHANGE)
@@ -1246,7 +1246,7 @@ function decodeDocument(buffer) {
  */
 function deflateColumn(column) {
   if (column.encoder.buffer.byteLength >= DEFLATE_MIN_SIZE) {
-    column.encoder = {buffer: pako.deflateRaw(column.encoder.buffer)}
+    column.encoder = {buffer: deflateRaw(column.encoder.buffer)}
     column.columnId |= COLUMN_TYPE_DEFLATE
   }
 }
@@ -1256,7 +1256,7 @@ function deflateColumn(column) {
  */
 function inflateColumn(column) {
   if ((column.columnId & COLUMN_TYPE_DEFLATE) !== 0) {
-    column.buffer = pako.inflateRaw(column.buffer)
+    column.buffer = inflateRaw(column.buffer)
     column.columnId ^= COLUMN_TYPE_DEFLATE
   }
 }
