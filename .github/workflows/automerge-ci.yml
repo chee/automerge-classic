@@ -6,74 +6,50 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [12.x, 14.x, 16.x]
+        node-version: [20.x, 22.x, 24.x]
     steps:
     - name: Check out repo
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
+    - name: Install pnpm
+      uses: pnpm/action-setup@v4
     - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v2
+      uses: actions/setup-node@v4
       with:
         node-version: ${{ matrix.node-version }}
-        cache: 'yarn'
+        cache: 'pnpm'
     - name: Install dependencies
-      run: yarn
+      run: pnpm install --frozen-lockfile
     - name: ESLint
-      run: yarn lint
+      run: pnpm run lint
     - name: Test suite
-      run: yarn test
+      run: pnpm test
     - name: Bundle
-      run: yarn build
+      run: pnpm run build
     - name: Test suite using bundle
-      run: TEST_DIST=1 yarn test
+      run: TEST_DIST=1 pnpm test
     - name: Load bundled code
       run: node -e "const Automerge = require(\"./dist/automerge\")"
-
-# browsertest:
-#   runs-on: ubuntu-latest
-#   # Don't run this job when triggered from a forked repository, since the secrets
-#   # (Sauce Labs credentials) are not available in that context
-#   if: ${{ github.repository == 'automerge/automerge' }}
-#   steps:
-#     - uses: actions/checkout@v2
-#     - name: Use Node.js
-#       uses: actions/setup-node@v2
-#       with:
-#         node-version: 16.x
-#         cache: 'yarn'
-#     - name: Install dependencies
-#       run: yarn
-#     - name: Bundle
-#       run: yarn build
-#     - name: Sauce Connect
-#       uses: saucelabs/sauce-connect-action@v1
-#       with:
-#         username: ${{ secrets.SAUCE_USERNAME }}
-#         accessKey: ${{ secrets.SAUCE_ACCESS_KEY }}
-#         tunnelIdentifier: github-action-tunnel
-#         scVersion: 4.7.0
-#     - name: Run browser tests
-#       run: node_modules/.bin/karma start karma.sauce.js
-#       env:
-#         SAUCE_USERNAME: ${{secrets.SAUCE_USERNAME}}
-#         SAUCE_ACCESS_KEY: ${{secrets.SAUCE_ACCESS_KEY}}
+    - name: Load ES modules
+      run: node --experimental-vm-modules test/esm_smoke.js
 
   npm-publish:
     name: npm-publish
     if: ${{ github.repository == 'automerge/automerge' && github.ref == 'refs/heads/main' }}
-#   needs: [ node-build, browsertest ]
     needs: [ node-build ]
     runs-on: ubuntu-latest
     steps:
     - name: Check out repo
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
+    - name: Install pnpm
+      uses: pnpm/action-setup@v4
     - name: Use Node.js
-      uses: actions/setup-node@v2
+      uses: actions/setup-node@v4
       with:
-        node-version: 16
+        node-version: 22
+        cache: 'pnpm'
     - name: Install dependencies
-      run: yarn install
+      run: pnpm install --frozen-lockfile
     - name: npm publish if version has been updated
-      uses: JS-DevTools/npm-publish@v1
+      uses: JS-DevTools/npm-publish@v3
       with:
         token: ${{ secrets.NPM_AUTH_TOKEN }}
-        check-version: true

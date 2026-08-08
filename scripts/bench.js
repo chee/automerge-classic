@@ -63,7 +63,7 @@ const WORKLOADS = {
 
   'clone+change x1000': (A, ctx) => {
     let doc = ctx.doc
-    for (let i = 0; i < 1000; i++) doc = A.change(doc, d => { d.map['key0'] = i })
+    for (let i = 0; i < 1000; i++) doc = A.change(doc, d => { d.map.key0 = i })
     return doc
   },
 
@@ -110,6 +110,28 @@ const WORKLOADS = {
       if (mb) [a, sa] = A.receiveSyncMessage(a, sa, mb)
     }
     return b
+  },
+
+  'diff: 20 sequential list edits': (A, ctx) => {
+    let doc = ctx.doc, heads = A.getHeads(doc), out = []
+    for (let i = 0; i < 20; i++) {
+      const before = heads
+      doc = A.change(doc, d => { d.list.push(i) })
+      heads = A.getHeads(doc)
+      out.push(A.diff(doc, before, heads))
+    }
+    return out
+  },
+
+  'diff: 20 sequential text edits': (A, ctx) => {
+    let doc = ctx.doc, heads = A.getHeads(doc), out = []
+    for (let i = 0; i < 20; i++) {
+      const before = heads
+      doc = A.change(doc, d => { A.splice(d, ['text'], 5, 0, 'z') })
+      heads = A.getHeads(doc)
+      out.push(A.diff(doc, before, heads))
+    }
+    return out
   },
 
   'diff: heads to heads': (A, ctx) => {

@@ -16,7 +16,9 @@ for (const impl of ['classic', 'modern']) {
     const out = execFileSync('node', ['--expose-gc', bench, impl], {encoding: 'utf8', maxBuffer: 1 << 24})
     for (const [name, ms] of Object.entries(JSON.parse(out))) {
       if (workloads.length && !workloads.includes(name)) continue
-      ;((all[name] ||= {})[impl] ||= []).push(ms)
+      if (!all[name]) all[name] = {}
+      if (!all[name][impl]) all[name][impl] = []
+      all[name][impl].push(ms)
     }
     process.stderr.write(`${impl} rep ${rep + 1}/${REPS}\n`)
   }
@@ -28,9 +30,9 @@ const rows = Object.entries(all).map(([name, byImpl]) => {
 })
 
 const w = Math.max(...rows.map(r => r.name.length))
-console.log(`${'workload'.padEnd(w)} | classic ms | modern ms | ratio`)
-console.log(`${'-'.repeat(w)} | ---------: | --------: | ----:`)
+process.stdout.write(`${'workload'.padEnd(w)} | classic ms | modern ms | ratio\n`)
+process.stdout.write(`${'-'.repeat(w)} | ---------: | --------: | ----:\n`)
 for (const r of rows) {
-  console.log(`${r.name.padEnd(w)} | ${r.classic.toFixed(1).padStart(10)} | ${r.modern.toFixed(1).padStart(9)} | ${r.ratio.toFixed(2)}x`)
+  process.stdout.write(`${r.name.padEnd(w)} | ${r.classic.toFixed(1).padStart(10)} | ${r.modern.toFixed(1).padStart(9)} | ${r.ratio.toFixed(2)}x\n`)
 }
 require('fs').writeFileSync('/tmp/bench-raw.json', JSON.stringify(all, null, 2))

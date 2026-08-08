@@ -21,7 +21,7 @@ describe('uuid', () => {
       return `custom-uuid-${counter++}`
     }
 
-    before(() => uuid.setFactory(customUuid))
+    beforeAll(() => uuid.setFactory(customUuid))
     beforeEach(() => counter = 0)
 
     it('invokes the custom factory', () => {

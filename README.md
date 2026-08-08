@@ -19,17 +19,18 @@ For a set of extensible examples in TypeScript, see [automerge-repo](https://git
 
 ## Setup
 
-If you're using npm, `npm install automerge`. If you're using yarn, `yarn add automerge`. Then you
+If you're using npm, `npm install automerge`. If you're using pnpm, `pnpm add automerge`. Then you
 can import it with `require('automerge')` as in [the example below](#usage) (or
 `import * as Automerge from 'automerge'` if using ES2015 or TypeScript).
 
 Otherwise, clone this repository, and then you can use the following commands:
 
-- `yarn install` — installs dependencies.
-- `yarn test` — runs the test suite in Node.
-- `yarn run browsertest` — runs the test suite in web browsers.
-- `yarn build` — creates a bundled JS file `dist/automerge.js` for web browsers. It includes the
-  dependencies and is set up so that you can load through a script tag.
+- `pnpm install` — installs dependencies.
+- `pnpm test` — type-checks and runs the Vitest suite in Node.
+- `pnpm run coverage` — runs the test suite with coverage reporting.
+- `pnpm run build` — builds `dist/` with Vite in library mode: a UMD bundle `dist/automerge.js`
+  for web browsers (bundles the dependencies, loadable through a script tag), plus the ES modules
+  `dist/automerge.mjs` and `dist/classic.mjs`.
 
 ## Meta
 

@@ -158,33 +158,39 @@ const change3 = {actor: 'abcd', seq: 1, deps: {'1234': 1}, startOp: 4, ops: [
   {action: 'set',      obj: '2@1234', key: '3@1234', insert: true,  value: 'baz'}
 ]}
 
-let doc1 = new Micromerge(), doc2 = new Micromerge()
-for (let c of [change1, change2, change3]) doc1.applyChange(c)
-for (let c of [change1, change3, change2]) doc2.applyChange(c)
-assert.deepStrictEqual(doc1.root, {title: 'Hello 2', tags: ['baz', 'bar']})
-assert.deepStrictEqual(doc2.root, {title: 'Hello 2', tags: ['baz', 'bar']})
-
 const change4 = {actor: '2345', seq: 1, deps: {}, startOp: 1, ops: [
   {action: 'makeList', obj: '_root',  key: 'todos',  insert: false},
   {action: 'set',      obj: '1@2345', key: '_head',  insert: true,  value: 'Task 1'},
   {action: 'set',      obj: '1@2345', key: '2@2345', insert: true,  value: 'Task 2'}
 ]}
 
-let doc3 = new Micromerge()
-doc3.applyChange(change4)
-assert.deepStrictEqual(doc3.root, {todos: ['Task 1', 'Task 2']})
-
 const change5 = {actor: '2345', seq: 2, deps: {}, startOp: 4, ops: [
   {action: 'del',      obj: '1@2345', key: '2@2345', insert: false},
   {action: 'set',      obj: '1@2345', key: '3@2345', insert: true,  value: 'Task 3'}
 ]}
-doc3.applyChange(change5)
-assert.deepStrictEqual(doc3.root, {todos: ['Task 2', 'Task 3']})
 
 const change6 = {actor: '2345', seq: 3, deps: {}, startOp: 6, ops: [
   {action: 'del',      obj: '1@2345', key: '3@2345', insert: false},
   {action: 'set',      obj: '1@2345', key: '5@2345', insert: false, value: 'Task 3b'},
   {action: 'set',      obj: '1@2345', key: '5@2345', insert: true,  value: 'Task 4'}
 ]}
-doc3.applyChange(change6)
-assert.deepStrictEqual(doc3.root, {todos: ['Task 3b', 'Task 4']})
+
+describe('micromerge', () => {
+  it('converges regardless of the order changes are applied', () => {
+    let doc1 = new Micromerge(), doc2 = new Micromerge()
+    for (let c of [change1, change2, change3]) doc1.applyChange(c)
+    for (let c of [change1, change3, change2]) doc2.applyChange(c)
+    assert.deepStrictEqual(doc1.root, {title: 'Hello 2', tags: ['baz', 'bar']})
+    assert.deepStrictEqual(doc2.root, {title: 'Hello 2', tags: ['baz', 'bar']})
+  })
+
+  it('applies list insertions and deletions', () => {
+    let doc3 = new Micromerge()
+    doc3.applyChange(change4)
+    assert.deepStrictEqual(doc3.root, {todos: ['Task 1', 'Task 2']})
+    doc3.applyChange(change5)
+    assert.deepStrictEqual(doc3.root, {todos: ['Task 2', 'Task 3']})
+    doc3.applyChange(change6)
+    assert.deepStrictEqual(doc3.root, {todos: ['Task 3b', 'Task 4']})
+  })
+})

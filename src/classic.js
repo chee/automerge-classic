@@ -7,11 +7,17 @@ function classicOptions(options) {
   return Object.assign({}, options, {textV2: false})
 }
 
-const Classic = {}
-Object.defineProperties(Classic, Object.getOwnPropertyDescriptors(Automerge))
-Classic.init = options => Automerge.init(classicOptions(options))
-Classic.from = (value, options) => Automerge.from(value, classicOptions(options))
-Classic.load = (data, options) => Automerge.load(data, classicOptions(options))
-Classic.clone = (doc, options) => Automerge.clone(doc, classicOptions(options))
+const overrides = {
+  init: options => Automerge.init(classicOptions(options)),
+  from: (value, options) => Automerge.from(value, classicOptions(options)),
+  load: (data, options) => Automerge.load(data, classicOptions(options)),
+  clone: (doc, options) => Automerge.clone(doc, classicOptions(options))
+}
+
+const Classic = Object.defineProperties({}, Object.assign(
+  {},
+  Object.getOwnPropertyDescriptors(Automerge),
+  Object.getOwnPropertyDescriptors(overrides)
+))
 
 module.exports = Classic

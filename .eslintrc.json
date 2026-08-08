@@ -6,6 +6,10 @@
         "node": true,
         "mocha": true
     },
+    "globals": {
+        "beforeAll": "readonly",
+        "afterAll": "readonly"
+    },
     "ignorePatterns": "dist/**",
     "extends": ["eslint:recommended", "plugin:compat/recommended"],
     "parserOptions": {

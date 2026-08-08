@@ -145,16 +145,69 @@ function loadFixture(name) {
     .map(encoded => new Uint8Array(Buffer.from(encoded, 'base64')))
 }
 
-describe('patch convergence', () => {
-  it('patch streams converge under concurrent fuzzing', function () {
-    this.timeout(60000)
-    for (let seed = 1; seed <= 12; seed++) fuzzRun(seed, 50, false)
+// diff() reuses document views and mark scans between calls. These check that
+// the reuse never returns a result that a cold call would not have produced.
+describe('diff reuse', () => {
+  it('matches cold results across successive versions', () => {
+    let doc = Automerge.from({text: 'hello', list: [1], map: {a: 1}}, ACTOR_A)
+    let heads = Automerge.getHeads(doc)
+    for (let step = 0; step < 5; step++) {
+      const before = heads
+      doc = Automerge.change(doc, {time: 0}, draft => {
+        Automerge.splice(draft, ['text'], 0, 0, 'z')
+        draft.list.push(step)
+        draft.map['k' + step] = step
+      })
+      heads = Automerge.getHeads(doc)
+      const cold = Automerge.diff(Automerge.load(Automerge.save(doc)), before, heads)
+      assert.deepStrictEqual(Automerge.diff(doc, before, heads), cold)
+    }
   })
 
-  it('diff from root rebuilds the fuzzed documents', function () {
-    this.timeout(60000)
-    for (let seed = 1; seed <= 12; seed++) fuzzRun(seed, 50, true)
+  it('keeps independent documents apart', () => {
+    let left = Automerge.from({text: 'abc'}, ACTOR_A)
+    let right = Automerge.from({text: 'abc'}, ACTOR_B)
+    const leftBefore = Automerge.getHeads(left), rightBefore = Automerge.getHeads(right)
+    left = Automerge.change(left, {time: 0}, draft => { Automerge.splice(draft, ['text'], 3, 0, 'L') })
+    right = Automerge.change(right, {time: 0}, draft => { Automerge.splice(draft, ['text'], 3, 0, 'R') })
+    const leftHeads = Automerge.getHeads(left), rightHeads = Automerge.getHeads(right)
+    assert.deepStrictEqual(Automerge.diff(left, leftBefore, leftHeads),
+      [{action: 'splice', path: ['text', 3], value: 'L'}])
+    assert.deepStrictEqual(Automerge.diff(right, rightBefore, rightHeads),
+      [{action: 'splice', path: ['text', 3], value: 'R'}])
+    assert.deepStrictEqual(Automerge.diff(left, leftBefore, leftHeads),
+      [{action: 'splice', path: ['text', 3], value: 'L'}])
   })
+
+  it('reports marks added by a change that leaves the text alone', () => {
+    let doc = Automerge.from({text: 'hello', other: 1}, ACTOR_A)
+    let heads = Automerge.getHeads(doc)
+    doc = Automerge.change(doc, {time: 0}, draft => { draft.other = 2 })
+    assert.deepStrictEqual(Automerge.diff(doc, heads, Automerge.getHeads(doc)),
+      [{action: 'put', path: ['other'], value: 2}])
+    heads = Automerge.getHeads(doc)
+    doc = Automerge.change(doc, {time: 0}, draft => {
+      Automerge.mark(draft, ['text'], {start: 0, end: 3, expand: 'none'}, 'bold', true)
+    })
+    assert.deepStrictEqual(Automerge.diff(doc, heads, Automerge.getHeads(doc)),
+      [{action: 'mark', path: ['text'], marks: [{name: 'bold', value: true, start: 0, end: 3}]}])
+    heads = Automerge.getHeads(doc)
+    doc = Automerge.change(doc, {time: 0}, draft => {
+      Automerge.unmark(draft, ['text'], {start: 0, end: 3}, 'bold')
+    })
+    assert.deepStrictEqual(Automerge.diff(doc, heads, Automerge.getHeads(doc)),
+      [{action: 'unmark', path: ['text'], name: 'bold', start: 0, end: 3}])
+  })
+})
+
+describe('patch convergence', () => {
+  it('patch streams converge under concurrent fuzzing', () => {
+    for (let seed = 1; seed <= 12; seed++) fuzzRun(seed, 50, false)
+  }, 60000)
+
+  it('diff from root rebuilds the fuzzed documents', () => {
+    for (let seed = 1; seed <= 12; seed++) fuzzRun(seed, 50, true)
+  }, 60000)
 
   it('keeps a concurrently surviving value when a delete arrives in a multi-key change', () => {
     // Minimized from fuzzing: a change that deletes a key whose only pred is
