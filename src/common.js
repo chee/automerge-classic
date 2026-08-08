@@ -97,6 +97,7 @@ function compareUtf8(left, right) {
  * values keeps a live document identical to its saved-and-reloaded form.
  */
 function wellFormedString(string) {
+  if (string.isWellFormed && string.isWellFormed()) return string
   if (string.toWellFormed) return string.toWellFormed()
   let result = ''
   for (let i = 0; i < string.length; i++) {

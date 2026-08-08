@@ -5,6 +5,7 @@ const { encodeChange: encodeChangeRaw, decodeChange, decodeChangeMeta, decodeCha
 const { isObject, parseOpId, compareUtf8, wellFormedString } = require('./common')
 const { ImmutableString, isImmutableString } = require('./immutable_string')
 const { myersDiff, graphemes, replaceHook } = require('./text_diff')
+const { instantiateText } = require('../frontend/text')
 let backend = require('../backend') // mutable: can be overridden with setDefaultBackend()
 const viewDocs = new WeakSet()
 const fragmentMetadataCache = new WeakMap()
@@ -1042,16 +1043,19 @@ function markEndpoint(doc, target, elemId) {
 
 function appendChangeMarkPatches(patches, before, after, changes) {
   if (!Array.isArray(changes) || changes.length === 0) return
-  const groups = [], pending = new Map()
+  const groups = [], pending = new Map(), markerOffsets = new Map()
   for (const change of decodeChanges(changes)) {
+    let opCounter = change.startOp
     for (const op of change.ops) {
+      const opId = `${opCounter}@${change.actor}`
+      opCounter += op.values ? op.values.length : 1
       if (op.action === 'markBegin') {
         if (!pending.has(op.obj)) pending.set(op.obj, [])
-        pending.get(op.obj).push(op)
+        pending.get(op.obj).push({op, opId})
       } else if (op.action === 'markEnd') {
         const stack = pending.get(op.obj)
         if (!stack || stack.length === 0) continue
-        const begin = stack.pop()
+        const {op: begin, opId: beginOpId} = stack.pop()
         const target = findTextObject(after, op.obj)
         if (!target || !findTextObject(before, op.obj)) continue
         let group = groups.find(value => sameValue(value.path, target.path))
@@ -1059,12 +1063,14 @@ function appendChangeMarkPatches(patches, before, after, changes) {
           group = {path: target.path, marks: []}
           groups.push(group)
         }
-        group.marks.push({
-          name: begin.name,
-          value: copyPatchValue(begin.value),
-          start: markEndpoint(after, target, begin.elemId),
-          end: markEndpoint(after, target, op.elemId)
-        })
+        // An empty mark's end boundary is anchored on its own begin boundary,
+        // which is not an element the cursor index knows about
+        const start = markerOffsets.has(begin.elemId) ? markerOffsets.get(begin.elemId)
+          : markEndpoint(after, target, begin.elemId)
+        markerOffsets.set(beginOpId, start)
+        const end = markerOffsets.has(op.elemId) ? markerOffsets.get(op.elemId)
+          : markEndpoint(after, target, op.elemId)
+        group.marks.push({name: begin.name, value: copyPatchValue(begin.value), start, end})
       }
     }
   }
@@ -1256,20 +1262,37 @@ function mark(doc, path, range, name, value) {
   if (typeof name !== 'string') throw new TypeError('mark() name must be a string')
   const expand = range.expand || 'after'
   if (!['before', 'after', 'both', 'none'].includes(expand)) throw new RangeError('mark() expand is invalid')
+  // A zero-width non-expanding mark can never cover anything; the Rust
+  // implementation ignores it without emitting any operations
+  if (range.start === range.end && expand === 'none') return
   const objectId = Frontend.getObjectId(text)
   const startIndex = textElementIndex(text, range.start)
   const endIndex = textElementIndex(text, range.end)
   const start = startIndex === 0 ? '_head' : text.getElemId(startIndex - 1)
-  const end = endIndex === 0 ? '_head' : text.getElemId(endIndex - 1)
+  const expandBefore = expand === 'before' || expand === 'both'
+  const beginOpId = text.context.nextOpId()
   text.context.addOp({
     action: 'markBegin', obj: objectId, elemId: start, insert: true, name, value,
-    expand: expand === 'before' || expand === 'both', pred: []
+    expand: expandBefore, pred: []
   })
+  // The mark boundaries are elements of the text sequence. If the range is
+  // empty and the begin boundary is sticky (expanding), the end boundary is
+  // inserted immediately after it, so its reference element is the begin
+  // boundary itself — this is what the Rust implementation produces.
+  const end = range.start === range.end && expandBefore ? beginOpId
+    : endIndex === 0 ? '_head' : text.getElemId(endIndex - 1)
   text.context.addOp({
     action: 'markEnd', obj: objectId, elemId: end, insert: true,
     expand: expand === 'after' || expand === 'both', pred: []
   })
-  text.context.updated[objectId] = text.context.getObject(objectId)
+  // Register the text as touched with a fresh copy: reusing the cached
+  // object would let later edits in the same change mutate the previous
+  // document snapshot in place, and the semantic diff would then see no
+  // difference and drop their patches.
+  if (!text.context.updated[objectId]) {
+    const current = text.context.getObject(objectId)
+    text.context.updated[objectId] = instantiateText(objectId, current.elems.slice())
+  }
 }
 
 function unmark(doc, path, range, name) {
@@ -1285,9 +1308,13 @@ function markRanges(doc, path) {
 
 function markRangesForText(doc, text) {
   const objectId = Frontend.getObjectId(text)
-  const positions = new Map(text.elems.map((elem, index) => [elem.elemId, index + 1]))
-  positions.set('_head', 0)
-  const pending = [], pairs = [], operations = [], inserts = new Map()
+  // Mark boundaries are elements of the text sequence in the Rust
+  // implementation: mark() inserts a markBegin and a markEnd operation at
+  // the given positions, and marks are resolved by scanning the sequence in
+  // order (an unclosed markBegin extends to the end of the text). This
+  // function reconstructs the full sequence, including deleted elements and
+  // the mark boundary elements, and performs the same scan.
+  const inserts = new Map(), markers = new Map(), operations = []
   function scanOps(ops, actor, startOp) {
     let opCounter = startOp
     for (let index = 0; index < ops.length; index++) {
@@ -1296,9 +1323,11 @@ function markRangesForText(doc, text) {
       opCounter += op.values ? op.values.length : (op.multiOp || 1)
       if (op.obj !== objectId) continue
       if (op.action === 'markBegin') {
-        pending.push({op, id: opId})
-      } else if (op.action === 'markEnd' && pending.length > 0) {
-        pairs.push({begin: pending.pop(), end: {op, id: opId}})
+        inserts.set(opId, op.elemId)
+        markers.set(opId, {begin: true, name: op.name, value: op.value, expand: !!op.expand})
+      } else if (op.action === 'markEnd') {
+        inserts.set(opId, op.elemId)
+        markers.set(opId, {begin: false, expand: !!op.expand})
       } else if (op.insert) {
         if (op.values) {
           let ref = op.elemId
@@ -1323,38 +1352,64 @@ function markRangesForText(doc, text) {
       total + (op.values ? op.values.length : (op.multiOp || 1)), 0)
     scanOps(text.context.ops, text.context.actorId, text.context.nextOpNum - size)
   }
-  // A mark boundary behaves like a zero-width element anchored after
-  // `elemId`. An expanding end boundary (and a non-expanding start boundary)
-  // floats past elements that were inserted at the anchor by later
-  // operations, so that those elements fall inside (respectively outside)
-  // the mark. This matches how the Rust implementation orders the boundary
-  // within the element sequence.
-  function floatingPosition(anchorElemId, markerId) {
-    let index = positions.get(anchorElemId)
-    if (index === undefined) return undefined
-    const marker = parseOpId(markerId), inside = new Set([anchorElemId])
-    while (index < text.elems.length) {
-      const elemId = text.elems[index].elemId
-      const ref = inserts.get(elemId)
-      if (ref === undefined || !inside.has(ref)) break
-      if (ref === anchorElemId) {
-        const elem = parseOpId(elemId)
-        const later = elem.counter > marker.counter ||
-          (elem.counter === marker.counter && elem.actorId > marker.actorId)
-        if (!later) break
-      }
-      inside.add(elemId)
-      index++
-    }
-    return index
+
+  // Order the children of each element in descending operation-ID order, the
+  // normal ordering for concurrent insertions. Mark boundaries get no special
+  // treatment here: the Rust implementation applies plain RGA ordering too,
+  // and instead makes locally-authored insertions anchor on an adjacent
+  // sticky mark boundary at authoring time (see adjustInsertAnchors in the
+  // backend), so the wire format alone determines the placement.
+  const childrenOf = new Map()
+  for (const [elemId, ref] of inserts) {
+    if (!childrenOf.has(ref)) childrenOf.set(ref, [])
+    childrenOf.get(ref).push(elemId)
   }
-  for (const {begin, end} of pairs) {
-    const start = begin.op.expand ? positions.get(begin.op.elemId)
-                                  : floatingPosition(begin.op.elemId, begin.id)
-    const endPos = end.op.expand ? floatingPosition(end.op.elemId, end.id)
-                                 : positions.get(end.op.elemId)
-    if (start !== undefined && endPos !== undefined && start <= endPos) {
-      operations.push({name: begin.op.name, value: begin.op.value, start, end: endPos, id: begin.id})
+  for (const children of childrenOf.values()) {
+    children.sort((a, b) => {
+      const left = parseOpId(a), right = parseOpId(b)
+      return right.counter - left.counter ||
+        (right.actorId < left.actorId ? -1 : right.actorId > left.actorId ? 1 : 0)
+    })
+  }
+
+  // Walk the sequence, tracking the active marks. A markEnd closes the
+  // markBegin with the preceding operation ID (mark() always creates them as
+  // consecutive operations). For each visible element, the active mark with
+  // the highest operation ID provides the value for each mark name.
+  const visibleIds = new Set(text.elems.map(elem => elem.elemId))
+  const boundaries = new Map()   // markBegin opId -> {name, value, start, end}
+  const active = new Map()       // markBegin opId -> same object
+  let visibleCount = 0
+  {
+    const stack = (childrenOf.get('_head') || []).slice().reverse()
+    while (stack.length > 0) {
+      const elemId = stack.pop()
+      const marker = markers.get(elemId)
+      if (marker) {
+        if (marker.begin) {
+          const boundary = {name: marker.name, value: marker.value, start: visibleCount, end: undefined, id: elemId}
+          boundaries.set(elemId, boundary)
+          active.set(elemId, boundary)
+        } else {
+          const parsed = parseOpId(elemId)
+          const beginId = `${parsed.counter - 1}@${parsed.actorId}`
+          const boundary = active.get(beginId)
+          if (boundary) {
+            boundary.end = visibleCount
+            active.delete(beginId)
+          }
+        }
+      } else if (visibleIds.has(elemId)) {
+        visibleCount++
+      }
+      const children = childrenOf.get(elemId)
+      if (children) for (let i = children.length - 1; i >= 0; i--) stack.push(children[i])
+    }
+  }
+  for (const boundary of boundaries.values()) {
+    const end = boundary.end === undefined ? visibleCount : boundary.end
+    if (boundary.start <= end) {
+      operations.push({name: boundary.name, value: boundary.value, start: boundary.start, end, id: boundary.id})
     }
   }
   operations.sort((left, right) => {

@@ -1,5 +1,9 @@
 const { isObject, copyObject, parseOpId, compareUtf8 } = require('../src/common')
 const { OBJECT_ID, CONFLICTS, ELEM_IDS, NEW_KEYS } = require('./constants')
+
+// Set of patch objects already applied in the current patch application (a
+// non-enumerable property of the `updated` map)
+const APPLIED_PATCHES = Symbol('_appliedPatches')
 const { Text, instantiateText } = require('./text')
 const { instantiateTable } = require('./table')
 const { Counter } = require('./counter')
@@ -279,6 +283,20 @@ function interpretPatch(patch, obj, updated, textV2 = false) {
   if (isObject(obj) && (!patch.props || Object.keys(patch.props).length === 0) &&
       (!patch.edits || patch.edits.length === 0) && !updated[patch.objectId]) {
     return obj
+  }
+
+  // A patch may reference the same child object several times (for example
+  // when a conflicted list element is re-listed after concurrent updates).
+  // The child's patch object is shared between those references, and its
+  // edits must be applied only once, otherwise its contents are duplicated.
+  if (patch.objectId) {
+    if (!updated[APPLIED_PATCHES]) {
+      Object.defineProperty(updated, APPLIED_PATCHES, {value: new WeakSet()})
+    }
+    if (updated[patch.objectId] && updated[APPLIED_PATCHES].has(patch)) {
+      return updated[patch.objectId]
+    }
+    updated[APPLIED_PATCHES].add(patch)
   }
 
   if (patch.type === 'map') {

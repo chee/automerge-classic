@@ -12,7 +12,8 @@ const BLOOM_FILTER_SIZE = Math.floor(BLOOM_BITS_PER_ENTRY * MAX_BLOCK_SIZE / 8) 
 
 const objActorIdx = 0, objCtrIdx = 1, keyActorIdx = 2, keyCtrIdx = 3, keyStrIdx = 4,
   idActorIdx = 5, idCtrIdx = 6, insertIdx = 7, actionIdx = 8, valLenIdx = 9, valRawIdx = 10,
-  predNumIdx = 13, predActorIdx = 14, predCtrIdx = 15, succNumIdx = 13, succActorIdx = 14, succCtrIdx = 15
+  predNumIdx = 13, predActorIdx = 14, predCtrIdx = 15, succNumIdx = 13, succActorIdx = 14, succCtrIdx = 15,
+  expandIdx = 16, markNameIdx = 17
 
 const PRED_COLUMN_IDS = CHANGE_COLUMNS
   .filter(column => ['predNum', 'predActor', 'predCtr'].includes(column.columnName))
@@ -924,6 +925,24 @@ function splitBlock(block, maxBlockSize, operations) {
 /**
  * Takes an array of blocks and concatenates the corresponding columns across all of the blocks.
  */
+/**
+ * Rewrites the values of every actor-index column in `columns` (a list of
+ * `{columnId, encoder}` objects) through the `remap` table, leaving other
+ * columns untouched. Used when the actor table is sorted at save time.
+ */
+function remapActorColumns(columns, remap) {
+  return columns.map(column => {
+    if ((column.columnId & 7) !== COLUMN_TYPE.ACTOR_ID) return column
+    const decoder = decoderByColumnId(column.columnId, column.encoder.buffer)
+    const encoder = encoderByColumnId(column.columnId)
+    while (!decoder.done) {
+      const value = decoder.readValue()
+      encoder.appendValue(value === null ? null : remap[value])
+    }
+    return {columnId: column.columnId, encoder}
+  })
+}
+
 function concatBlocks(blocks) {
   const encoders = blocks[0].columns.map(col => ({columnId: col.columnId, encoder: encoderByColumnId(col.columnId)}))
 
@@ -1430,51 +1449,80 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
     deepCopyUpdate(docState.objectMeta, [objectId, 'children', elemId], values)
   }
 
-  let patchKey, patchValue
+  const emissions = []
 
-  // For counters, increment operations are succs to the set operation that created the counter,
-  // but in this case we want to add the values rather than overwriting them.
-  if (isOverwritten && ACTIONS[op[actionIdx]] === 'set' && (op[valLenIdx] & 0x0f) === VALUE_TYPE.COUNTER) {
-    // This is the initial set operation that creates a counter. Initialise the counter state
-    // to contain all successors of the set operation. Only if we later find that each of these
-    // successor operations is an increment, we make the counter visible in the patch.
-    if (!propState[elemId]) propState[elemId] = {visibleOps: [], hasChild: false}
+  // If this operation's ID appears in the pending-successor index, some
+  // earlier operation for this property is waiting to find out whether this
+  // successor is an increment (which does not overwrite it) or a real
+  // overwrite. A non-increment successor kills those candidates for good.
+  const pendingBySucc = propState[elemId] && propState[elemId].counterStates
+  if (pendingBySucc && pendingBySucc[opId] && ACTIONS[op[actionIdx]] !== 'inc') {
+    for (const state of pendingBySucc[opId]) {
+      state.dead = true
+      delete state.succs[opId]
+    }
+    delete pendingBySucc[opId]
+  }
+
+  // An operation with successors may still be visible if every successor
+  // turns out to be an increment: increments extend a counter rather than
+  // overwriting the value. The decision is deferred until the successors
+  // have been seen; successors that never appear as rows (deletions) leave
+  // the operation hidden.
+  if (isOverwritten && (ACTIONS[op[actionIdx]] === 'set' || op[actionIdx] % 2 === 0)) {
     if (!propState[elemId].counterStates) propState[elemId].counterStates = {}
-    let counterStates = propState[elemId].counterStates
-    let counterState = {opId, value: decodeValue(op[valLenIdx], op[valRawIdx]).value, succs: {}}
-
+    const counterStates = propState[elemId].counterStates
+    const isCounter = ACTIONS[op[actionIdx]] === 'set' && (op[valLenIdx] & 0x0f) === VALUE_TYPE.COUNTER
+    const state = {
+      op, opId, isCounter, dead: false,
+      value: isCounter ? decodeValue(op[valLenIdx], op[valRawIdx]).value : undefined,
+      succs: {}
+    }
     for (let i = 0; i < op[succNumIdx]; i++) {
       const succOp = `${op[succCtrIdx][i]}@${docState.actorIds[op[succActorIdx][i]]}`
-      counterStates[succOp] = counterState
-      counterState.succs[succOp] = true
+      if (!counterStates[succOp]) counterStates[succOp] = []
+      counterStates[succOp].push(state)
+      state.succs[succOp] = true
     }
 
   } else if (ACTIONS[op[actionIdx]] === 'inc') {
-    // Incrementing a previously created counter.
-    if (!propState[elemId] || !propState[elemId].counterStates || !propState[elemId].counterStates[opId]) {
-      throw new RangeError(`increment operation ${opId} for unknown counter`)
-    }
-    let counterState = propState[elemId].counterStates[opId]
-    counterState.value += decodeValue(op[valLenIdx], op[valRawIdx]).value
-    delete counterState.succs[opId]
-
-    if (Object.keys(counterState.succs).length === 0) {
-      patchKey = counterState.opId
-      patchValue = {type: 'value', datatype: 'counter', value: counterState.value}
-      // TODO if the counter is in a list element, we need to add a 'remove' action when deleted
+    // An increment operation resolves the pending states registered under
+    // its ID. Increments whose counter is not visible at this property (for
+    // example because it was concurrently overwritten) contribute nothing,
+    // matching the Rust implementation.
+    const states = pendingBySucc && pendingBySucc[opId]
+    if (!states) return
+    delete pendingBySucc[opId]
+    const delta = decodeValue(op[valLenIdx], op[valRawIdx]).value
+    for (const state of states) {
+      if (state.isCounter) state.value += delta
+      delete state.succs[opId]
+      if (state.dead || Object.keys(state.succs).length > 0) continue
+      // Every successor was an increment: the operation is visible after all
+      if (state.isCounter) {
+        emissions.push([state.opId, {type: 'value', datatype: 'counter', value: state.value}])
+      } else if (ACTIONS[state.op[actionIdx]] === 'set') {
+        emissions.push([state.opId, Object.assign({type: 'value'}, decodeValue(state.op[valLenIdx], state.op[valRawIdx]))])
+      } else {
+        const objType = state.op[actionIdx] < ACTIONS.length ? OBJECT_TYPE[ACTIONS[state.op[actionIdx]]] : null
+        if (!patches[state.opId]) patches[state.opId] = emptyObjectPatch(state.opId, objType)
+        emissions.push([state.opId, patches[state.opId]])
+      }
+      propState[elemId].visibleOps.push(state.op)
+      propState[elemId].hasChild = propState[elemId].hasChild || (state.op[actionIdx] % 2) === 0
     }
 
   } else if (!isOverwritten) {
     // Add the value to the patch if it is not overwritten (i.e. if it has no succs).
     if (ACTIONS[op[actionIdx]] === 'set') {
-      patchKey = opId
-      patchValue = Object.assign({type: 'value'}, decodeValue(op[valLenIdx], op[valRawIdx]))
+      emissions.push([opId, Object.assign({type: 'value'}, decodeValue(op[valLenIdx], op[valRawIdx]))])
     } else if (op[actionIdx] % 2 === 0) { // even-numbered action == make* operation
       if (!patches[opId]) patches[opId] = emptyObjectPatch(opId, type)
-      patchKey = opId
-      patchValue = patches[opId]
+      emissions.push([opId, patches[opId]])
     }
   }
+  let patchKey = emissions.length > 0 ? emissions[0][0] : undefined
+  let patchValue = emissions.length > 0 ? emissions[0][1] : undefined
 
   if (!patches[objectId]) patches[objectId] = emptyObjectPatch(objectId, docState.objectMeta[objectId].type)
   const patch = patches[objectId]
@@ -1523,6 +1571,12 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
         if (!propState[elemId].action) propState[elemId].action = 'update'
       }
 
+      // Any further values that became visible at the same time (multiple
+      // operations resolved by one increment) are additional conflict values
+      for (let i = 1; i < emissions.length; i++) {
+        appendUpdate(patch.edits, listIndex, elemId, emissions[i][0], emissions[i][1], false)
+      }
+
     } else if (oldSuccNum === 0 && !propState[elemId].action) {
       // If the property used to have a non-overwritten/non-deleted value, but no longer, it's a remove
       propState[elemId].action = 'remove'
@@ -1535,7 +1589,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   } else if (patchValue || !isWholeDoc) {
     // Updating a map or table (with string key)
     if (firstOp || !patch.props[op[keyStrIdx]]) patch.props[op[keyStrIdx]] = {}
-    if (patchValue) patch.props[op[keyStrIdx]][patchKey] = patchValue
+    for (const [key, value] of emissions) patch.props[op[keyStrIdx]][key] = value
   }
 }
 
@@ -1623,9 +1677,15 @@ function mergeDocChangeOps(patches, newBlock, outCols, outOps, changeState, docS
           // When updating/deleting list elements, keep going if the next elemId in the change
           // equals the next elemId in the doc (i.e. we're updating several consecutive elements)
         } else if (!insert && lastOp === null && nextOp[keyStrIdx] !== null &&
-                   lastChangeKey !== null && compareUtf8(lastChangeKey, nextOp[keyStrIdx]) < 0) {
+                   lastChangeKey !== null && compareUtf8(lastChangeKey, nextOp[keyStrIdx]) < 0 &&
+                   !(docOp && docOp[objActorIdx] === firstOp[objActorIdx] &&
+                     docOp[objCtrIdx] === firstOp[objCtrIdx] && docOp[keyStrIdx] === lastChangeKey)) {
           // Allow a single mergeDocChangeOps call to process changes to several keys in the same
-          // object, provided that they appear in ascending order
+          // object, provided that they appear in ascending order. However, if the document still
+          // has unprocessed operations for the key we just finished (for example a concurrent
+          // value with a higher opId than a deletion we just applied), we must not move on to the
+          // next key yet: those operations have to pass through updatePatchProperty first, so
+          // that the patch reflects any values that remain visible for that key.
         } else break
 
         lastChangeKey = (nextOp !== null) ? nextOp[keyStrIdx] : null
@@ -1702,6 +1762,13 @@ function mergeDocChangeOps(patches, newBlock, outCols, outOps, changeState, docS
         // them sorted in ascending order by opId. Here we have docOp with a lower opId, so we
         // output it first.
         takeDocOp = true
+        // If this is the insertion of the next list element and the previous element remained
+        // visible (e.g. a deletion was outweighed by a concurrent update), advance the list index
+        // before generating the patch, the same way documentPatch() does
+        if (docOp[insertIdx] && elemVisible) {
+          elemVisible = false
+          listIndex++
+        }
         updatePatchProperty(patches, newBlock, objectId, docOp, docState, propState, listIndex, docOpOldSuccNum)
 
         // A deletion op in the change is represented in the document only by its entries in the
@@ -1816,6 +1883,9 @@ function applyOps(patches, changeState, docState) {
     objActor, objActorNum, objCtr, keyActor, keyActorNum, keyCtr, keyStr,
     idActor: docState.actorIds[idActorNum], idCtr, insert,
     objId: objActor === null ? '_root' : `${objCtr}@${objActor}`
+  }
+  if (ACTIONS[changeState.nextOp[actionIdx]] === 'mark' && docState.objectsWithMarks) {
+    docState.objectsWithMarks.add(ops.objId)
   }
 
   let startBlockIndex
@@ -2204,6 +2274,7 @@ function documentPatch(docState) {
       listIndex++
     }
     if (docOp[succNumIdx] === 0 && ACTIONS[docOp[actionIdx]] !== 'mark') elemVisible = true
+    if (ACTIONS[docOp[actionIdx]] === 'mark' && docState.objectsWithMarks) docState.objectsWithMarks.add(objectId)
     if (docOp[idCtrIdx] > docState.maxOp) docState.maxOp = docOp[idCtrIdx]
     for (let i = 0; i < docOp[succNumIdx]; i++) {
       if (docOp[succCtrIdx][i] > docState.maxOp) docState.maxOp = docOp[succCtrIdx][i]
@@ -2291,13 +2362,15 @@ function buildCursorIndex(blocks, actorIds, objectId) {
       const matches = objectId === '_root'
         ? op[objCtrIdx] === null
         : op[objCtrIdx] === object.counter && op[objActorIdx] === object.actorId
-      if (!matches || op[keyStrIdx] !== null || op[actionIdx] === ACTIONS.indexOf('mark')) continue
+      if (!matches || op[keyStrIdx] !== null) continue
       if (op[insertIdx]) {
         const id = `${op[idCtrIdx]}@${op[idActorIdx]}`
         const key = op[keyCtrIdx] === 0 ? '_head' : `${op[keyCtrIdx]}@${op[keyActorIdx]}`
         elements.push(id)
-        byId.set(id, {key, visible: op[succNumIdx] === 0})
-      } else {
+        // Mark boundaries are elements of the sequence, but they are never
+        // visible; including them lets cursors anchored on a boundary resolve
+        byId.set(id, {key, visible: op[actionIdx] !== ACTIONS.indexOf('mark') && op[succNumIdx] === 0})
+      } else if (op[actionIdx] !== ACTIONS.indexOf('mark')) {
         const id = `${op[keyCtrIdx]}@${op[keyActorIdx]}`
         const element = byId.get(id)
         if (element && op[succNumIdx] === 0) element.visible = true
@@ -2334,6 +2407,7 @@ class BackendDoc {
     this.objectMeta = {_root: {parentObj: null, parentKey: null, opId: null, type: 'map', children: {}}}
     this.visibleMapOps = new Map()
     this.cursorIndex = new Map()
+    this.objectsWithMarks = new Set()
 
     if (buffer) {
       const doc = decodeDocumentHeader(buffer)
@@ -2375,7 +2449,8 @@ class BackendDoc {
       this.blocks = [{columns: makeDecoders(doc.opsColumns, DOC_OPS_COLUMNS)}]
       updateBlockMetadata(this.blocks[0], this.visibleMapOps)
 
-      let docState = {blocks: this.blocks, actorIds: this.actorIds, objectMeta: this.objectMeta, maxOp: 0}
+      let docState = {blocks: this.blocks, actorIds: this.actorIds, objectMeta: this.objectMeta, maxOp: 0,
+        objectsWithMarks: this.objectsWithMarks}
       this.initPatch = documentPatch(docState)
       this.maxOp = docState.maxOp
 
@@ -2403,6 +2478,104 @@ class BackendDoc {
   }
 
   /**
+   * Adjusts the `elemId` references of the insertion operations in a local change so that they
+   * match what the Rust implementation would have generated. In Rust, mark boundaries are elements
+   * of the sequence, and an insertion whose position immediately follows a "sticky" boundary (an
+   * expanding markBegin, or a non-expanding markEnd) anchors on the boundary element itself rather
+   * than on the preceding visible element; a begin/end pair that would be straddled by the
+   * insertion point is skipped over entirely. This is a port of the candidate logic in
+   * `InsertQuery` (rust/automerge/src/op_set2/op_set/insert.rs). Applying the same adjustment at
+   * authoring time means the wire format alone determines placement, and the apply side can use
+   * plain RGA ordering. Mutates `change.ops` in place. Only runs for objects that contain marks.
+   */
+  adjustInsertAnchors(change) {
+    if (this.objectsWithMarks.size === 0) return
+    const objects = new Map()
+    for (const op of change.ops) {
+      if (!op.insert || op.elemId === undefined || !this.objectsWithMarks.has(op.obj)) continue
+      if (!objects.has(op.obj)) objects.set(op.obj, new Map())
+      objects.get(op.obj).set(op.elemId, null)
+    }
+    if (objects.size === 0) return
+    for (const [objectId, anchors] of objects) this.scanInsertAnchors(objectId, anchors)
+    for (const op of change.ops) {
+      if (!op.insert || op.elemId === undefined) continue
+      const anchors = objects.get(op.obj)
+      const anchor = anchors && anchors.get(op.elemId)
+      if (anchor && anchor !== op.elemId) op.elemId = anchor
+    }
+  }
+
+  /**
+   * For each key of `anchors` (an element ID that a local insertion wants to insert after, or
+   * `_head`), walks the document operations of the list object `objectId` and determines the
+   * element the insertion should actually anchor on, following the Rust `InsertQuery` semantics.
+   * Fills in the values of `anchors`; references that are not found (e.g. elements created earlier
+   * in the same change) are left as null.
+   */
+  scanInsertAnchors(objectId, anchors) {
+    const object = parseOpId(objectId)
+    const states = new Map()
+    for (const refKey of anchors.keys()) {
+      states.set(refKey, refKey === '_head'
+        ? {phase: 'active', candidates: [{ref: '_head', id: null}]}
+        : {phase: 'seeking', candidates: [{ref: refKey, id: null}]})
+    }
+    let remaining = states.size
+    for (const block of this.blocks) {
+      if (remaining === 0) break
+      for (const column of block.columns) column.decoder.reset()
+      while (remaining > 0 && !block.columns[actionIdx].decoder.done) {
+        const op = readOperation(block.columns, this.actorIds)
+        if (op[objCtrIdx] !== object.counter || op[objActorIdx] !== object.actorId ||
+            op[keyStrIdx] !== null) continue
+        const action = ACTIONS[op[actionIdx]]
+        if (action === 'inc') continue
+        const insert = op[insertIdx], isMark = action === 'mark'
+        const rowId = `${op[idCtrIdx]}@${op[idActorIdx]}`
+        const markName = op[markNameIdx], expand = !!op[expandIdx]
+        const visible = op[succNumIdx] === 0
+        for (const [refKey, state] of states) {
+          if (state.phase === 'done') continue
+          if (state.phase === 'seeking') {
+            if (insert && rowId === refKey) state.phase = 'run'
+            continue
+          }
+          if (state.phase === 'run') {
+            // Skip the update operations of the reference element; candidate collection begins
+            // at the next inserted element
+            if (!insert) continue
+            state.phase = 'active'
+          }
+          if (isMark) {
+            if (markName === null) {
+              // A markEnd whose matching markBegin is itself a candidate: the points between the
+              // pair are invalid insertion spots, drop the pair's candidates
+              const beginId = `${op[idCtrIdx] - 1}@${op[idActorIdx]}`
+              const index = state.candidates.findIndex(c => c.id === beginId)
+              if (index >= 0) {
+                state.candidates.length = index
+                continue
+              }
+            }
+            const sticky = markName === null ? !expand : expand
+            if (sticky) state.candidates.push({ref: rowId, id: rowId})
+          } else if (visible) {
+            anchors.set(refKey, state.candidates[state.candidates.length - 1].ref)
+            state.phase = 'done'
+            remaining--
+          }
+        }
+      }
+    }
+    for (const [refKey, state] of states) {
+      if (state.phase === 'active') {
+        anchors.set(refKey, state.candidates[state.candidates.length - 1].ref)
+      }
+    }
+  }
+
+  /**
    * Makes a copy of this BackendDoc that can be independently modified.
    */
   clone() {
@@ -2424,6 +2597,7 @@ class BackendDoc {
     copy.objectMeta = this.objectMeta // immutable, no copying needed
     copy.visibleMapOps = new Map(this.visibleMapOps)
     copy.cursorIndex = this.cursorIndex
+    copy.objectsWithMarks = new Set(this.objectsWithMarks)
     copy.queue = this.queue // immutable, no copying needed
     copy.saveCursor = this.saveCursor
     copy.changesEncoders = this.changesEncoders &&
@@ -2466,7 +2640,8 @@ class BackendDoc {
       clock: this.clock,
       blocks: this.blocks.slice(),
       visibleMapOps: {base: this.visibleMapOps, changes: new Map()},
-      objectMeta: Object.assign({}, this.objectMeta)
+      objectMeta: Object.assign({}, this.objectMeta),
+      objectsWithMarks: new Set(this.objectsWithMarks)
     }
     let queue = (this.queue.length === 0) ? decodedChanges : decodedChanges.concat(this.queue)
     let allApplied = [], objectIds = new Set()
@@ -2523,6 +2698,7 @@ class BackendDoc {
     this.clock        = docState.clock
     this.blocks       = docState.blocks
     this.objectMeta   = docState.objectMeta
+    this.objectsWithMarks = docState.objectsWithMarks
     for (const [property, values] of docState.visibleMapOps.changes) {
       if (values && values.size === 0) this.visibleMapOps.delete(property)
       else this.visibleMapOps.set(property, values)
@@ -2617,7 +2793,7 @@ class BackendDoc {
     }
 
     // Fast path for the common case where all new changes depend only on haveDeps
-    let stack = [], seenHashes = {}, toReturn = []
+    let stack = [], seenHashes = {}, toReturn = [], aborted = false
     for (let hash of haveDeps) {
       seenHashes[hash] = true
       const successors = this.dependentsByHash[hash]
@@ -2635,6 +2811,10 @@ class BackendDoc {
         // If a change depends on a hash we have not seen, abort the traversal and fall back to the
         // slower algorithm. This will sometimes abort even if all new changes depend on `haveDeps`,
         // because our depth-first traversal is not necessarily a topological sort of the graph.
+        // The abort must be recorded explicitly: checking `stack.length` is not enough, because
+        // the stack can be empty at this point even though the change we just took has
+        // dependencies that were never visited.
+        aborted = true
         break
       }
       stack.push(...this.dependentsByHash[hash])
@@ -2642,7 +2822,7 @@ class BackendDoc {
 
     // If the traversal above has encountered all the heads, and was not aborted early due to
     // a missing dependency, then the set of changes it has found is complete, so we can return it
-    if (stack.length === 0 && this.heads.every(head => seenHashes[head])) {
+    if (!aborted && stack.length === 0 && this.heads.every(head => seenHashes[head])) {
       return toReturn.map(hash => this.changes[this.changeIndexByHash[hash]])
     }
 
@@ -2837,12 +3017,26 @@ class BackendDoc {
 
     // Getting the byte array for the changes columns finalises their encoders, after which we can
     // no longer append values to them. We therefore copy their data over to fresh encoders.
-    const changesColumns = this.changesEncoders.map(col => ({columnId: col.columnId, encoder: col.encoder.clone()}))
+    let changesColumns = this.changesEncoders.map(col => ({columnId: col.columnId, encoder: col.encoder.clone()}))
+    let opsColumns = concatBlocks(this.blocks)
+    let actorIds = this.actorIds
+
+    // The document format requires the actor table to be lexicographically
+    // sorted, and the Rust implementation validates the document against
+    // that assumption. Actors are registered in the order they are first
+    // seen, so if that order is not sorted, remap every actor-index column.
+    if (actorIds.some((actor, index) => index > 0 && actorIds[index - 1] > actor)) {
+      const sortedActors = actorIds.slice().sort()
+      const remap = actorIds.map(actor => sortedActors.indexOf(actor))
+      changesColumns = remapActorColumns(changesColumns, remap)
+      opsColumns = remapActorColumns(opsColumns, remap)
+      actorIds = sortedActors
+    }
 
     this.binaryDoc = encodeDocumentHeader({
       changesColumns,
-      opsColumns: concatBlocks(this.blocks),
-      actorIds: this.actorIds, // TODO: sort actorIds (requires transforming all actorId columns in opsColumns)
+      opsColumns,
+      actorIds,
       heads: this.heads,
       headsIndexes: this.heads.map(hash => this.changeIndexByHash[hash]),
       extraBytes: this.extraBytes

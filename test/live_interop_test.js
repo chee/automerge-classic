@@ -328,6 +328,47 @@ describeLive('live Rust/WASM interoperability', () => {
     assert.strictEqual(Classic.inspectChange(classic, hash).hash, Modern.inspectChange(modern, hash).hash)
   })
 
+  it('anchors insertions at sticky mark boundaries like the Rust implementation', () => {
+    const cases = [
+      ['insert at sticky begin', [
+        A => d => A.splice(d, ['text'], 0, 0, 'hello'),
+        A => d => A.mark(d, ['text'], {start: 2, end: 5, expand: 'before'}, 'bold', true),
+        A => d => A.splice(d, ['text'], 2, 0, 'X')
+      ]],
+      ['insert at sticky end', [
+        A => d => A.splice(d, ['text'], 0, 0, 'hello'),
+        A => d => A.mark(d, ['text'], {start: 1, end: 3, expand: 'none'}, 'bold', true),
+        A => d => A.splice(d, ['text'], 3, 0, 'X')
+      ]],
+      ['stacked marks then insert', [
+        A => d => A.splice(d, ['text'], 0, 0, 'hello'),
+        A => d => A.mark(d, ['text'], {start: 0, end: 4, expand: 'both'}, 'bold', true),
+        A => d => A.mark(d, ['text'], {start: 0, end: 4, expand: 'none'}, 'em', 1),
+        A => d => A.splice(d, ['text'], 4, 0, 'YZ'),
+        A => d => A.splice(d, ['text'], 0, 0, 'Q')
+      ]],
+      ['insert after deleted char before sticky end', [
+        A => d => A.splice(d, ['text'], 0, 0, 'hello'),
+        A => d => A.mark(d, ['text'], {start: 0, end: 3, expand: 'none'}, 'bold', true),
+        A => d => A.splice(d, ['text'], 2, 1),
+        A => d => A.splice(d, ['text'], 2, 0, 'W')
+      ]],
+      ['empty expanding mark then insert into it', [
+        A => d => A.splice(d, ['text'], 0, 0, 'abc'),
+        A => d => A.mark(d, ['text'], {start: 1, end: 1, expand: 'both'}, 'bold', true),
+        A => d => A.splice(d, ['text'], 1, 0, 'M')
+      ]]
+    ]
+    function build(A, steps) {
+      let doc = A.change(A.init(ACTOR_A), {time: 0}, draft => { draft.text = '' })
+      for (const step of steps) doc = A.change(doc, {time: 0}, step(A))
+      return {heads: A.getHeads(doc), spans: plain(A.spans(doc, ['text']))}
+    }
+    for (const [name, steps] of cases) {
+      assert.deepStrictEqual(build(Classic, steps), build(Modern, steps), name)
+    }
+  })
+
   it('exposes every export of the modern package', () => {
     for (const key of Object.keys(Modern)) {
       assert.ok(key in Classic, `missing export: ${key}`)

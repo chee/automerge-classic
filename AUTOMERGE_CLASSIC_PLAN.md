@@ -161,7 +161,23 @@ The cursor index improved the repeated lookup fixture by 14.05×. A representati
 - Exact semantic patches for local changes, load, applyChanges, merge, and sync.
 - Rust parity regressions for key ordering, conflicts, patch order, updateText, updateSpans, mark boundaries, surrogate handling, and getChanges.
 - Live cross-implementation integration tests against the built `../automerge/javascript` package.
-- Current source result: 707 passing, 1 pending, no failures; TypeScript passes; lint passes; ESM smoke passes.
+- Patch-convergence fuzzing (`test/patch_convergence_test.js`): three peers make concurrent map/list/text/mark changes and exchange them over partial out-of-order syncs; after every step, applying the patchCallback stream to a plain value must equal `toJS(doc)`, and after full synchronization the peers must converge with matching spans. The fuzz found four bugs, all fixed with minimized regressions pinned:
+  - `mark()` before text edits in the same change registered the old cached text object as updated, so later edits mutated the previous snapshot in place and their patches were dropped;
+  - saved documents emitted the actor table in first-seen order; the Rust implementation requires it sorted and rejected such documents with "mismatching heads" (save now remaps every actor-index column);
+  - a delete whose predecessors were already overwritten, batched with changes to other keys, emitted a patch that dropped the concurrently surviving value (the multi-key merge walk now drains the current key's document ops first);
+  - `getChanges`'s fast path could return a change without its dependencies when the traversal aborted on the last stack entry (the abort is now tracked explicitly), leaving receiving peers unable to converge.
+- A second, wider fuzzing pass (counters, blocks, updateSpans in the mix; save-bytes loadability in the Rust implementation checked continuously) found and fixed six more bugs:
+  - a batched patch that references the same child object several times through conflict re-listing duplicated its contents when applied (each shared child patch is now applied once per pass);
+  - counters could not be overwritten with plain values, unlike the Rust implementation;
+  - successive increments emitted their pred against the previous increment instead of the counter operation, so reloads and remote peers dropped all but the first increment;
+  - an increment on a conflicted key wiped the other conflicting values from the local state;
+  - increments whose counter is not visible crashed the backend instead of contributing nothing;
+  - values whose only successors are increments were hidden by reload and by patches (visibility is now deferred until the successors are known, with multiple candidates per successor supported); and marks anchored on deleted elements were dropped by marks()/spans() (anchors now resolve through the full insertion tree, including tombstones).
+- Known Rust-implementation inconsistencies found by the fuzz (classic follows the replay semantics, which converge): the Rust implementation's local and reload views drop conflicts that its own change replay preserves after a multi-pred increment, and values whose only successors are increments survive its replay but are dropped by its own document encoding. Classic is self-consistent (live == reload == replay) in both cases.
+- A third fuzzing pass (100 seeds × 100 steps in both plain and blocks modes, all clean) found and fixed two more bugs:
+  - insertions at sticky mark boundaries anchored on the preceding character instead of the boundary element, diverging from the Rust wire format (fixed by porting Rust's `InsertQuery` authoring-time anchor adjustment and switching mark resolution to plain RGA ordering — this also resolved the previously open stacked marks/blocks divergence);
+  - deleting two consecutive list elements where the first survives through a concurrent overwrite removed the survivor instead of the second element in the incremental patch (the list index now advances past the surviving element before the removal patch is generated, matching the load path).
+- Current source result: 786 passing, 1 pending (env-gated live interop), no failures; TypeScript passes; lint passes; ESM smoke passes.
 
 ## Implementation checklist
 
@@ -282,6 +298,7 @@ The packed override passes CommonJS root, Node ESM root, slim, classic, raw zero
 - `backend/column_data.js` is internal. Its immutable slab sharing relies on internal callers not mutating returned slab objects or byte arrays.
 - The Rust implementation iterates a `std::collections::HashMap` when generating the property operations of a block marker, so the operation order of a multi-property block (and therefore the change hash) is nondeterministic in Rust itself. Classic uses a fixed deterministic order (`type` first for `splitBlock`, sorted for `updateBlock`); either order interoperates.
 - `diff()` emits the same patch set with the same per-object grouping and object ordering as Rust, but within one object Rust orders patches by the operation order of the underlying changes, while classic orders deletions first and then keys in sorted order. Patches on distinct keys commute, so applying the patches yields the same result.
+- Mark boundaries are now handled the way the Rust implementation handles them, at both ends of the pipeline. Reading: boundaries are elements of the text sequence ordered by plain RGA (descending operation ID among siblings), marks are resolved with a linear sequence scan in which an unclosed begin extends to the end of the text, zero-width non-expanding marks are ignored without emitting operations, and an empty expanding mark anchors its end boundary on its own begin boundary. Writing: boundary stickiness is applied at authoring time, as in Rust's `InsertQuery` — a locally authored insertion whose position immediately follows a sticky boundary (an expanding begin or a non-expanding end) anchors its wire `elemId` on the boundary element itself, and a begin/end pair straddling the insertion point is skipped over entirely (`adjustInsertAnchors` in `backend/new.js`, gated on the object containing marks so mark-free documents pay nothing). All verified hash-identical with the Rust implementation, including inserts at sticky and empty-mark boundaries and the stacked marks/blocks arrangement previously pinned as an open divergence (fixture `test/fixtures/mark_block_stack.json`, test now enabled).
 
 ## Known non-goals unless a consumer requires them
 

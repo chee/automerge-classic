@@ -422,8 +422,10 @@ describe('Proxying context', () => {
     context.cache._root = {[OBJECT_ID]: '_root', counter, [CONFLICTS]: {counter: {'1@actor1': counter}}}
     context.increment([], 'counter', 1)
     assert(applyPatch.calledOnce)
+    // The updated value is recorded under the opId of the operation that
+    // created the counter, so that further increments also use it as pred
     assert.deepStrictEqual(applyPatch.firstCall.args[0], {objectId: '_root', type: 'map', props: {
-      counter: {[`1@${context.actorId}`]: {value: 1, datatype: 'counter'}}
+      counter: {'1@actor1': {value: 1, datatype: 'counter'}}
     }})
     assert.deepStrictEqual(context.ops, [{obj: '_root', action: 'inc', key: 'counter', insert: false, value: 1, pred: ['1@actor1']}])
   })

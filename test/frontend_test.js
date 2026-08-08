@@ -211,13 +211,15 @@ describe('Automerge.Frontend', () => {
         })
       })
 
-      it('should refuse to overwrite a property with a counter value', () => {
+      it('should allow a counter to be overwritten with a plain value, like the Rust implementation', () => {
         const [doc1] = Frontend.change(Frontend.init(), doc => {
           doc.counter = new Frontend.Counter()
           doc.list = [new Frontend.Counter()]
         })
-        assert.throws(() => Frontend.change(doc1, doc => doc.counter++), /Cannot overwrite a Counter object/)
-        assert.throws(() => Frontend.change(doc1, doc => doc.list[0] = 3), /Cannot overwrite a Counter object/)
+        const [doc2] = Frontend.change(doc1, doc => { doc.counter = 7 })
+        assert.strictEqual(doc2.counter, 7)
+        const [doc3] = Frontend.change(doc2, doc => { doc.list[0] = 3 })
+        assert.strictEqual(doc3.list[0], 3)
       })
 
       it('should make counter objects behave like primitive numbers', () => {

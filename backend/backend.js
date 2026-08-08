@@ -82,6 +82,7 @@ function applyLocalChange(backend, change) {
     change.deps = Object.keys(deps).sort()
   }
 
+  state.adjustInsertAnchors(change)
   const binaryChange = encodeChange(change)
   const patch = state.applyChanges([binaryChange], true)
   backend.frozen = true

@@ -337,9 +337,6 @@ class Context {
 
     const objectId = path.length === 0 ? '_root' : path[path.length - 1].objectId
     const object = this.getObject(objectId)
-    if (object[key] instanceof Counter) {
-      throw new RangeError('Cannot overwrite a Counter object; use .increment() or .decrement() to change its value.')
-    }
 
     // If the assigned field value is the same as the existing value, and
     // the assignment does not resolve a conflict, do nothing
@@ -428,9 +425,6 @@ class Context {
       const insertions = createArrayOfNulls(index - list.length)
       insertions.push(value)
       return this.splice(path, list.length, 0, insertions)
-    }
-    if (list[index] instanceof Counter) {
-      throw new RangeError('Cannot overwrite a Counter object; use .increment() or .decrement() to change its value.')
     }
 
     // If the assigned list element value is the same as the existing value, and
@@ -564,7 +558,6 @@ class Context {
     // TODO what if there is a conflicting value on the same key as the counter?
     const type = this.getObjectType(objectId)
     const value = object[key].value + delta
-    const opId = this.nextOpId()
     const pred = getPred(object, key)
 
     if (type === 'list' || type === 'text') {
@@ -574,11 +567,31 @@ class Context {
       this.addOp({action: 'inc', obj: objectId, key, value: delta, insert: false, pred})
     }
 
+    // The updated counter value is recorded in the local state under the
+    // operation ID of the operation that created the counter, not under the
+    // increment's own ID: further increments must again use the counter's
+    // creation operation as their pred, matching the Rust implementation,
+    // and reload resolution attributes increments to the counter operation
+    // they extend. In a conflict, the counter is the value that is an
+    // actual Counter instance. Any other conflicting values are carried
+    // through the patch unchanged, so that the increment does not wipe them
+    // from the local state.
+    let counterOpId = pred[0]
+    const conflicts = object[CONFLICTS] && object[CONFLICTS][key]
+    if (conflicts) {
+      for (const conflictOpId of Object.keys(conflicts)) {
+        if (conflicts[conflictOpId] instanceof Counter) counterOpId = conflictOpId
+      }
+    }
+    const values = this.getValuesDescriptions(path, object, key)
+    values[counterOpId] = {value, datatype: 'counter'}
     this.applyAtPath(path, subpatch => {
       if (type === 'list' || type === 'text') {
-        subpatch.edits.push({action: 'update', index: key, opId, value: {value, datatype: 'counter'}})
+        for (const opId of Object.keys(values)) {
+          subpatch.edits.push({action: 'update', index: key, opId, value: values[opId]})
+        }
       } else {
-        subpatch.props[key] = {[opId]: {value, datatype: 'counter'}}
+        subpatch.props[key] = values
       }
     })
   }
