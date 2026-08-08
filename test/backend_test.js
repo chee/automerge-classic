@@ -1,10 +1,9 @@
 /* eslint-disable no-unused-vars */
-const assert = require('assert')
-const Automerge = process.env.TEST_DIST === '1' ? require('../dist/automerge') : require('../src/automerge')
-const Backend = Automerge.Backend
-const { encodeChange, decodeChange } = require('../backend/columnar')
-const uuid = require('../src/uuid')
-
+import assert from 'node:assert'
+import Automerge from '../src/automerge.js'
+import * as Backend from '../backend/index.js'
+import { decodeChange, encodeChange } from '../backend/columnar.js'
+import uuid from '../src/uuid.js'
 function hash(change) {
   return decodeChange(encodeChange(change)).hash
 }

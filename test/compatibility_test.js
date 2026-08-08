@@ -1,18 +1,20 @@
-const assert = require('assert')
-const { execFileSync } = require('child_process')
-const { statSync } = require('fs')
-const Automerge = require('@automerge/automerge-classic')
+import assert from 'node:assert'
+import { execFileSync } from 'node:child_process'
+import { statSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import * as Automerge from '@automerge/automerge-classic'
+import * as Slim from '@automerge/automerge-classic/slim'
+import { automergeWasmBase64 } from '@automerge/automerge-classic/automerge.wasm.base64'
 
 describe('modern API compatibility', () => {
-  it('loads the root and slim exports through require and import', () => {
-    const requiredSlim = require('@automerge/automerge-classic/slim')
-    assert.strictEqual(requiredSlim.init, Automerge.init)
+  it('loads the root and slim exports through the package entry points', () => {
+    assert.strictEqual(Slim.init, Automerge.init)
     assert.strictEqual(Automerge.next.change, Automerge.change)
     const script = "Promise.all([import('@automerge/automerge-classic'), import('@automerge/automerge-classic/slim')]).then(([root, slim]) => process.stdout.write(typeof root.init + ':' + typeof root.next.diff + ':' + typeof slim.applyPatches))"
     assert.strictEqual(execFileSync(process.execPath, ['--input-type=module', '-e', script], {encoding: 'utf8'}), 'function:function:function')
-    assert.deepStrictEqual(['diffPath', 'dump', 'isCounter', 'releaseInfo', 'use'].filter(name => !(name in Automerge)), [])
-    assert.strictEqual(require('@automerge/automerge-classic/automerge.wasm.base64').automergeWasmBase64, '')
-    assert.strictEqual(statSync(require.resolve('@automerge/automerge-classic/automerge.wasm')).size, 0)
+    assert.deepStrictEqual(['dump', 'isCounter', 'use'].filter(name => !(name in Automerge)), [])
+    assert.strictEqual(automergeWasmBase64, '')
+    assert.strictEqual(statSync(fileURLToPath(import.meta.resolve('@automerge/automerge-classic/automerge.wasm'))).size, 0)
   })
 
   it('normalizes modern actor options', () => {
@@ -50,7 +52,7 @@ describe('modern API compatibility', () => {
   })
 
   it('converts documents to detached JavaScript values', () => {
-    const doc = Automerge.from({nested: {value: 1}, text: new Automerge.Text('abc')})
+    const doc = Automerge.from({nested: {value: 1}, text: 'abc'})
     const copy = Automerge.toJS(doc)
     assert.strictEqual(Automerge.isAutomerge(doc), true)
     assert.strictEqual(Automerge.isAutomerge(copy), false)
@@ -59,7 +61,7 @@ describe('modern API compatibility', () => {
   })
 
   it('provides scalar, list, and classic text mutation helpers', () => {
-    let doc = Automerge.from({list: ['a'], text: new Automerge.Text('hello'), title: 'a🙂b', values: ['🙂x']})
+    let doc = Automerge.from({list: ['a'], text: 'hello', title: 'a🙂b', values: ['🙂x']})
     doc = Automerge.change(doc, draft => {
       Automerge.insertAt(draft.list, 1, 'b', 'c')
       Automerge.deleteAt(draft.list, 0)
@@ -96,11 +98,6 @@ describe('modern API compatibility', () => {
     let replay = Automerge.clone(Automerge.view(doc, beforeHeads))
     replay = Automerge.change(replay, draft => Automerge.applyPatches(draft, patches))
     assert.deepStrictEqual(Automerge.toJS(replay), Automerge.toJS(doc))
-
-    const nested = Automerge.diffPath(doc, ['nested'], beforeHeads, afterHeads)
-    assert(nested.every(patch => patch.path[0] === 'nested'))
-    assert(Automerge.diffPath(doc, ['nested'], beforeHeads, afterHeads, {recursive: false})
-      .every(patch => patch.path.length === 2))
   })
 
   it('diffs front insertions, conflicts, and mark-only changes semantically', () => {
@@ -123,7 +120,7 @@ describe('modern API compatibility', () => {
       {action: 'conflict', path: ['value']}
     ])
 
-    let text = Automerge.from({text: new Automerge.Text('abc')})
+    let text = Automerge.from({text: 'abc'})
     before = Automerge.getHeads(text)
     text = Automerge.change(text, draft => {
       Automerge.mark(draft, ['text'], {start: 0, end: 1}, 'bold', true)
@@ -159,7 +156,7 @@ describe('modern API compatibility', () => {
   })
 
   it('updates spans without replacing unchanged text', () => {
-    let doc = Automerge.from({text: new Automerge.Text('abc')}, {actor: '11111111111111111111111111111111'})
+    let doc = Automerge.from({text: 'abc'}, {actor: '11111111111111111111111111111111'})
     const cursor = Automerge.getCursor(doc, ['text'], 1)
     const before = Automerge.getHeads(doc)
     doc = Automerge.change(doc, draft => {
@@ -177,7 +174,7 @@ describe('modern API compatibility', () => {
   })
 
   it('accepts cursors as splice indexes', () => {
-    let doc = Automerge.from({text: new Automerge.Text('abc')}, {actor: '11111111111111111111111111111111'})
+    let doc = Automerge.from({text: 'abc'}, {actor: '11111111111111111111111111111111'})
     const cursor = Automerge.getCursor(doc, ['text'], 1)
     doc = Automerge.change(doc, draft => Automerge.splice(draft, ['text'], cursor, 0, 'X'))
     assert.strictEqual(doc.text.toString(), 'aXbc')
@@ -430,7 +427,6 @@ describe('modern API compatibility', () => {
     const doc = Automerge.from({count: new Automerge.Counter(1)})
     assert.strictEqual(Automerge.isCounter(doc.count), true)
     assert.strictEqual(Automerge.isCounter(1), false)
-    assert.deepStrictEqual(Automerge.releaseInfo(), {js: {gitHead: 'classic'}, wasm: null})
     assert.strictEqual(Automerge.dump(doc), undefined)
     assert.strictEqual(Automerge.use({}), undefined)
   })
@@ -505,7 +501,7 @@ describe('modern API compatibility', () => {
   })
 
   it('indexes cursors anchored to deleted block markers', () => {
-    let doc = Automerge.from({text: new Automerge.Text('abc')},
+    let doc = Automerge.from({text: 'abc'},
       {actor: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'})
     doc = Automerge.change(doc, draft => {
       Automerge.splitBlock(draft, ['text'], 1, {type: 'paragraph'})
@@ -580,47 +576,15 @@ describe('modern API compatibility', () => {
     assert.strictEqual(Automerge.inspectChange(doc, '00'.repeat(32)), null)
   })
 
-  it('exposes level-zero fragment metadata and bundles', () => {
+  it('saves and reads bundles', () => {
     let doc = Automerge.from({value: 1}, {actor: 'aabb'})
     doc = Automerge.change(doc, draft => { draft.value = 2 })
-    const changes = Automerge.getAllChanges(doc)
-    const metadata = Automerge.getFragmentMetadata(doc, 0)
+    const hashes = Automerge.getAllChanges(doc).map(change => Automerge.decodeChange(change).hash)
 
-    assert.deepStrictEqual(metadata.map(fragment => fragment.head), changes.map(change => Automerge.decodeChange(change).hash))
-    assert.deepStrictEqual(metadata.map(fragment => fragment.level), [0, 0])
-    assert.deepStrictEqual(metadata[0].boundary, [])
-    assert.deepStrictEqual(metadata[1].boundary, [metadata[0].head])
-    assert.deepStrictEqual(metadata.map(fragment => fragment.checkpoints), [[], []])
-    assert.deepStrictEqual(metadata.map(fragment => fragment.members), metadata.map(fragment => [fragment.head]))
-    assert.deepStrictEqual(Automerge.getFragmentMetadata(doc, {start: 1}), [])
-    assert.deepStrictEqual(Automerge.bundleFragmentMetadata(doc, metadata), changes)
-    assert.deepStrictEqual(Automerge.getFragmentMeta(doc, metadata[1].head), metadata[1])
-    assert.strictEqual(Automerge.getFragmentMeta(doc, '00'.repeat(32)), null)
-    assert.deepStrictEqual(Automerge.getCommits(doc).map(commit => commit.bytes), changes)
-    assert.deepStrictEqual(Automerge.getFragments(doc), [])
-    assert.deepStrictEqual(Automerge.getFragments(doc, 0).map(fragment => fragment.bytes), changes)
-    assert.deepStrictEqual(Automerge.getFragmentMetadata(doc, null), metadata)
-
-    const commits = Automerge.getCommits(doc)
-    const commitCallbacks = []
-    const committed = Automerge.addCommits(Automerge.init(), commits.slice().reverse(), {
-      patchCallback: (patches, info) => commitCallbacks.push({patches, info})
-    })
-    const fragmented = Automerge.addFragments(Automerge.init(), Automerge.getFragments(doc, 0).reverse())
-    assert.deepStrictEqual(committed, doc)
-    assert.deepStrictEqual(fragmented, doc)
-    assert.strictEqual(commitCallbacks.length, 1)
-    assert.strictEqual(commitCallbacks[0].info.source, 'addCommits')
-    assert.deepStrictEqual(commitCallbacks[0].info.before, {})
-    assert.deepStrictEqual(commitCallbacks[0].info.after, doc)
-    assert.throws(() => Automerge.addCommits(Automerge.init(), [Object.assign({}, commits[0], {head: '00'.repeat(32)})]), /head mismatch/)
-    assert.throws(() => Automerge.addCommits(Automerge.init(), [Object.assign({}, commits[0], {parents: ['00'.repeat(32)]})]), /parents do not match/)
-    assert.throws(() => Automerge.addFragments(Automerge.init(), [{bytes: new Uint8Array([1, 2, 3])}]), /fragment bundles/)
-
-    const bundle = Automerge.saveBundle(doc, [metadata[1].head])
+    const bundle = Automerge.saveBundle(doc, [hashes[1]])
     const decodedBundle = Automerge.readBundle(bundle)
-    assert.deepStrictEqual(decodedBundle.changes.map(change => change.hash), [metadata[1].head])
-    assert.deepStrictEqual(decodedBundle.deps, [metadata[0].head])
+    assert.deepStrictEqual(decodedBundle.changes.map(change => change.hash), [hashes[1]])
+    assert.deepStrictEqual(decodedBundle.deps, [hashes[0]])
     assert(Automerge.getBackend(doc))
     assert.strictEqual(Automerge.hasOurChanges(doc, {sharedHeads: Automerge.getHeads(doc)}), true)
   })
@@ -646,7 +610,7 @@ describe('modern API compatibility', () => {
   })
 
   it('reads and changes rich text blocks and spans', () => {
-    let doc = Automerge.from({text: new Automerge.Text('abc')})
+    let doc = Automerge.from({text: 'abc'})
     doc = Automerge.change(doc, draft => {
       Automerge.splitBlock(draft, ['text'], 1, {type: 'paragraph', level: 1})
     })

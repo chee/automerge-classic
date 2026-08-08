@@ -1,15 +1,15 @@
-const assert = require('assert')
-const Automerge = process.env.TEST_DIST === '1' ? require('../dist/automerge') : require('../src/automerge')
-const { BloomFilter } = require('../backend/sync')
-const { decodeChangeMeta } = require('../backend/columnar')
-const { decodeSyncMessage, encodeSyncMessage, decodeSyncState, encodeSyncState, initSyncState } = Automerge.Backend
+import assert from 'node:assert'
+import Automerge from './subject.js'
+import { BloomFilter } from '../backend/sync.js'
+import { decodeChangeMeta } from '../backend/columnar.js'
+const { decodeSyncMessage, encodeSyncMessage, decodeSyncState, encodeSyncState, initSyncState } = Automerge
 
 function getHeads(doc) {
-  return Automerge.Backend.getHeads(Automerge.Frontend.getBackendState(doc))
+  return Automerge.getHeads(doc)
 }
 
 function getMissingDeps(doc) {
-  return Automerge.Backend.getMissingDeps(Automerge.Frontend.getBackendState(doc))
+  return Automerge.getMissingDeps(doc)
 }
 
 function sync(a, b, aSyncState = initSyncState(), bSyncState = initSyncState()) {

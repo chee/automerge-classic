@@ -20,8 +20,8 @@ For a set of extensible examples in TypeScript, see [automerge-repo](https://git
 ## Setup
 
 If you're using npm, `npm install automerge`. If you're using pnpm, `pnpm add automerge`. Then you
-can import it with `require('automerge')` as in [the example below](#usage) (or
-`import * as Automerge from 'automerge'` if using ES2015 or TypeScript).
+can import it with `import * as Automerge from 'automerge'`. The package is ESM-only;
+`require()` is not supported.
 
 Otherwise, clone this repository, and then you can use the following commands:
 

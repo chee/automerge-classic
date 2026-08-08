@@ -1,7 +1,5 @@
-const assert = require('assert')
-const Automerge = process.env.TEST_DIST === '1' ? require('../dist/automerge') : require('../src/automerge')
-
-const uuid = Automerge.uuid
+import assert from 'node:assert'
+import uuid from '../src/uuid.js'
 
 describe('uuid', () => {
   afterEach(() => {

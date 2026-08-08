@@ -1,28 +1,26 @@
 {
     "env": {
         "browser": true,
-        "commonjs": true,
-        "es2015": true,
         "node": true,
-        "mocha": true
+        "mocha": true,
+        "es2022": true
     },
     "globals": {
         "beforeAll": "readonly",
         "afterAll": "readonly"
     },
-    "ignorePatterns": "dist/**",
-    "extends": ["eslint:recommended", "plugin:compat/recommended"],
-    "parserOptions": {
-        "ecmaVersion": 2015
-    },
-    "overrides": [
-        {
-            "files": ["*.mjs"],
-            "parserOptions": {
-                "sourceType": "module"
-            }
-        }
+    "ignorePatterns": [
+        "dist/**",
+        "test/*typescript_test.js"
     ],
+    "extends": [
+        "eslint:recommended",
+        "plugin:compat/recommended"
+    ],
+    "parserOptions": {
+        "ecmaVersion": 2022,
+        "sourceType": "module"
+    },
     "rules": {
         "accessor-pairs": "error",
         "array-bracket-newline": "off",
@@ -42,7 +40,10 @@
         "block-spacing": "error",
         "brace-style": [
             "error",
-            "1tbs", { "allowSingleLine": true }
+            "1tbs",
+            {
+                "allowSingleLine": true
+            }
         ],
         "camelcase": "off",
         "capitalized-comments": "off",
@@ -202,7 +203,12 @@
         "no-unreachable-loop": "error",
         "no-unsafe-optional-chaining": "error",
         "no-unused-expressions": "error",
-        "no-unused-vars": ["error", { "args": "after-used" }],
+        "no-unused-vars": [
+            "error",
+            {
+                "args": "after-used"
+            }
+        ],
         "no-use-before-define": "off",
         "no-useless-backreference": "error",
         "no-useless-call": "error",
@@ -257,7 +263,12 @@
             "error",
             "first"
         ],
-        "sort-imports": "error",
+        "sort-imports": [
+            "error",
+            {
+                "ignoreDeclarationSort": true
+            }
+        ],
         "sort-keys": "off",
         "sort-vars": "off",
         "space-before-blocks": "error",
@@ -295,5 +306,15 @@
             "error",
             "never"
         ]
-    }
+    },
+    "overrides": [
+        {
+            "files": [
+                "frontend/proxies.js"
+            ],
+            "rules": {
+                "no-invalid-this": "off"
+            }
+        }
+    ]
 }

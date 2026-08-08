@@ -1,7 +1,7 @@
-const assert = require('assert')
-const Automerge = require('../src/automerge')
-const { decodeChangeColumns } = require('../backend/columnar')
-
+import assert from 'node:assert'
+import fixtures from './interop_fixtures.js'
+import Automerge from '../src/automerge.js'
+import { decodeChangeColumns } from '../backend/columnar.js'
 function markChange(doc, actor, begin, end) {
   const previous = Automerge.getAllChanges(doc).map(Automerge.decodeChange)
     .filter(change => change.actor === actor).sort((left, right) => left.seq - right.seq).pop()
@@ -18,7 +18,7 @@ function markChange(doc, actor, begin, end) {
 
 describe('modern mark encoding', () => {
   it('reads and writes mark ranges and spans', () => {
-    const fixture = require('./interop_fixtures').marks
+    const fixture = fixtures.marks
     const fixtureDoc = Automerge.load(Uint8Array.from(Buffer.from(fixture.document, 'base64')))
     assert.deepStrictEqual(Automerge.marks(fixtureDoc, ['text']), [
       {name: 'bold', value: true, start: 1, end: 3}

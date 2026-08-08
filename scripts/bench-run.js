@@ -1,8 +1,10 @@
-const {execFileSync} = require('child_process')
-const path = require('path')
+import {execFileSync} from 'node:child_process'
+import {writeFileSync} from 'node:fs'
+import path from 'node:path'
+import {fileURLToPath} from 'node:url'
 
 const REPS = Number(process.env.BENCH_REPS || 5)
-const bench = path.join(__dirname, 'bench.js')
+const bench = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bench.js')
 
 function median(xs) {
   const s = [...xs].sort((a, b) => a - b)
@@ -35,4 +37,4 @@ process.stdout.write(`${'-'.repeat(w)} | ---------: | --------: | ----:\n`)
 for (const r of rows) {
   process.stdout.write(`${r.name.padEnd(w)} | ${r.classic.toFixed(1).padStart(10)} | ${r.modern.toFixed(1).padStart(9)} | ${r.ratio.toFixed(2)}x\n`)
 }
-require('fs').writeFileSync('/tmp/bench-raw.json', JSON.stringify(all, null, 2))
+writeFileSync('/tmp/bench-raw.json', JSON.stringify(all, null, 2))

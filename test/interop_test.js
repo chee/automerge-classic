@@ -1,9 +1,12 @@
-const assert = require('assert')
-const path = require('path')
-const Automerge = process.env.TEST_DIST === '1' ? require('../dist/automerge') : require('../src/automerge')
-const { splitContainers } = require('../backend/columnar')
-const fixtures = require('./interop_fixtures')
+import assert from 'node:assert'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 
+const resolve = createRequire(import.meta.url).resolve
+import path from 'node:path'
+import Automerge from './subject.js'
+import { splitContainers } from '../backend/columnar.js'
+import fixtures from './interop_fixtures.js'
 function decode(base64) {
   return Uint8Array.from(Buffer.from(base64, 'base64'))
 }
@@ -118,15 +121,13 @@ describe('modern Rust/WASM interoperability', () => {
     assert.deepStrictEqual(Automerge.getHeads(doc), fixtures.conflicts.heads)
   })
 
-  it('loads legacy tables from a document re-saved by modern', () => {
+  it('loads legacy tables as plain maps of rows', () => {
     const bytes = decode(fixtures.table.bytes)
     const doc = Automerge.load(bytes)
-    const row = doc.books.byId(fixtures.table.rowId)
+    const row = doc.books[fixtures.table.rowId]
 
-    assert.strictEqual(doc.books instanceof Automerge.Table, true)
-    assert.strictEqual(doc.books.count, 1)
-    assert.deepStrictEqual(doc.books.ids, [fixtures.table.rowId])
-    assert.deepStrictEqual(row, {title: raw('Dune'), year: 1965, id: fixtures.table.rowId})
+    assert.deepStrictEqual(Object.keys(doc.books), [fixtures.table.rowId])
+    assert.deepStrictEqual({...row}, {title: raw('Dune'), year: 1965})
     assert.strictEqual(encode(Automerge.save(doc)), fixtures.table.bytes)
   })
 
@@ -206,8 +207,8 @@ describe('modern Rust/WASM interoperability', () => {
   })
 
   const liveIt = process.env.AUTOMERGE_MODERN_PATH ? it : it.skip
-  liveIt('round-trips fixtures through an installed modern package', () => {
-    const Modern = require(path.resolve(process.env.AUTOMERGE_MODERN_PATH))
+  liveIt('round-trips fixtures through an installed modern package', async () => {
+    const Modern = await import(pathToFileURL(resolve(path.resolve(process.env.AUTOMERGE_MODERN_PATH))).href)
     let modernDoc = Modern.load(decode(fixtures.document.bytes), {actor: 'd1'})
     const modernValue = Modern.toJS(modernDoc)
     assert.strictEqual(modernValue.title, 'Aé👩‍💻Z')
@@ -219,7 +220,7 @@ describe('modern Rust/WASM interoperability', () => {
 
     let classicDoc = Automerge.load(decode(fixtures.document.bytes), 'd2')
     classicDoc = Automerge.change(classicDoc, {message: 'classic extension', time: 0}, draft => {
-      draft.classicText = new Automerge.Text('from classic')
+      draft.classicText = 'from classic'
       draft.bytes = new Uint8Array([8, 6, 7, 5, 3, 0, 9])
     })
     const roundTripped = Modern.toJS(Modern.load(Automerge.save(classicDoc), {actor: 'd3'}))

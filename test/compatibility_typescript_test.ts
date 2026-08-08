@@ -1,4 +1,4 @@
-import * as assert from 'assert'
+import * as assert from 'node:assert'
 import * as Automerge from '..'
 import {
   ActorId,
@@ -6,7 +6,6 @@ import {
   ChangeFn,
   ChangeOptions,
   DecodedChange,
-  DiffOptions,
   Mark,
   MarkRange,
   MarkSet,
@@ -16,16 +15,14 @@ import {
   PatchInfo,
   Prop,
   RawString,
-  ReleaseInfo,
   SyncState,
   next as A,
 } from '..'
-
-const Slim = require('../src/slim') as typeof Automerge
+import * as Slim from '@automerge/automerge-classic/slim'
 
 interface DocumentValue {
   list: Automerge.List<string>
-  text: Automerge.Text
+  text: string
   title: string
 }
 
@@ -34,7 +31,7 @@ describe('modern API compatibility types', () => {
     let doc = Automerge.init<DocumentValue>({actor: 'aabb'})
     doc = Automerge.change(doc, draft => {
       draft.list = ['one'] as Automerge.List<string>
-      draft.text = new Automerge.Text('hello')
+      draft.text = 'hello'
       draft.title = 'hello'
       draft.list.insertAt(1, 'two')
       draft.list.deleteAt(1)
@@ -45,13 +42,9 @@ describe('modern API compatibility types', () => {
     const heads: Automerge.Heads = Automerge.next.getHeads(doc)
     const view: Automerge.Doc<DocumentValue> = Automerge.view(doc, heads)
     const patches: Automerge.Patch[] = Slim.diff(doc, heads, heads)
-    const diffOptions: DiffOptions = {recursive: false}
-    const nestedPatches: Automerge.Patch[] = Automerge.diffPath(doc, ['title'], heads, heads, diffOptions)
     const cursor: Automerge.Cursor = Automerge.getCursor(doc, ['title'], 1)
-    const fragments: Automerge.FragmentMetadata[] = Automerge.getFragmentMetadata(doc, {start: 0, end: 1})
-    const bundles: Uint8Array[] = Automerge.bundleFragmentMetadata(doc, fragments)
-    const commits: Automerge.Commit[] = Automerge.getCommits(doc)
-    const imported: Automerge.Doc<DocumentValue> = Automerge.addCommits(Automerge.init<DocumentValue>(), commits)
+    const bundle: Uint8Array = Automerge.saveBundle(doc, Automerge.next.getHeads(doc))
+    const decodedBundle: Automerge.DecodedBundle = Automerge.readBundle(bundle)
     let nextDoc: A.Doc<DocumentValue> = A.init<DocumentValue>()
     const changeOptions: ChangeOptions<DocumentValue> = {message: 'next'}
     const changeFn: ChangeFn<DocumentValue> = draft => {
@@ -71,8 +64,6 @@ describe('modern API compatibility types', () => {
     const path: Prop[] = ['title']
     const rawString: RawString = new RawString('raw')
     const syncState: SyncState = Automerge.initSyncState()
-    const release: ReleaseInfo = Automerge.releaseInfo()
-    Automerge.addFragments(imported, Automerge.getFragments(doc, 0))
     Automerge.applyPatches({}, patches)
     patchCallback([], patchInfo)
     assert.strictEqual(Automerge.getCursorPosition(doc, ['title'], cursor), 1)
@@ -86,8 +77,6 @@ describe('modern API compatibility types', () => {
     assert.strictEqual(rawString.toString(), 'raw')
     assert.ok(syncState)
     assert.strictEqual(view.text.toString(), 'world')
-    assert.strictEqual(bundles.length, fragments.length)
-    assert.strictEqual(nestedPatches.length, 0)
-    assert.strictEqual(release.js.gitHead.length > 0, true)
+    assert.strictEqual(decodedBundle.changes.length, 1)
   })
 })

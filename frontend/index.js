@@ -1,15 +1,12 @@
-const { OPTIONS, CACHE, STATE, OBJECT_ID, CONFLICTS, CHANGE, ELEM_IDS, PROXY_PATH } = require('./constants')
-const { isObject, copyObject } = require('../src/common')
-const uuid = require('../src/uuid')
-const { interpretPatch, cloneRootObject, lamportCompare, reorderNewKeys } = require('./apply_patch')
-const { rootObjectProxy } = require('./proxies')
-const { Context } = require('./context')
-const { Text } = require('./text')
-const { Table } = require('./table')
-const { Counter } = require('./counter')
-const { Float64, Int, Uint } = require('./numbers')
-const { Observable } = require('./observable')
-
+import { CACHE, CHANGE, CONFLICTS, ELEM_IDS, OBJECT_ID, OPTIONS, PROXY_PATH, STATE } from './constants.js'
+import { copyObject, isObject } from '../src/common.js'
+import uuid from '../src/uuid.js'
+import { cloneRootObject, interpretPatch, lamportCompare, reorderNewKeys } from './apply_patch.js'
+import { rootObjectProxy } from './proxies.js'
+import { Context } from './context.js'
+import { Text } from './text.js'
+import { Counter } from './counter.js'
+import { Float64, Int, Uint } from './numbers.js'
 /**
  * Actor IDs must consist only of hexadecimal digits so that they can be encoded
  * compactly in binary form.
@@ -47,9 +44,7 @@ function updateRootObject(doc, updated, state) {
 
   if (doc[OPTIONS].freeze) {
     for (let objectId of Object.keys(updated)) {
-      if (updated[objectId] instanceof Table) {
-        updated[objectId]._freeze()
-      } else if (updated[objectId] instanceof Text) {
+      if (updated[objectId] instanceof Text) {
         Object.freeze(updated[objectId].elems)
         Object.freeze(updated[objectId])
       } else {
@@ -92,8 +87,9 @@ function makeChange(doc, context, options) {
     seq: state.seq,
     startOp: state.maxOp + 1,
     deps: state.deps,
-    time: (options && typeof options.time === 'number') ? options.time
-                                                        : Math.round(new Date().getTime() / 1000),
+    time: (options && Object.prototype.hasOwnProperty.call(options, 'time'))
+      ? (typeof options.time === 'number' ? options.time : 0)
+      : Math.round(new Date().getTime() / 1000),
     message: (options && typeof options.message === 'string') ? options.message : '',
     ops: context.ops
   }
@@ -189,14 +185,6 @@ function init(options) {
       options.actorId = uuid()
     }
     checkActorId(options.actorId)
-  }
-
-  if (options.observable) {
-    const patchCallback = options.patchCallback, observable = options.observable
-    options.patchCallback = (patch, before, after, local, changes) => {
-      if (patchCallback) patchCallback(patch, before, after, local, changes)
-      observable.patchCallback(patch, before, after, local, changes)
-    }
   }
 
   const root = {}, cache = {_root: root}
@@ -412,7 +400,7 @@ function setActorId(doc, actorId) {
 }
 
 function readonlyConflict(value, proxies) {
-  if (!isObject(value) || !value[OBJECT_ID] || value instanceof Text || value instanceof Table) return value
+  if (!isObject(value) || !value[OBJECT_ID] || value instanceof Text) return value
   if (proxies.has(value)) return proxies.get(value)
   const proxy = new Proxy(value, {
     get(target, key) {
@@ -492,9 +480,9 @@ function getElementIds(list) {
   }
 }
 
-module.exports = {
+export {
   init, from, change, emptyChange, applyPatch, setInteropAttach,
   getObjectId, getObjectById, getText, getActorId, setActorId, getConflicts, getLastLocalChange,
   getBackendState, getElementIds,
-  Text, Table, Counter, Observable, Float64, Int, Uint
+  Text, Counter, Float64, Int, Uint
 }

@@ -28,7 +28,7 @@ jobs:
     - name: Test suite using bundle
       run: TEST_DIST=1 pnpm test
     - name: Load bundled code
-      run: node -e "const Automerge = require(\"./dist/automerge\")"
+      run: node --input-type=module -e "import('./dist/automerge.js')"
     - name: Load ES modules
       run: node --experimental-vm-modules test/esm_smoke.js
 

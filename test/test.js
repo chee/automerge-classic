@@ -1,7 +1,7 @@
-const assert = require('assert')
-const Automerge = process.env.TEST_DIST === '1' ? require('../dist/automerge') : require('../src/automerge')
-const { assertEqualsOneOf } = require('./helpers')
-const { decodeChange } = require('../backend/columnar')
+import assert from 'node:assert'
+import Automerge from './subject.js'
+import { assertEqualsOneOf } from './helpers.js'
+import { decodeChange } from '../backend/columnar.js'
 const UUID_PATTERN = /^[0-9a-f]{32}$/
 const OPID_PATTERN = /^[0-9]+@[0-9a-f]{32}$/
 
@@ -377,8 +377,8 @@ describe('Automerge', () => {
         s1 = Automerge.change(s1, doc => doc.z = 1000)
         const changes = Automerge.getAllChanges(Automerge.load(Automerge.save(s1)))
         ;[s2] = Automerge.applyChanges(Automerge.init(), changes)
-        const heads1 = Automerge.Backend.getHeads(Automerge.Frontend.getBackendState(s1))
-        const heads2 = Automerge.Backend.getHeads(Automerge.Frontend.getBackendState(s2))
+        const heads1 = Automerge.getHeads(s1)
+        const heads2 = Automerge.getHeads(s2)
         assert.deepStrictEqual(heads1, heads2)
         assert.deepStrictEqual(s1, s2)
       })
@@ -1446,11 +1446,11 @@ describe('Automerge', () => {
       let changes = Automerge.getAllChanges(s2)
       let [s3] = Automerge.applyChanges(Automerge.init(), [changes[1]])
       assert.deepStrictEqual(s3, {})
-      assert.deepStrictEqual(Automerge.Backend.getMissingDeps(Automerge.Frontend.getBackendState(s3)),
+      assert.deepStrictEqual(Automerge.getMissingDeps(s3),
                              decodeChange(changes[1]).deps)
       ;[s3] = Automerge.applyChanges(s3, [changes[0]])
       assert.deepStrictEqual(s3.birds, ['Chaffinch', 'Bullfinch'])
-      assert.deepStrictEqual(Automerge.Backend.getMissingDeps(Automerge.Frontend.getBackendState(s3)), [])
+      assert.deepStrictEqual(Automerge.getMissingDeps(s3), [])
     })
 
     it('should allow changes to be applied in any order', () => {
@@ -1473,7 +1473,7 @@ describe('Automerge', () => {
       let s4 = Automerge.init()
       let [s5] = Automerge.applyChanges(s4, changes23)
       let [s6] = Automerge.applyChanges(s5, changes12)
-      assert.deepStrictEqual(Automerge.Backend.getMissingDeps(Automerge.Frontend.getBackendState(s6)),
+      assert.deepStrictEqual(Automerge.getMissingDeps(s6),
                              [decodeChange(changes01[0]).hash])
     })
 

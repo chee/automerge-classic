@@ -139,8 +139,7 @@ class Micromerge {
 
 /* TESTS */
 
-const assert = require('assert')
-
+import assert from 'node:assert'
 const change1 = {actor: '1234', seq: 1, deps: {}, startOp: 1, ops: [
   {action: 'set',      obj: '_root',  key: 'title',  insert: false, value: 'Hello'},
   {action: 'makeList', obj: '_root',  key: 'tags',   insert: false},

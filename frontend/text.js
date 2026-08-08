@@ -1,6 +1,5 @@
-const { OBJECT_ID } = require('./constants')
-const { isObject } = require('../src/common')
-
+import { OBJECT_ID } from './constants.js'
+import { isObject } from '../src/common.js'
 class Text {
   constructor (text) {
     if (typeof text === 'string') {
@@ -182,4 +181,4 @@ function instantiateText(objectId, elems) {
   return instance
 }
 
-module.exports = { Text, instantiateText }
+export { Text, instantiateText }

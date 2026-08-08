@@ -1,10 +1,6 @@
-const { parseOpId, copyObject, compareUtf8 } = require('../src/common')
-const { COLUMN_TYPE, VALUE_TYPE, ACTIONS, OBJECT_TYPE, DOC_OPS_COLUMNS, CHANGE_COLUMNS, DOCUMENT_COLUMNS,
-  encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue,
-  encodeChange, decodeChangeColumns, decodeChanges,
-  decodeDocumentHeader, encodeDocumentHeader } = require('./columnar')
-const ColumnData = require('./column_data')
-
+import { compareUtf8, copyObject, parseOpId } from '../src/common.js'
+import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, decodeChangeColumns, decodeChanges, decodeDocumentHeader, decodeValue, decoderByColumnId, encodeChange, encodeDocumentHeader, encoderByColumnId, makeDecoders } from './columnar.js'
+import * as ColumnData from './column_data.js'
 const MAX_BLOCK_SIZE = 600 // operations
 const MAX_MAP_BLOCK_SIZE = 100
 const BLOOM_BITS_PER_ENTRY = 10, BLOOM_NUM_PROBES = 7 // 1% false positive rate
@@ -3058,4 +3054,4 @@ class BackendDoc {
   }
 }
 
-module.exports = { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, bloomFilterContains }
+export { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, bloomFilterContains }

@@ -1,12 +1,10 @@
-const assert = require('assert')
-const sinon = require('sinon')
-const { Context } = require('../frontend/context')
-const { CACHE, OBJECT_ID, CONFLICTS, STATE, ELEM_IDS } = require('../frontend/constants')
-const { Counter } = require('../frontend/counter')
-const { Table, instantiateTable } = require('../frontend/table')
-const { Text } = require('../frontend/text')
-const uuid = require('../src/uuid')
-
+import assert from 'node:assert'
+import sinon from 'sinon'
+import { Context } from '../frontend/context.js'
+import { CACHE, CONFLICTS, ELEM_IDS, OBJECT_ID, STATE } from '../frontend/constants.js'
+import { Counter } from '../frontend/counter.js'
+import { Text } from '../frontend/text.js'
+import uuid from '../src/uuid.js'
 describe('Proxying context', () => {
   let context, applyPatch
 
@@ -144,18 +142,6 @@ describe('Proxying context', () => {
       assert.deepStrictEqual(context.ops, [
         {obj: '_root', action: 'makeText', key: 'text', insert: false, pred: []},
         {obj: objectId, action: 'set', elemId: '_head', insert: true, values: ['h', 'i'], pred: []}
-      ])
-    })
-
-    it('should create nested Table objects', () => {
-      context.setMapKey([], 'books', new Table())
-      assert(applyPatch.calledOnce)
-      const objectId = applyPatch.firstCall.args[0].props.books[`1@${context.actorId}`].objectId
-      assert.deepStrictEqual(applyPatch.firstCall.args[0], {objectId: '_root', type: 'map', props: {
-        books: {[`1@${context.actorId}`]: {objectId, type: 'table', props: {}}}
-      }})
-      assert.deepStrictEqual(context.ops, [
-        {obj: '_root', action: 'makeTable', key: 'books', insert: false, pred: []}
       ])
     })
 
@@ -369,50 +355,6 @@ describe('Proxying context', () => {
       assert.deepStrictEqual(context.ops, [
         {obj: listId, action: 'del', elemId: '1@xxx', insert: false, pred: ['1@xxx']},
         {obj: listId, action: 'set', elemId: '_head', insert: true, values: ['starling', 'goldfinch'], pred: []}
-      ])
-    })
-  })
-
-  describe('Table manipulation', () => {
-    let tableId, table
-
-    beforeEach(() => {
-      tableId = uuid()
-      table = instantiateTable(tableId)
-      context.cache[tableId] = table
-      context.cache._root = {[OBJECT_ID]: '_root', books: table, [CONFLICTS]: {books: {'1@actor1': table}}}
-    })
-
-    it('should add a table row', () => {
-      const rowId = context.addTableRow([{key: 'books', objectId: tableId}], {author: 'Mary Shelley', title: 'Frankenstein'})
-      assert(applyPatch.calledOnce)
-      assert.deepStrictEqual(applyPatch.firstCall.args[0], {objectId: '_root', type: 'map', props: {
-        books: {'1@actor1': {objectId: tableId, type: 'table', props: {
-          [rowId]: {[`1@${context.actorId}`]: {objectId: `1@${context.actorId}`, type: 'map', props: {
-            author: {[`2@${context.actorId}`]: {value: 'Mary Shelley', type: 'value'}},
-            title: {[`3@${context.actorId}`]: {value: 'Frankenstein', type: 'value'}}
-          }}}
-        }}}
-      }})
-      assert.deepStrictEqual(context.ops, [
-        {obj: tableId, action: 'makeMap', key: rowId, insert: false, pred: []},
-        {obj: `1@${context.actorId}`, action: 'set', key: 'author', insert: false, value: 'Mary Shelley', pred: []},
-        {obj: `1@${context.actorId}`, action: 'set', key: 'title', insert: false, value: 'Frankenstein', pred: []}
-      ])
-    })
-
-    it('should delete a table row', () => {
-      const rowId = uuid()
-      const row = {author: 'Mary Shelley', title: 'Frankenstein'}
-      row[OBJECT_ID] = rowId
-      table.entries[rowId] = row
-      context.deleteTableRow([{key: 'books', objectId: tableId}], rowId, '5@actor1')
-      assert(applyPatch.calledOnce)
-      assert.deepStrictEqual(applyPatch.firstCall.args[0], {objectId: '_root', type: 'map', props: {
-        books: {'1@actor1': {objectId: tableId, type: 'table', props: {[rowId]: {}}}}
-      }})
-      assert.deepStrictEqual(context.ops, [
-        {obj: tableId, action: 'del', key: rowId, insert: false, pred: ['5@actor1']}
       ])
     })
   })

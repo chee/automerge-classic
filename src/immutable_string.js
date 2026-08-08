@@ -26,4 +26,4 @@ function isImmutableString(value) {
     Object.prototype.hasOwnProperty.call(value, IMMUTABLE_STRING)
 }
 
-module.exports = {ImmutableString, isImmutableString}
+export {ImmutableString, isImmutableString}

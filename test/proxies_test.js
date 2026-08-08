@@ -1,6 +1,6 @@
-const assert = require('assert')
-const Automerge = process.env.TEST_DIST === '1' ? require('../dist/automerge') : require('../src/automerge')
-const { assertEqualsOneOf } = require('./helpers')
+import assert from 'node:assert'
+import Automerge from './subject.js'
+import { assertEqualsOneOf } from './helpers.js'
 const UUID_PATTERN = /^[0-9a-f]{32}$/
 
 describe('Automerge proxy API', () => {
@@ -79,19 +79,6 @@ describe('Automerge proxy API', () => {
       })
     })
 
-    it('should allow access to an object by id', () => {
-      const doc = Automerge.change(Automerge.init(), doc => {
-        doc.deepObj = {}
-        doc.deepObj.deepList = []
-        const listId = Automerge.getObjectId(doc.deepObj.deepList)
-        assert.throws(() => { Automerge.getObjectById(doc, listId) }, /Cannot use getObjectById in a change callback/)
-      })
-
-      const objId = Automerge.getObjectId(doc.deepObj)
-      assert.strictEqual(Automerge.getObjectById(doc, objId), doc.deepObj)
-      const listId = Automerge.getObjectId(doc.deepObj.deepList)
-      assert.strictEqual(Automerge.getObjectById(doc, listId), doc.deepObj.deepList)
-    })
   })
 
   describe('list object', () => {

@@ -1,7 +1,4 @@
-const {
-  Decoder, RLEEncoder, RLEDecoder, DeltaEncoder, DeltaDecoder, BooleanEncoder, BooleanDecoder
-} = require('./encoding')
-
+import { BooleanDecoder, BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, RLEDecoder, RLEEncoder } from './encoding.js'
 const DEFAULT_SLAB_ROWS = 1024
 const DEFAULT_SLAB_BYTES = 64 * 1024
 const TYPES = ['int', 'uint', 'string', 'boolean', 'delta', 'raw']
@@ -355,7 +352,7 @@ function save(column) {
   }
 }
 
-module.exports = {
+export {
   DEFAULT_SLAB_ROWS, DEFAULT_SLAB_BYTES,
-  createColumn, loadColumn, clone, get, range, values: range, splice, append, save, toBuffer, decoder
+  createColumn, loadColumn, clone, get, range, range as values, splice, append, save, toBuffer, decoder
 }

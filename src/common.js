@@ -119,6 +119,6 @@ function wellFormedString(string) {
   return result
 }
 
-module.exports = {
+export {
   isObject, copyObject, parseOpId, equalBytes, createArrayOfNulls, compareUtf8, wellFormedString
 }

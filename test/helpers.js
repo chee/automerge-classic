@@ -1,6 +1,5 @@
-const assert = require('assert')
-const { Encoder } = require('../backend/encoding')
-
+import assert from 'node:assert'
+import { Encoder } from '../backend/encoding.js'
 // Assertion that succeeds if the first argument deepStrictEquals at least one of the
 // subsequent arguments (but we don't care which one)
 function assertEqualsOneOf(actual, ...expected) {
@@ -29,4 +28,4 @@ function checkEncoded(encoder, bytes, detail) {
   }
 }
 
-module.exports = { assertEqualsOneOf, checkEncoded }
+export { assertEqualsOneOf, checkEncoded }

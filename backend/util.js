@@ -15,6 +15,6 @@ function backendState(backend, allowFrozen = false) {
   return backend.state
 }
 
-module.exports = {
+export {
   backendState
 }

@@ -1,8 +1,7 @@
-const { encodeChange, splitContainers } = require('./columnar')
-const { encodeBundle, decodeBundle } = require('./bundle')
-const { BackendDoc } = require('./new')
-const { backendState } = require('./util')
-
+import { encodeChange, splitContainers } from './columnar.js'
+import { decodeBundle, encodeBundle } from './bundle.js'
+import { BackendDoc } from './new.js'
+import { backendState } from './util.js'
 /**
  * Returns an empty node state.
  */
@@ -272,7 +271,7 @@ function readBundle(data) {
   return decodeBundle(data)
 }
 
-module.exports = {
+export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
   load, loadChanges, loadIncremental, getPatch, getHeads, getAllChanges, getChanges,
   getChangesAdded, getChangeByHash, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta,

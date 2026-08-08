@@ -1,10 +1,10 @@
-const assert = require('assert')
-const Frontend = require('../frontend')
-const { decodeChange } = require('../backend/columnar')
-const { Backend } = require('../src/automerge')
-const uuid = require('../src/uuid')
-const { STATE } = require('../frontend/constants')
-const { ImmutableString, isImmutableString } = require('../src/immutable_string')
+import assert from 'node:assert'
+import * as Frontend from '../frontend/index.js'
+import { decodeChange } from '../backend/columnar.js'
+import * as Backend from '../backend/index.js'
+import uuid from '../src/uuid.js'
+import { STATE } from '../frontend/constants.js'
+import { ImmutableString, isImmutableString } from '../src/immutable_string.js'
 const UUID_PATTERN = /^[0-9a-f]{32}$/
 
 describe('Automerge.Frontend', () => {

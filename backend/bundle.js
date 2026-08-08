@@ -1,16 +1,7 @@
-const { deflateSync: deflateRaw, inflateSync: inflateRaw } = require('fflate')
-const { parseOpId } = require('../src/common')
-const {
-  hexStringToBytes, bytesToHexString,
-  Encoder, Decoder, RLEEncoder, RLEDecoder, DeltaEncoder, DeltaDecoder, BooleanEncoder
-} = require('./encoding')
-const {
-  COLUMN_TYPE, CHANGE_COLUMNS,
-  encodeOperationAction, encodeValue,
-  decodeColumns, decodeOps, encodeColumnInfo, decodeColumnInfo,
-  encodeContainer, decodeContainerHeader, encodeChange, decodeChangeColumns, decodeChangeMeta
-} = require('./columnar')
-
+import { deflateSync as deflateRaw, inflateSync as inflateRaw } from 'fflate'
+import { parseOpId } from '../src/common.js'
+import { BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, Encoder, RLEDecoder, RLEEncoder, bytesToHexString, hexStringToBytes } from './encoding.js'
+import { CHANGE_COLUMNS, COLUMN_TYPE, decodeChangeColumns, decodeChangeMeta, decodeColumnInfo, decodeColumns, decodeContainerHeader, decodeOps, encodeChange, encodeColumnInfo, encodeContainer, encodeOperationAction, encodeValue } from './columnar.js'
 const CHUNK_TYPE_BUNDLE = 3
 
 const BUNDLE_CHANGE_COLUMNS = [
@@ -458,7 +449,7 @@ function decodeBundle(buffer) {
   return {changes, changeBytes, rawChanges: changeBytes, deps: external, actors}
 }
 
-module.exports = {
+export {
   CHUNK_TYPE_BUNDLE, BUNDLE_CHANGE_COLUMNS, BUNDLE_OPS_COLUMNS,
   encodeBundle, decodeBundle
 }

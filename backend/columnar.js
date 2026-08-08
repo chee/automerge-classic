@@ -1,10 +1,6 @@
-const { deflateSync: deflateRaw, inflateSync: inflateRaw } = require('fflate')
-const { copyObject, parseOpId, equalBytes } = require('../src/common')
-const {
-  utf8ToString, hexStringToBytes, bytesToHexString,
-  Encoder, Decoder, RLEEncoder, RLEDecoder, DeltaEncoder, DeltaDecoder, BooleanEncoder, BooleanDecoder
-} = require('./encoding')
-
+import { deflateSync as deflateRaw, inflateSync as inflateRaw } from 'fflate'
+import { copyObject, equalBytes, parseOpId } from '../src/common.js'
+import { BooleanDecoder, BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, Encoder, RLEDecoder, RLEEncoder, bytesToHexString, hexStringToBytes, utf8ToString } from './encoding.js'
 // Maybe we should be using the platform's built-in hash implementation?
 // Node has the crypto module: https://nodejs.org/api/crypto.html and browsers have
 // https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/digest
@@ -18,8 +14,8 @@ const {
 // - It does not need a secure source of random bits and does not need to be
 //   constant-time;
 // - I have reviewed the source code and it seems pretty reasonable.
-const { Hash } = require('fast-sha256')
-
+import { Hash } from 'fast-sha256'
+import { decodeBundle } from './bundle.js'
 // These bytes don't mean anything, they were generated randomly
 const MAGIC_BYTES = new Uint8Array([0x85, 0x6f, 0x4a, 0x83])
 
@@ -51,7 +47,8 @@ const VALUE_TYPE = {
 // make* actions must be at even-numbered indexes in this list
 const ACTIONS = ['makeMap', 'set', 'makeList', 'del', 'makeText', 'inc', 'makeTable', 'mark']
 
-const OBJECT_TYPE = {makeMap: 'map', makeList: 'list', makeText: 'text', makeTable: 'table'}
+// Tables were a v1-only feature; documents containing them materialize as plain maps of rows
+const OBJECT_TYPE = {makeMap: 'map', makeList: 'list', makeText: 'text', makeTable: 'map'}
 const UNKNOWN_COLUMNS = Symbol('unknownColumns')
 const RAW_VALUE = Symbol('rawValue')
 
@@ -605,7 +602,7 @@ function decodeOps(ops, forDocument) {
       newOp.value = op.valLen
       if (op.valLen_datatype) newOp.datatype = op.valLen_datatype
     }
-    if (op[RAW_VALUE]) Object.defineProperty(newOp, RAW_VALUE, {value: op[RAW_VALUE]})
+    if (op[RAW_VALUE]) Object.defineProperty(newOp, RAW_VALUE, {value: op[RAW_VALUE], writable: true, configurable: true})
     if (action === 'markBegin') newOp.name = op.markName
     if (action === 'markBegin' || action === 'markEnd') newOp.expand = !!op.expand
     if (!!op.chldCtr !== !!op.chldActor) {
@@ -621,7 +618,7 @@ function decodeOps(ops, forDocument) {
       newOp.pred = op.predNum.map(pred => `${pred.predCtr}@${pred.predActor}`)
       checkSortedOpIds(op.predNum.map(pred => ({counter: pred.predCtr, actorId: pred.predActor})))
     }
-    if (op[UNKNOWN_COLUMNS]) Object.defineProperty(newOp, UNKNOWN_COLUMNS, {value: op[UNKNOWN_COLUMNS]})
+    if (op[UNKNOWN_COLUMNS]) Object.defineProperty(newOp, UNKNOWN_COLUMNS, {value: op[UNKNOWN_COLUMNS], writable: true, configurable: true})
     newOps.push(newOp)
   }
   return newOps
@@ -1011,7 +1008,7 @@ function decodeChanges(binaryChanges) {
       } else if (chunk[8] === CHUNK_TYPE_CHANGE || chunk[8] === CHUNK_TYPE_DEFLATE) {
         decoded.push(decodeChange(chunk, true))
       } else if (chunk[8] === 3) {
-        decoded = decoded.concat(require('./bundle').decodeBundle(chunk).changes)
+        decoded = decoded.concat(decodeBundle(chunk).changes)
       } else {
         // ignoring chunk of unknown type
       }
@@ -1261,7 +1258,7 @@ function inflateColumn(column) {
   }
 }
 
-module.exports = {
+export {
   COLUMN_TYPE, VALUE_TYPE, ACTIONS, OBJECT_TYPE, DOC_OPS_COLUMNS, CHANGE_COLUMNS, DOCUMENT_COLUMNS,
   encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue, decodeColumns, decodeOps,
   parseAllOpIds, encodeObjectId, encodeOperationKey, encodeOperationAction, encodeValue,

@@ -1,8 +1,6 @@
-const { OBJECT_ID, CHANGE, STATE, PROXY_PATH } = require('./constants')
-const { isObject, createArrayOfNulls } = require('../src/common')
-const { Text } = require('./text')
-const { Table } = require('./table')
-
+import { CHANGE, OBJECT_ID, PROXY_PATH, STATE } from './constants.js'
+import { createArrayOfNulls, isObject } from '../src/common.js'
+import { Text } from './text.js'
 function parseListIndex(key) {
   if (typeof key === 'string' && /^[0-9]+$/.test(key)) key = parseInt(key, 10)
   if (typeof key !== 'number') {
@@ -250,7 +248,7 @@ function instantiateProxy(path, objectId, readonly) {
   const object = this.getObject(objectId)
   if (Array.isArray(object)) {
     return listProxy(this, objectId, path)
-  } else if (object instanceof Text || object instanceof Table) {
+  } else if (object instanceof Text) {
     return object.getWriteable(this, path)
   } else {
     return mapProxy(this, objectId, path, readonly)
@@ -262,4 +260,4 @@ function rootObjectProxy(context) {
   return mapProxy(context, '_root', [])
 }
 
-module.exports = { rootObjectProxy }
+export { rootObjectProxy }

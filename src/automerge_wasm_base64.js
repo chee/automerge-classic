@@ -1,1 +1,1 @@
-module.exports = {automergeWasmBase64: ''}
+export const automergeWasmBase64 = ''

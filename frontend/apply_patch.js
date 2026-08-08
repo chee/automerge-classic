@@ -1,14 +1,11 @@
-const { isObject, copyObject, parseOpId, compareUtf8 } = require('../src/common')
-const { OBJECT_ID, CONFLICTS, ELEM_IDS, NEW_KEYS } = require('./constants')
-
+import { compareUtf8, copyObject, isObject, parseOpId } from '../src/common.js'
+import { CONFLICTS, ELEM_IDS, NEW_KEYS, OBJECT_ID } from './constants.js'
 // Set of patch objects already applied in the current patch application (a
 // non-enumerable property of the `updated` map)
 const APPLIED_PATCHES = Symbol('_appliedPatches')
-const { Text, instantiateText } = require('./text')
-const { instantiateTable } = require('./table')
-const { Counter } = require('./counter')
-const { ImmutableString } = require('../src/immutable_string')
-
+import { Text, instantiateText } from './text.js'
+import { Counter } from './counter.js'
+import { ImmutableString } from '../src/immutable_string.js'
 /**
  * Reconstructs the value from the patch object `patch`.
  */
@@ -122,33 +119,6 @@ function updateMapObject(patch, obj, updated, textV2) {
  * Updates the table object `obj` according to the modifications described in
  * `patch`, or creates a new object if `obj` is undefined. Mutates `updated`
  * to map the objectId to the new object, and returns the new object.
- */
-function updateTableObject(patch, obj, updated, textV2) {
-  const objectId = patch.objectId
-  if (!updated[objectId]) {
-    updated[objectId] = obj ? obj._clone() : instantiateTable(objectId)
-  }
-
-  const object = updated[objectId]
-
-  for (let key of Object.keys(patch.props || {})) {
-    const opIds = Object.keys(patch.props[key])
-
-    if (opIds.length === 0) {
-      object.remove(key)
-    } else if (opIds.length === 1) {
-      const subpatch = patch.props[key][opIds[0]]
-      object._set(key, getValue(subpatch, object.byId(key), updated, textV2), opIds[0])
-    } else {
-      throw new RangeError('Conflicts are not supported on properties of a table')
-    }
-  }
-  return object
-}
-
-/**
- * Creates a writable copy of an immutable list object. If `originalList` is
- * undefined, creates an empty list with ID `objectId`.
  */
 function cloneListObject(originalList, objectId) {
   const list = originalList ? originalList.slice() : [] // slice() makes a shallow clone
@@ -301,8 +271,6 @@ function interpretPatch(patch, obj, updated, textV2 = false) {
 
   if (patch.type === 'map') {
     return updateMapObject(patch, obj, updated, textV2)
-  } else if (patch.type === 'table') {
-    return updateTableObject(patch, obj, updated, textV2)
   } else if (patch.type === 'list') {
     return updateListObject(patch, obj, updated, textV2)
   } else if (patch.type === 'text') {
@@ -340,6 +308,6 @@ function reorderNewKeys(object) {
   newKeys.clear()
 }
 
-module.exports = {
+export {
   interpretPatch, cloneRootObject, lamportCompare, reorderNewKeys
 }

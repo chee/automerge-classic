@@ -184,4 +184,4 @@ function replaceHook(hook) {
   }
 }
 
-module.exports = { myersDiff, graphemes, replaceHook }
+export { myersDiff, graphemes, replaceHook }

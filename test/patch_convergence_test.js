@@ -1,8 +1,8 @@
-const assert = require('assert')
-const fs = require('fs')
-const path = require('path')
-const Automerge = process.env.TEST_DIST === '1' ? require('../dist/automerge') : require('../src/automerge')
-
+import assert from 'node:assert'
+import { decodeDocumentHeader } from '../backend/columnar.js'
+import fs from 'node:fs'
+import path from 'node:path'
+import Automerge from './subject.js'
 // Patch-convergence fuzzing: several peers make concurrent changes (maps,
 // lists, text, marks) and exchange them over partial, out-of-order syncs.
 // Invariants, checked after every step:
@@ -196,7 +196,7 @@ describe('diff reuse', () => {
       Automerge.unmark(draft, ['text'], {start: 0, end: 3}, 'bold')
     })
     assert.deepStrictEqual(Automerge.diff(doc, heads, Automerge.getHeads(doc)),
-      [{action: 'unmark', path: ['text'], name: 'bold', start: 0, end: 3}])
+      [{action: 'mark', path: ['text'], marks: [{name: 'bold', value: null, start: 0, end: 3}]}])
   })
 })
 
@@ -225,7 +225,6 @@ describe('patch convergence', () => {
     const changes = loadFixture('concurrent_delete_patch.json')
     let doc = Automerge.init()
     ;[doc] = Automerge.applyChanges(doc, changes)
-    const {decodeDocumentHeader} = require('../backend/columnar')
     const {actorIds} = decodeDocumentHeader(Automerge.save(doc))
     const sorted = actorIds.slice().sort()
     assert.deepStrictEqual(actorIds, sorted)

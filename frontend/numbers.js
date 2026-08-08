@@ -30,4 +30,4 @@ class Float64 {
   }
 }
 
-module.exports = { Int, Uint, Float64 }
+export { Int, Uint, Float64 }

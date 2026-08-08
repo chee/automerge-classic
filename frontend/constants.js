@@ -11,6 +11,6 @@ const ELEM_IDS  = Symbol('_elemIds')   // list containing the element ID of each
 const PROXY_PATH = Symbol('_proxyPath')
 const NEW_KEYS  = Symbol('_newKeys')   // keys added to a map object since it was last materialized
 
-module.exports = {
+export {
   OPTIONS, CACHE, STATE, OBJECT_ID, CONFLICTS, CHANGE, ELEM_IDS, PROXY_PATH, NEW_KEYS
 }

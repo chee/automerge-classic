@@ -2,67 +2,29 @@
   "name": "@automerge/automerge-classic",
   "version": "1.0.1-preview.7",
   "description": "Data structures for building collaborative applications",
+  "type": "module",
+  "sideEffects": false,
   "main": "./src/automerge.js",
-  "module": "./dist/automerge.mjs",
-  "browser": "./dist/automerge.mjs",
+  "module": "./src/automerge.js",
+  "browser": "./dist/automerge.js",
   "types": "@types/automerge/index.d.ts",
   "exports": {
     ".": {
       "types": "./@types/automerge/index.d.ts",
-      "workerd": {
-        "import": "./dist/automerge.mjs",
-        "require": "./src/automerge.js"
-      },
-      "node": {
-        "import": "./src/automerge.mjs",
-        "require": "./src/automerge.js"
-      },
-      "browser": {
-        "import": "./dist/automerge.mjs",
-        "require": "./src/automerge.js"
-      },
-      "import": "./dist/automerge.mjs",
-      "require": "./src/automerge.js"
+      "node": "./src/automerge.js",
+      "browser": "./dist/automerge.js",
+      "default": "./dist/automerge.js"
     },
     "./slim": {
       "types": "./@types/automerge/index.d.ts",
-      "workerd": {
-        "import": "./dist/automerge.mjs",
-        "require": "./src/slim.js"
-      },
-      "node": {
-        "import": "./src/slim.mjs",
-        "require": "./src/slim.js"
-      },
-      "browser": {
-        "import": "./dist/automerge.mjs",
-        "require": "./src/slim.js"
-      },
-      "import": "./dist/automerge.mjs",
-      "require": "./src/slim.js"
-    },
-    "./classic": {
-      "types": "./@types/automerge/index.d.ts",
-      "workerd": {
-        "import": "./dist/classic.mjs",
-        "require": "./src/classic.js"
-      },
-      "node": {
-        "import": "./src/classic.mjs",
-        "require": "./src/classic.js"
-      },
-      "browser": {
-        "import": "./dist/classic.mjs",
-        "require": "./src/classic.js"
-      },
-      "import": "./dist/classic.mjs",
-      "require": "./src/classic.js"
+      "node": "./src/slim.js",
+      "browser": "./dist/automerge.js",
+      "default": "./dist/automerge.js"
     },
     "./automerge.wasm": "./src/automerge.wasm",
     "./automerge.wasm.base64": {
       "types": "./@types/automerge/automerge_wasm_base64.d.ts",
-      "import": "./src/automerge_wasm_base64.mjs",
-      "require": "./src/automerge_wasm_base64.js"
+      "default": "./src/automerge_wasm_base64.js"
     }
   },
   "scripts": {
@@ -70,7 +32,7 @@
     "test:esm": "pnpm run build && node --experimental-vm-modules test/esm_smoke.js",
     "test": "tsc --noEmit && vitest run",
     "testwasm": "vitest run",
-    "build": "vite build --mode umd && vite build --mode esm && vite build --mode classic && copyfiles --flat @types/automerge/index.d.ts dist",
+    "build": "vite build --mode esm && copyfiles --flat @types/automerge/index.d.ts dist",
     "prepublishOnly": "pnpm run build",
     "lint": "eslint ."
   },
@@ -94,7 +56,6 @@
     "/img/**",
     "/*.md",
     "/LICENSE",
-    "/.babelrc",
     "/.eslintrc.json",
     "/tsconfig.json",
     "/vite.config.mjs",
@@ -108,9 +69,10 @@
     "@types/node": "^22.20.1",
     "@vitest/coverage-v8": "^4.1.10",
     "copyfiles": "^2.4.1",
-    "eslint": "^7.24.0",
-    "eslint-plugin-compat": "^3.9.0",
+    "eslint": "^8.57.1",
+    "eslint-plugin-compat": "^4.2.0",
     "sinon": "^9.2.4",
+    "terser": "^5.49.2",
     "typescript": "^5.9.3",
     "vite": "^8.2.1",
     "vitest": "^4.1.10"

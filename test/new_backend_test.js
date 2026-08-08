@@ -1,12 +1,8 @@
-const assert = require('assert')
-const { checkEncoded } = require('./helpers')
-const {
-  DOC_OPS_COLUMNS, encodeChange, decodeChange, decodeChangeColumns,
-  encodeColumnInfo, encodeContainer, encoderByColumnId
-} = require('../backend/columnar')
-const { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, bloomFilterContains } = require('../backend/new')
-const uuid = require('../src/uuid')
-
+import assert from 'node:assert'
+import { checkEncoded } from './helpers.js'
+import { DOC_OPS_COLUMNS, decodeChange, decodeChangeColumns, encodeChange, encodeColumnInfo, encodeContainer, encoderByColumnId } from '../backend/columnar.js'
+import { BackendDoc, MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, bloomFilterContains } from '../backend/new.js'
+import uuid from '../src/uuid.js'
 function checkColumns(block, expectedCols) {
   for (let actual of block.columns) {
     const {columnName} = DOC_OPS_COLUMNS.find(({columnId}) => columnId === actual.columnId) || {columnName: actual.columnId.toString()}

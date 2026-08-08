@@ -16,11 +16,10 @@
  * last sync to disk), and we fall back to sending the entire document in this case.
  */
 
-const Backend = require('./backend')
-const { hexStringToBytes, bytesToHexString, Encoder, Decoder } = require('./encoding')
-const { decodeChangeMeta } = require('./columnar')
-const { copyObject } = require('../src/common')
-
+import * as Backend from './backend.js'
+import { Decoder, Encoder, bytesToHexString, hexStringToBytes } from './encoding.js'
+import { decodeChangeMeta } from './columnar.js'
+import { copyObject } from '../src/common.js'
 const HASH_SIZE = 32 // 256 bits = 32 bytes
 const MESSAGE_TYPE_SYNC = 0x42 // first byte of a sync message, for identification
 const MESSAGE_TYPE_SYNC_V2 = 0x43
@@ -512,7 +511,7 @@ function receiveSyncMessage(backend, oldSyncState, binaryMessage) {
   return [backend, syncState, patch]
 }
 
-module.exports = {
+export {
   receiveSyncMessage, generateSyncMessage,
   encodeSyncMessage, decodeSyncMessage,
   initSyncState, encodeSyncState, decodeSyncState,

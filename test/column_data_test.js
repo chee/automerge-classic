@@ -1,11 +1,6 @@
-const assert = require('assert')
-const {
-  RLEEncoder, DeltaEncoder, BooleanEncoder
-} = require('../backend/encoding')
-const {
-  createColumn, loadColumn, clone, get, range, splice, append, save, toBuffer, decoder
-} = require('../backend/column_data')
-
+import assert from 'node:assert'
+import { BooleanEncoder, DeltaEncoder, RLEEncoder } from '../backend/encoding.js'
+import { append, clone, createColumn, decoder, get, loadColumn, range, save, splice, toBuffer } from '../backend/column_data.js'
 function encode(type, values) {
   if (type === 'raw') return Uint8Array.from(values)
   let encoder

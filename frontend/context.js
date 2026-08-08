@@ -1,14 +1,10 @@
-const { CACHE, OBJECT_ID, CONFLICTS, ELEM_IDS, STATE, OPTIONS } = require('./constants')
-const { interpretPatch } = require('./apply_patch')
-const { Text } = require('./text')
-const { Table } = require('./table')
-const { Counter, getWriteableCounter } = require('./counter')
-const { Int, Uint, Float64 } = require('./numbers')
-const { isObject, parseOpId, createArrayOfNulls, wellFormedString } = require('../src/common')
-const { isImmutableString } = require('../src/immutable_string')
-const uuid = require('../src/uuid')
-
-
+import { CACHE, CONFLICTS, ELEM_IDS, OBJECT_ID, OPTIONS, STATE } from './constants.js'
+import { interpretPatch } from './apply_patch.js'
+import { Text } from './text.js'
+import { Counter, getWriteableCounter } from './counter.js'
+import { Float64, Int, Uint } from './numbers.js'
+import { createArrayOfNulls, isObject, parseOpId, wellFormedString } from '../src/common.js'
+import { isImmutableString } from '../src/immutable_string.js'
 /**
  * An instance of this class is passed to `rootObjectProxy()`. The methods are
  * called by proxy object mutation functions to query the current object state
@@ -105,12 +101,7 @@ class Context {
    * returns an object that maps operation IDs to descriptions of values.
    */
   getValuesDescriptions(path, object, key) {
-    if (object instanceof Table) {
-      // Table objects don't have conflicts, since rows are identified by their unique objectId
-      const value = object.byId(key)
-      const opId = object.opIds[key]
-      return value ? {[opId]: this.getValueDescription(value)} : {}
-    } else if (object instanceof Text) {
+    if (object instanceof Text) {
       // Text objects don't support conflicts
       const value = object.get(key)
       const elemId = object.getElemId(key)
@@ -133,9 +124,7 @@ class Context {
    * the value whose assignment operation has the ID `opId`.
    */
   getPropertyValue(object, key, opId) {
-    if (object instanceof Table) {
-      return object.byId(key)
-    } else if (object instanceof Text) {
+    if (object instanceof Text) {
       return object.get(key)
     } else {
       return object[CONFLICTS][key][opId]
@@ -189,14 +178,13 @@ class Context {
   }
 
   /**
-   * Returns a string that is either 'map', 'table', 'list', or 'text', indicating
+   * Returns a string that is either 'map', 'list', or 'text', indicating
    * the type of the object with ID `objectId`.
    */
   getObjectType(objectId) {
     if (objectId === '_root') return 'map'
     const object = this.getObject(objectId)
     if (object instanceof Text) return 'text'
-    if (object instanceof Table) return 'table'
     if (Array.isArray(object)) return 'list'
     return 'map'
   }
@@ -247,15 +235,6 @@ class Context {
       const subpatch = {objectId, type: 'text', edits: []}
       this.insertListItems(subpatch, 0, [...value], true)
       return subpatch
-
-    } else if (value instanceof Table) {
-      // Create a new Table object
-      if (value.count > 0) {
-        throw new RangeError('Assigning a non-empty Table object is not supported')
-      }
-      this.addOp(elemId ? {action: 'makeTable', obj, elemId, insert, pred}
-                        : {action: 'makeTable', obj, key, insert, pred})
-      return {objectId, type: 'table', props: {}}
 
     } else if (Array.isArray(value)) {
       // Create a new list object
@@ -507,44 +486,6 @@ class Context {
   }
 
   /**
-   * Updates the table object at path `path`, adding a new entry `row`.
-   * Returns the objectId of the new row.
-   */
-  addTableRow(path, row) {
-    if (!isObject(row) || Array.isArray(row)) {
-      throw new TypeError('A table row must be an object')
-    }
-    if (row[OBJECT_ID]) {
-      throw new TypeError('Cannot reuse an existing object as table row')
-    }
-    if (row.id) {
-      throw new TypeError('A table row must not have an "id" property; it is generated automatically')
-    }
-
-    const id = uuid()
-    const valuePatch = this.setValue(path[path.length - 1].objectId, id, row, false, [])
-    this.applyAtPath(path, subpatch => {
-      subpatch.props[id] = {[valuePatch.objectId]: valuePatch}
-    })
-    return id
-  }
-
-  /**
-   * Updates the table object at path `path`, deleting the row with ID `rowId`.
-   * `pred` is the opId of the operation that originally created the row.
-   */
-  deleteTableRow(path, rowId, pred) {
-    const objectId = path[path.length - 1].objectId, table = this.getObject(objectId)
-
-    if (table.byId(rowId)) {
-      this.addOp({action: 'del', obj: objectId, key: rowId, insert: false, pred: [pred]})
-      this.applyAtPath(path, subpatch => {
-        subpatch.props[rowId] = {}
-      })
-    }
-  }
-
-  /**
    * Adds the integer `delta` to the value of the counter located at property
    * `key` in the object at path `path`.
    */
@@ -598,9 +539,7 @@ class Context {
 }
 
 function getPred(object, key) {
-  if (object instanceof Table) {
-    return [object.opIds[key]]
-  } else if (object instanceof Text) {
+  if (object instanceof Text) {
     return object.elems[key].pred
   } else if (object[CONFLICTS]) {
     return object[CONFLICTS][key] ? Object.keys(object[CONFLICTS][key]) : []
@@ -619,6 +558,6 @@ function getElemId(list, index, insert = false) {
   throw new RangeError(`Cannot find elemId at list index ${index}`)
 }
 
-module.exports = {
+export {
   Context
 }

@@ -1,22 +1,23 @@
-const assert = require('assert')
-const Automerge = require('../src/automerge')
-const { splitContainers } = require('../backend/columnar')
-
+import assert from 'node:assert'
+import Automerge from '../src/automerge.js'
+import * as Backend from '../backend/index.js'
+import * as Frontend from '../frontend/index.js'
+import { splitContainers } from '../backend/columnar.js'
 describe('incremental persistence', () => {
   it('saves only changes since the previous cursor', () => {
     let doc = Automerge.init('aa')
-    let state = Automerge.Frontend.getBackendState(doc)
-    assert.strictEqual(Automerge.Backend.saveIncremental(state).byteLength, 0)
+    let state = Frontend.getBackendState(doc)
+    assert.strictEqual(Backend.saveIncremental(state).byteLength, 0)
 
     doc = Automerge.change(doc, draft => { draft.one = 1 })
-    state = Automerge.Frontend.getBackendState(doc)
-    const first = Automerge.Backend.saveIncremental(state)
+    state = Frontend.getBackendState(doc)
+    const first = Backend.saveIncremental(state)
     assert.strictEqual(splitContainers(first).length, 1)
-    assert.strictEqual(Automerge.Backend.saveIncremental(state).byteLength, 0)
+    assert.strictEqual(Backend.saveIncremental(state).byteLength, 0)
 
     doc = Automerge.change(doc, draft => { draft.two = 2 })
-    state = Automerge.Frontend.getBackendState(doc)
-    const second = Automerge.Backend.saveIncremental(state)
+    state = Frontend.getBackendState(doc)
+    const second = Backend.saveIncremental(state)
     assert.strictEqual(splitContainers(second).length, 1)
     assert.strictEqual(Automerge.decodeChange(second).message, null)
   })
@@ -24,32 +25,32 @@ describe('incremental persistence', () => {
   it('loads full documents and trailing changes incrementally', () => {
     let source = Automerge.from({one: 1}, 'aa')
     const full = Automerge.save(source)
-    Automerge.Backend.saveIncremental(Automerge.Frontend.getBackendState(source))
+    Backend.saveIncremental(Frontend.getBackendState(source))
     source = Automerge.change(source, draft => { draft.two = 2 })
-    const tail = Automerge.Backend.saveIncremental(Automerge.Frontend.getBackendState(source))
+    const tail = Backend.saveIncremental(Frontend.getBackendState(source))
     const bytes = new Uint8Array(full.byteLength + tail.byteLength)
     bytes.set(full)
     bytes.set(tail, full.byteLength)
 
-    const initial = Automerge.Backend.init()
-    const [state, patch] = Automerge.Backend.loadIncremental(initial, bytes)
-    const target = Automerge.Frontend.applyPatch(
-      Automerge.Frontend.init({backend: Automerge.Backend, actorId: 'bb'}),
+    const initial = Backend.init()
+    const [state, patch] = Backend.loadIncremental(initial, bytes)
+    const target = Frontend.applyPatch(
+      Frontend.init({backend: Backend, actorId: 'bb'}),
       patch,
       state
     )
     assert.deepStrictEqual({one: target.one, two: target.two}, {one: 1, two: 2})
-    assert.deepStrictEqual(Automerge.Backend.getHeads(state), Automerge.Backend.getHeads(
-      Automerge.Frontend.getBackendState(source)
+    assert.deepStrictEqual(Backend.getHeads(state), Backend.getHeads(
+      Frontend.getBackendState(source)
     ))
   })
 
   it('saves changes after specified heads', () => {
     let doc = Automerge.from({one: 1}, 'aa')
-    const heads = Automerge.Backend.getHeads(Automerge.Frontend.getBackendState(doc))
+    const heads = Backend.getHeads(Frontend.getBackendState(doc))
     doc = Automerge.change(doc, draft => { draft.two = 2 })
-    const state = Automerge.Frontend.getBackendState(doc)
-    const bytes = Automerge.Backend.saveSince(state, heads)
+    const state = Frontend.getBackendState(doc)
+    const bytes = Backend.saveSince(state, heads)
     assert.strictEqual(splitContainers(bytes).length, 1)
     assert.strictEqual(Automerge.decodeChange(bytes).ops[0].key, 'two')
   })
@@ -71,13 +72,13 @@ describe('incremental persistence', () => {
   it('exposes compact history metadata', () => {
     let doc = Automerge.from({one: 1}, 'aa')
     doc = Automerge.change(doc, draft => { draft.two = 2 })
-    const state = Automerge.Frontend.getBackendState(doc)
-    const heads = Automerge.Backend.getHeads(state)
-    const traversal = Automerge.Backend.topoHistoryTraversal(state)
-    const metadata = Automerge.Backend.getChangesMeta(state)
+    const state = Frontend.getBackendState(doc)
+    const heads = Backend.getHeads(state)
+    const traversal = Backend.topoHistoryTraversal(state)
+    const metadata = Backend.getChangesMeta(state)
     assert.deepStrictEqual(traversal, metadata.map(change => change.hash))
-    assert.strictEqual(Automerge.Backend.hasHeads(state, heads), true)
-    assert.deepStrictEqual(Automerge.Backend.stats(state), {
+    assert.strictEqual(Backend.hasHeads(state, heads), true)
+    assert.deepStrictEqual(Backend.stats(state), {
       numChanges: 2,
       numOps: 2,
       numActors: 1

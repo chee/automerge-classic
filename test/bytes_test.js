@@ -1,6 +1,5 @@
-const assert = require('assert')
-const Automerge = require('../src/automerge')
-
+import assert from 'node:assert'
+import Automerge from '../src/automerge.js'
 describe('byte values', () => {
   it('stores byte views without including unrelated buffer bytes', () => {
     const source = new Uint8Array([0, 1, 2, 3])

@@ -1,18 +1,21 @@
-const assert = require('assert')
-const path = require('path')
-const Classic = process.env.TEST_DIST === '1' ? require('../dist/automerge') : require('../src/automerge')
+import assert from 'node:assert'
+import { createRequire } from 'node:module'
+import path from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
+const resolve = createRequire(import.meta.url).resolve
+import Classic from './subject.js'
 // Cross-implementation integration tests: a classic (plain JavaScript) peer
 // and a Rust/WASM peer perform the same operations, exchange documents, and
 // synchronize. Set AUTOMERGE_MODERN_PATH to the modern package, or build
 // ../automerge/javascript (branch fragment); the suite is skipped when no
 // modern package is available.
+const here = path.dirname(fileURLToPath(import.meta.url))
+
 function resolveModern() {
-  if (process.env.AUTOMERGE_MODERN_PATH) return path.resolve(process.env.AUTOMERGE_MODERN_PATH)
-  const sibling = path.resolve(__dirname, '..', '..', 'automerge', 'javascript')
+  const candidate = process.env.AUTOMERGE_MODERN_PATH || path.resolve(here, '..', '..', 'automerge', 'javascript')
   try {
-    require(sibling)
-    return sibling
+    return resolve(candidate)
   } catch (e) {
     return null
   }
@@ -20,7 +23,7 @@ function resolveModern() {
 
 const modernPath = resolveModern()
 const describeLive = modernPath ? describe : describe.skip
-const Modern = modernPath ? require(modernPath) : null
+const Modern = modernPath ? (await import(pathToFileURL(modernPath).href)) : null
 
 const ACTOR_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 const ACTOR_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
@@ -369,12 +372,21 @@ describeLive('live Rust/WASM interoperability', () => {
     }
   })
 
-  it('exposes every export of the modern package', () => {
+  it('exposes exactly the exports of the modern package', () => {
     for (const key of Object.keys(Modern)) {
+      if (key === 'default') continue
       assert.ok(key in Classic, `missing export: ${key}`)
     }
     for (const key of Object.keys(Modern.next)) {
       assert.ok(key in Classic.next, `missing next export: ${key}`)
+    }
+    const modernKeys = new Set([...Object.keys(Modern), 'next', 'default'])
+    for (const key of Object.keys(Classic)) {
+      assert.ok(modernKeys.has(key), `extra export: ${key}`)
+    }
+    for (const key of Object.keys(Classic.next)) {
+      if (key === 'default') continue
+      assert.ok(key in Modern.next, `extra next export: ${key}`)
     }
   })
 })

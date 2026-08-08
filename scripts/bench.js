@@ -1,9 +1,14 @@
-const path = require('path')
+import {createRequire} from 'node:module'
+import path from 'node:path'
+import {fileURLToPath, pathToFileURL} from 'node:url'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const resolve = createRequire(import.meta.url).resolve
 
 const IMPLS = {
-  classic: () => require(path.resolve(__dirname, '..', 'src', 'automerge')),
-  modern: () => require(process.env.AUTOMERGE_MODERN_PATH ||
-    path.resolve(__dirname, '..', '..', 'automerge', 'javascript'))
+  classic: () => import(pathToFileURL(path.resolve(here, '..', 'src', 'automerge.js')).href),
+  modern: () => import(pathToFileURL(resolve(process.env.AUTOMERGE_MODERN_PATH ||
+    path.resolve(here, '..', '..', 'automerge', 'javascript'))).href)
 }
 
 function bigDoc(A) {
@@ -150,10 +155,10 @@ function context(A) {
   return {doc, bytes, smallHistory, unsaved: bigDoc(A)}
 }
 
-function run() {
+async function run() {
   const impl = process.argv[2]
   const only = process.argv[3]
-  const A = IMPLS[impl]()
+  const A = await IMPLS[impl]()
   const results = {}
   for (const [name, fn] of Object.entries(WORKLOADS)) {
     if (only && name !== only) continue
@@ -166,4 +171,4 @@ function run() {
   process.stdout.write(JSON.stringify(results))
 }
 
-run()
+await run()

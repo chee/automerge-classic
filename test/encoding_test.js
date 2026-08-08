@@ -1,7 +1,6 @@
-const assert = require('assert')
-const { checkEncoded } = require('./helpers')
-const { Encoder, Decoder, RLEEncoder, RLEDecoder, DeltaEncoder, DeltaDecoder, BooleanEncoder, BooleanDecoder } = require('../backend/encoding')
-
+import assert from 'node:assert'
+import { checkEncoded } from './helpers.js'
+import { BooleanDecoder, BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, Encoder, RLEDecoder, RLEEncoder } from '../backend/encoding.js'
 describe('Binary encoding', () => {
   describe('Encoder and Decoder', () => {
     it('should clone unfinished encoder state', () => {

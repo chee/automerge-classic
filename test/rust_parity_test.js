@@ -1,6 +1,5 @@
-const assert = require('assert')
-const Automerge = process.env.TEST_DIST === '1' ? require('../dist/automerge') : require('../src/automerge')
-
+import assert from 'node:assert'
+import Automerge from './subject.js'
 const ACTOR_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 const ACTOR_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 

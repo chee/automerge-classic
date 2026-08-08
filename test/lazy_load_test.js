@@ -1,7 +1,6 @@
-const assert = require('assert')
-const Automerge = require('../src/automerge')
-const { MAX_MAP_BLOCK_SIZE } = require('../backend/new')
-
+import assert from 'node:assert'
+import Automerge from '../src/automerge.js'
+import { MAX_MAP_BLOCK_SIZE } from '../backend/new.js'
 function state(doc) {
   return Automerge.getBackend(doc).state
 }

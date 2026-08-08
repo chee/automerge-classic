@@ -1,8 +1,7 @@
-const assert = require('assert')
-const { checkEncoded } = require('./helpers')
-const Automerge = process.env.TEST_DIST === '1' ? require('../dist/automerge') : require('../src/automerge')
-const { encodeChange, decodeChange } = require('../backend/columnar')
-
+import assert from 'node:assert'
+import { checkEncoded } from './helpers.js'
+import Automerge from './subject.js'
+import { decodeChange, encodeChange } from '../backend/columnar.js'
 describe('change encoding', () => {
   it('should encode text edits', () => {
     const change1 = {actor: 'aaaa', seq: 1, startOp: 1, time: 9, message: '', deps: [], ops: [
