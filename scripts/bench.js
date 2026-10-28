@@ -73,7 +73,7 @@ function repoDoc(A, index) {
   let doc = A.from({title: `doc ${index}`, text: '', items: []})
   for (let edit = 0; edit < 50; edit++) {
     doc = A.change(doc, d => {
-      d.text += `edit ${edit} of doc ${index}; `
+      A.splice(d, ['text'], d.text.length, 0, `edit ${edit} of doc ${index}; `)
       d.items.push({edit, at: edit * 7})
     })
   }
@@ -148,7 +148,7 @@ const WORKLOADS = {
 
   'load: 6000-op doc': (A, ctx) => A.load(ctx.bytes),
 
-  'repo: create 20 docs x 50 text+= edits': A => Array.from({length: 20}, (_, index) => repoDoc(A, index)),
+  'repo: create 20 docs x 50 edits': A => Array.from({length: 20}, (_, index) => repoDoc(A, index)),
 
   'repo: load 20 docs': [repoContext, (A, ctx) => ctx.saved.map(bytes => A.load(bytes))],
 
