@@ -69,6 +69,22 @@ function branchesContext(A) {
   return {left, right}
 }
 
+function repoDoc(A, index) {
+  let doc = A.from({title: `doc ${index}`, text: '', items: []})
+  for (let edit = 0; edit < 50; edit++) {
+    doc = A.change(doc, d => {
+      d.text += `edit ${edit} of doc ${index}; `
+      d.items.push({edit, at: edit * 7})
+    })
+  }
+  return doc
+}
+
+function repoContext(A) {
+  const docs = Array.from({length: 20}, (_, index) => repoDoc(A, index))
+  return {docs, saved: docs.map(doc => A.save(doc))}
+}
+
 function sequentialDiffs(A, doc, edit) {
   let heads = A.getHeads(doc)
   const out = []
@@ -131,6 +147,23 @@ const WORKLOADS = {
   'save: 6000-op doc': (A, ctx) => A.save(ctx.unsaved),
 
   'load: 6000-op doc': (A, ctx) => A.load(ctx.bytes),
+
+  'repo: create 20 docs x 50 text+= edits': A => Array.from({length: 20}, (_, index) => repoDoc(A, index)),
+
+  'repo: load 20 docs': [repoContext, (A, ctx) => ctx.saved.map(bytes => A.load(bytes))],
+
+  'repo: sync 20 docs to empty peer': [repoContext, (A, ctx) => ctx.docs.map(doc => {
+    let b = A.init(), sa = A.initSyncState(), sb = A.initSyncState()
+    for (let round = 0; round < 20; round++) {
+      let ma, mb
+      ;[sa, ma] = A.generateSyncMessage(doc, sa)
+      if (ma) [b, sb] = A.receiveSyncMessage(b, sb, ma)
+      ;[sb, mb] = A.generateSyncMessage(b, sb)
+      if (mb) [doc, sa] = A.receiveSyncMessage(doc, sa, mb)
+      if (!ma && !mb) break
+    }
+    return b
+  })],
 
   'save: 5000-change doc': [largeContext, (A, ctx) => A.save(ctx.unsaved)],
 
