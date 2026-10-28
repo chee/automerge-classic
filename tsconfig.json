@@ -1,11 +1,9 @@
 {
   "compilerOptions": {
     "allowJs": false,
-    "baseUrl": ".",
     "esModuleInterop": true,
     "lib": ["dom", "esnext.asynciterable", "es2017", "es2016", "es2015"],
     "module": "preserve",
-    "paths": { "automerge": ["*"]},
     "rootDir": "",
     "target": "es2016",
     "typeRoots": ["./@types", "./node_modules/@types"]

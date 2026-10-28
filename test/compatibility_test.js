@@ -1,20 +1,21 @@
 import assert from 'node:assert'
 import { execFileSync } from 'node:child_process'
-import { statSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import * as Automerge from '@automerge/automerge-classic'
-import * as Slim from '@automerge/automerge-classic/slim'
-import { automergeWasmBase64 } from '@automerge/automerge-classic/automerge.wasm.base64'
+import * as Automerge from '@chee/automerge.js'
+import * as Slim from '@chee/automerge.js/slim'
+import { automergeWasmBase64 } from '@chee/automerge.js/automerge.wasm.base64'
 
 describe('modern API compatibility', () => {
   it('loads the root and slim exports through the package entry points', () => {
     assert.strictEqual(Slim.init, Automerge.init)
     assert.strictEqual(Automerge.next.change, Automerge.change)
-    const script = "Promise.all([import('@automerge/automerge-classic'), import('@automerge/automerge-classic/slim')]).then(([root, slim]) => process.stdout.write(typeof root.init + ':' + typeof root.next.diff + ':' + typeof slim.applyPatches))"
+    const script = "Promise.all([import('@chee/automerge.js'), import('@chee/automerge.js/slim')]).then(([root, slim]) => process.stdout.write(typeof root.init + ':' + typeof root.next.diff + ':' + typeof slim.applyPatches))"
     assert.strictEqual(execFileSync(process.execPath, ['--input-type=module', '-e', script], {encoding: 'utf8'}), 'function:function:function')
     assert.deepStrictEqual(['dump', 'isCounter', 'use'].filter(name => !(name in Automerge)), [])
     assert.strictEqual(automergeWasmBase64, '')
-    assert.strictEqual(statSync(fileURLToPath(import.meta.resolve('@automerge/automerge-classic/automerge.wasm'))).size, 0)
+    const wasm = readFileSync(fileURLToPath(import.meta.resolve('@chee/automerge.js/automerge.wasm')))
+    assert.deepStrictEqual(WebAssembly.Module.exports(new WebAssembly.Module(wasm)), [])
   })
 
   it('normalizes modern actor options', () => {

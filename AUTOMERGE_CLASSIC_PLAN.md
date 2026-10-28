@@ -2,7 +2,7 @@
 
 ## Goal
 
-Make `@automerge/automerge-classic` a practical plain-JavaScript replacement for `@automerge/automerge` through a pnpm override. Preserve the current Automerge binary formats and JavaScript behavior, including modern primitive-string text, rich text, sync v2, bundles, incremental loading, package subpaths, and the intentionally empty `automerge.wasm` export.
+Make `@automerge/automerge-classic` a practical plain-JavaScript replacement for `@automerge/automerge` through a pnpm override. Preserve the current Automerge binary formats and JavaScript behavior, including modern primitive-string text, rich text, sync v2, bundles, incremental loading, package subpaths, and the `automerge.wasm` export (a valid Wasm module with no exports).
 
 The exported API surface is exactly the modern package's surface — a breaking change from earlier revisions of this package. Everything that was not a feature of `../automerge` has been removed: the v1 classic entry point (`Text`/`Table` value classes, `Observable`, the split `Frontend`/`Backend` API, `setDefaultBackend`, `getObjectById`, `setActorId`, `uuid`, `releaseInfo`) and the sedimentree fragment-metadata surface that classic grew while it was also standing in for `@automerge/automerge-subduction` (`getFragmentMetadata`, `getFragmentMeta`, `bundleFragmentMetadata`, `getCommits`, `getFragments`, `addCommits`, `addFragments`, `diffPath`). `saveBundle`/`readBundle` remain (they are modern exports). Documents containing v1 tables still load, materializing each table as a plain map of rows, and re-save byte-identically. The live interop suite asserts exact export equality with the modern package in both directions.
 
@@ -119,7 +119,7 @@ The cursor index improved the repeated lookup fixture by 14.05×. A representati
 - Browser and workerd import conditions use the self-contained ESM bundles.
 - Node CommonJS and Node ESM imports work.
 - The root and slim API export sets match the modern package surface used by the compatibility tests.
-- `./automerge.wasm` exports an intentional zero-byte module.
+- `./automerge.wasm` exports a valid Wasm module with no exports (JSR requires export targets to parse).
 - `./automerge.wasm.base64` exports an empty base64 string in CommonJS and ESM.
 - Package dry-run includes ESM bundles, source maps, classic entry points, and both wasm compatibility assets.
 - An actual pnpm override smoke test has loaded CommonJS, ESM, and Automerge Repo consumers.

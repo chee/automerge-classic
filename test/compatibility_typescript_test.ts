@@ -18,7 +18,7 @@ import {
   SyncState,
   next as A,
 } from '..'
-import * as Slim from '@automerge/automerge-classic/slim'
+import * as Slim from '@chee/automerge.js/slim'
 
 interface DocumentValue {
   list: Automerge.List<string>

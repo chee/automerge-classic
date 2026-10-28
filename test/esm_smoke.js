@@ -24,7 +24,7 @@ function verify(api) {
   assert.strictEqual(api.load(api.save(doc), {actor: 'ccdd'}).value, 2)
 }
 
-const nodeScript = "Promise.all([import('@automerge/automerge-classic'), import('@automerge/automerge-classic/slim')]).then(apis => { for (const api of apis) { let doc = api.from({value: 1}, {actor: 'aabb'}); doc = api.change(doc, draft => { draft.value = 2 }); if (api.load(api.save(doc), {actor: 'ccdd'}).value !== 2) process.exitCode = 1 } })"
+const nodeScript = "Promise.all([import('@chee/automerge.js'), import('@chee/automerge.js/slim')]).then(apis => { for (const api of apis) { let doc = api.from({value: 1}, {actor: 'aabb'}); doc = api.change(doc, draft => { draft.value = 2 }); if (api.load(api.save(doc), {actor: 'ccdd'}).value !== 2) process.exitCode = 1 } })"
 execFileSync(process.execPath, ['--input-type=module', '-e', nodeScript])
 
 const root = await loadBundle('automerge.js')

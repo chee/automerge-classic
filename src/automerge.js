@@ -1,3 +1,4 @@
+/* @ts-self-types="../@types/automerge/index.d.ts" */
 export * from './api.js'
 
 import * as automerge from './automerge.js'

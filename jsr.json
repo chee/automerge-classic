@@ -1,0 +1,22 @@
+{
+  "name": "@chee/automerge-js",
+  "version": "0.0.0-experimental.0",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/automerge.js",
+    "./slim": "./src/slim.js",
+    "./automerge.wasm": "./src/automerge.wasm",
+    "./automerge.wasm.base64": "./src/automerge_wasm_base64.js"
+  },
+  "publish": {
+    "include": [
+      "src/**/*.js",
+      "src/automerge.wasm",
+      "frontend/**/*.js",
+      "backend/**/*.js",
+      "@types/automerge/*.d.ts",
+      "README.md",
+      "LICENSE"
+    ]
+  }
+}
