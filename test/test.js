@@ -821,11 +821,12 @@ describe('Automerge', () => {
         assert.deepStrictEqual(s3, {birds: {}})
       })
 
-      it('should not allow deleting counters from lists', () => {
+      it('should allow deleting counters from lists', () => {
         const s1 = Automerge.change(Automerge.init(), doc => doc.recordings = [new Automerge.Counter(1)])
         const s2 = Automerge.change(s1, doc => doc.recordings[0].increment(2))
+        const s3 = Automerge.change(s2, doc => doc.recordings.deleteAt(0))
         assert.deepStrictEqual(s2, {recordings: [new Automerge.Counter(3)]})
-        assert.throws(() => { Automerge.change(s2, doc => doc.recordings.deleteAt(0)) }, /Unsupported operation/)
+        assert.deepStrictEqual(s3, {recordings: []})
       })
 
       it('should allow putting multiple counters in a list', () => {

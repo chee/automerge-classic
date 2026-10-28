@@ -230,6 +230,26 @@ function deepCopyUpdate(objectTree, path, value) {
   }
 }
 
+function visibleRow(row, succNum, counters) {
+  if (row[insertIdx] && counters.length > 0) counters.length = 0
+  const action = ACTIONS[row[actionIdx]]
+  if (action === 'inc') {
+    let visible = false
+    for (const counter of counters) {
+      if (counter.ctrs[counter.next] === row[idCtrIdx] && counter.actors[counter.next] === row[idActorIdx]) {
+        counter.next++
+        if (counter.next === counter.ctrs.length) visible = true
+      }
+    }
+    return visible
+  }
+  if (succNum === 0) return action !== 'mark'
+  if (action === 'set' && (row[valLenIdx] & 0x0f) === VALUE_TYPE.COUNTER) {
+    counters.push({ctrs: row[succCtrIdx], actors: row[succActorIdx], next: 0})
+  }
+  return false
+}
+
 function seekWithinOperations(target, cache, actorIds, resumeInsertion) {
   const rows = cache.operations
   const {objActor, objActorNum, objCtr, keyActor, keyCtr, keyStr, idActor, idCtr, insert} = target
@@ -284,6 +304,7 @@ function seekWithinOperations(target, cache, actorIds, resumeInsertion) {
   const hasRef = keyCtr !== null && keyCtr > 0 && keyActor !== null
   if (!insert && !hasRef) return {found: true, skipCount: index, visibleCount: 0}
   let found = insert && (resumeInsertion || !hasRef), visibleCount = 0, elemVisible = false
+  const counters = []
   for (; index < rows.length; index++) {
     const row = rows[index], rowIdActor = actorIds[row[idActorIdx]]
     if (row[objCtrIdx] !== objCtr || row[objActorIdx] !== objActorNum) break
@@ -291,7 +312,7 @@ function seekWithinOperations(target, cache, actorIds, resumeInsertion) {
     if (isRef && !insert) return {found: true, skipCount: index, visibleCount}
     if (found && row[insertIdx] && (row[idCtrIdx] < idCtr || (row[idCtrIdx] === idCtr && rowIdActor <= idActor))) break
     if (row[insertIdx]) elemVisible = false
-    if (!elemVisible && row[succNumIdx] === 0 && ACTIONS[row[actionIdx]] !== 'mark') {
+    if (!elemVisible && visibleRow(row, row[succNumIdx], counters)) {
       visibleCount++
       elemVisible = true
     }
@@ -403,9 +424,13 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
     if (found && rowInsert && (rowIdCtr < idCtr || (rowIdCtr === idCtr && rowIdActor <= idActor))) break
     skipCount++
     if (rowInsert) elemVisible = false
-    if (!elemVisible && rowSuccNum === 0 && ACTIONS[rowAction] !== 'mark') {
-      visibleCount++
-      elemVisible = true
+    if (!elemVisible) {
+      const action = ACTIONS[rowAction]
+      if (action === 'inc') return seekWithinOperations(ops, columnOperationCache(docCols), actorIds, false)
+      if (rowSuccNum === 0 && action !== 'mark') {
+        visibleCount++
+        elemVisible = true
+      }
     }
     // If insertion is not at the head, search for the reference element
     if (isRef) found = true
@@ -587,9 +612,9 @@ function updateBlockMetadata(block, visibleMapOps) {
   block.lastIdCtr = undefined
   block.hasListOps = false
 
-  const cached = COLUMN_OPERATIONS.get(block.columns)
+  const cached = COLUMN_OPERATIONS.get(block.columns), counters = []
   if (cached) {
-    for (const op of cached.operations) addOperationMetadata(block, op, visibleMapOps)
+    for (const op of cached.operations) addOperationMetadata(block, op, visibleMapOps, counters)
     return
   }
 
@@ -608,11 +633,15 @@ function updateBlockMetadata(block, visibleMapOps) {
     op[insertIdx] = insertD.readValue()
     op[actionIdx] = actionD.readValue()
     op[succNumIdx] = succNumD.readValue()
-    addOperationMetadata(block, op, visibleMapOps)
+    if (op[keyStrIdx] === null && ACTIONS[op[actionIdx]] === 'inc') {
+      columnOperationCache(block.columns)
+      return updateBlockMetadata(block, visibleMapOps)
+    }
+    addOperationMetadata(block, op, visibleMapOps, counters)
   }
 }
 
-function addOperationMetadata(block, op, visibleMapOps) {
+function addOperationMetadata(block, op, visibleMapOps, counters) {
   block.numOps += 1
   const objActor = op[objActorIdx], objCtr = op[objCtrIdx]
   const keyActor = op[keyActorIdx], keyCtr = op[keyCtrIdx], keyStr = op[keyStrIdx]
@@ -653,7 +682,7 @@ function addOperationMetadata(block, op, visibleMapOps) {
     bloomFilterAdd(block.bloom, elemIdActor, elemIdCtr)
 
     // If the list element is visible, update the block metadata accordingly
-    if (succNum === 0 && ACTIONS[action] !== 'mark') {
+    if (visibleRow(op, succNum, counters)) {
       if (block.firstVisibleActor === undefined) block.firstVisibleActor = elemIdActor
       if (block.firstVisibleCtr === undefined) block.firstVisibleCtr = elemIdCtr
       if (block.lastVisibleActor !== elemIdActor || block.lastVisibleCtr !== elemIdCtr) {
@@ -717,10 +746,26 @@ function splitBlock(block, maxBlockSize, operations) {
   // 50% full when going from two to three blocks.
   const numBlocks = Math.ceil(block.numOps / (0.8 * maxBlockSize))
   let blocks = [], opsSoFar = 0
-  if (!operations) for (let col of block.columns) col.decoder.reset()
+  let keyStrD, insertD, row = 0
+  if (!operations) {
+    for (let col of block.columns) col.decoder.reset()
+    keyStrD = decoderByColumnId(block.columns[keyStrIdx].columnId, block.columns[keyStrIdx].decoder.buf)
+    insertD = decoderByColumnId(block.columns[insertIdx].columnId, block.columns[insertIdx].decoder.buf)
+  }
+  function continuesElement(index) {
+    if (operations) return operations[index][keyStrIdx] === null && !operations[index][insertIdx]
+    keyStrD.skipValues(index - row)
+    insertD.skipValues(index - row)
+    row = index + 1
+    const keyStr = keyStrD.readValue(), insert = insertD.readValue()
+    return keyStr === null && !insert
+  }
 
   for (let i = 1; i <= numBlocks; i++) {
-    const opsToCopy = Math.ceil(i * block.numOps / numBlocks) - opsSoFar
+    let end = Math.ceil(i * block.numOps / numBlocks)
+    if (end <= opsSoFar) continue
+    while (end < block.numOps && continuesElement(end)) end++
+    const opsToCopy = end - opsSoFar
     let columns
     if (operations) {
       columns = columnsFromOperations(block.columns, operations.slice(opsSoFar, opsSoFar + opsToCopy))
@@ -1234,6 +1279,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   }
 
   const emissions = []
+  let wasVisible = oldSuccNum === 0 && ACTIONS[op[actionIdx]] !== 'inc'
 
   // If this operation's ID appears in the pending-successor index, some
   // earlier operation for this property is waiting to find out whether this
@@ -1256,7 +1302,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   if (isOverwritten && ACTIONS[op[actionIdx]] === 'set' && (op[valLenIdx] & 0x0f) === VALUE_TYPE.COUNTER) {
     if (!propState[elemId].counterStates) propState[elemId].counterStates = {}
     const counterStates = propState[elemId].counterStates
-    const state = {op, opId, dead: false, value: decodeValue(op[valLenIdx], op[valRawIdx]).value, succs: {}}
+    const state = {op, opId, dead: false, value: decodeValue(op[valLenIdx], op[valRawIdx]).value, succs: {}, oldSuccNum, oldIncs: 0}
     for (let i = 0; i < op[succNumIdx]; i++) {
       const succOp = `${op[succCtrIdx][i]}@${docState.actorIds[op[succActorIdx][i]]}`
       if (!counterStates[succOp]) counterStates[succOp] = []
@@ -1276,6 +1322,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
     for (const state of states) {
       state.value += delta
       delete state.succs[opId]
+      if (oldSuccNum !== undefined && ++state.oldIncs === state.oldSuccNum) wasVisible = true
       if (state.dead || Object.keys(state.succs).length > 0) continue
       // Every successor was an increment: the operation is visible after all
       const counter = {type: 'value', datatype: 'counter', value: state.value}
@@ -1330,7 +1377,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
     // means the current list element already had a value before this change was applied, and
     // therefore the current element cannot be an insert. If we already registered an insert, we
     // have to convert it into an update.
-    if (oldSuccNum === 0 && !isWholeDoc && propState[elemId].action === 'insert') {
+    if (wasVisible && !isWholeDoc && propState[elemId].action === 'insert') {
       propState[elemId].action = 'update'
       convertInsertToUpdate(patch.edits, listIndex, elemId)
       if (countsVisible) newBlock.numVisible -= 1
@@ -1368,7 +1415,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
         appendUpdate(patch.edits, listIndex, elemId, emissions[i][0], emissions[i][1], false)
       }
 
-    } else if (oldSuccNum === 0 && !propState[elemId].action) {
+    } else if (wasVisible && !propState[elemId].action) {
       // If the property used to have a non-overwritten/non-deleted value, but no longer, it's a remove
       propState[elemId].action = 'remove'
       appendEdit(patch.edits, {action: 'remove', index: listIndex, count: 1})
@@ -1398,6 +1445,7 @@ function mergeDocChangeOps(patches, newBlock, outCols, outOps, changeState, docS
   const objectId = objActor === null ? '_root' : `${objCtr}@${docState.actorIds[objActor]}`
   const idActorIndex = changeState.actorIndex, idActor = docState.actorIds[idActorIndex]
   let foundListElem = false, elemVisible = false, propState = {}, docOp
+  const counters = []
   ;({ docOp, blockIndex } = readNextDocOp(docState, blockIndex))
   let docOpsConsumed = (docOp === null ? 0 : 1)
   let docOpOldSuccNum = (docOp === null ? 0 : docOp[succNumIdx])
@@ -1596,7 +1644,7 @@ function mergeDocChangeOps(patches, newBlock, outCols, outOps, changeState, docS
         elemVisible = false
         listIndex++
       }
-      if (docOp[succNumIdx] === 0 && ACTIONS[docOp[actionIdx]] !== 'mark') elemVisible = true
+      if (!elemVisible && docOp[keyStrIdx] === null && visibleRow(docOp, docOp[succNumIdx], counters)) elemVisible = true
       newBlock.numOps++
       ;({ docOp, blockIndex } = readNextDocOp(docState, blockIndex))
       if (docOp !== null) {
@@ -1625,7 +1673,7 @@ function mergeDocChangeOps(patches, newBlock, outCols, outOps, changeState, docS
         } else if (op[insertIdx]) {
           elemVisible = false
           listIndex++
-        } else {
+        } else if (op[keyStrIdx] === null && visibleRow(op, 0, counters)) {
           elemVisible = true
         }
       }
@@ -2013,6 +2061,7 @@ function documentPatch(docState) {
   let propState = {}, docOp = null, blockIndex = 0
   let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
   let lastObjActor = null, lastObjCtr = null, objectId = '_root', elemVisible = false, listIndex = 0
+  const counters = []
 
   while (true) {
     ({ docOp, blockIndex } = readNextDocOp(docState, blockIndex))
@@ -2030,7 +2079,7 @@ function documentPatch(docState) {
       elemVisible = false
       listIndex++
     }
-    if (docOp[succNumIdx] === 0 && ACTIONS[docOp[actionIdx]] !== 'mark') elemVisible = true
+    if (!elemVisible && docOp[keyStrIdx] === null && visibleRow(docOp, docOp[succNumIdx], counters)) elemVisible = true
     if (ACTIONS[docOp[actionIdx]] === 'mark' && docState.objectsWithMarks) docState.objectsWithMarks.add(objectId)
     if (docOp[idCtrIdx] > docState.maxOp) docState.maxOp = docOp[idCtrIdx]
     for (let i = 0; i < docOp[succNumIdx]; i++) {
@@ -2111,7 +2160,7 @@ function appendChange(columns, change, actorIndexById, changeIndexByHash) {
 
 function buildCursorIndex(blocks, actorIds, objectId) {
   const object = parseOpId(objectId)
-  const elements = [], byId = new Map()
+  const elements = [], byId = new Map(), counters = []
   for (const block of blocks) {
     for (const column of block.columns) column.decoder.reset()
     while (!block.columns[actionIdx].decoder.done) {
@@ -2126,11 +2175,11 @@ function buildCursorIndex(blocks, actorIds, objectId) {
         elements.push(id)
         // Mark boundaries are elements of the sequence, but they are never
         // visible; including them lets cursors anchored on a boundary resolve
-        byId.set(id, {key, visible: op[actionIdx] !== ACTIONS.indexOf('mark') && op[succNumIdx] === 0})
-      } else if (op[actionIdx] !== ACTIONS.indexOf('mark')) {
+        byId.set(id, {key, visible: visibleRow(op, op[succNumIdx], counters)})
+      } else {
         const id = `${op[keyCtrIdx]}@${op[keyActorIdx]}`
         const element = byId.get(id)
-        if (element && op[succNumIdx] === 0) element.visible = true
+        if (element && visibleRow(op, op[succNumIdx], counters)) element.visible = true
       }
     }
   }
@@ -2281,14 +2330,13 @@ class BackendDoc {
   }
 
   sequenceElements(objectId) {
-    const object = parseOpId(objectId), elems = []
+    const object = parseOpId(objectId), elems = [], counters = []
     for (const block of this.blocks) {
       for (const column of block.columns) column.decoder.reset()
       while (!block.columns[actionIdx].decoder.done) {
         const op = readOperation(block.columns, this.actorIds)
         if (op[objCtrIdx] !== object.counter || op[objActorIdx] !== object.actorId || op[keyStrIdx] !== null) continue
-        const action = ACTIONS[op[actionIdx]], visible = op[succNumIdx] === 0
-        if (action === 'inc') continue
+        const action = ACTIONS[op[actionIdx]], visible = visibleRow(op, op[succNumIdx], counters)
         if (op[insertIdx]) {
           const mark = action !== 'mark' ? null : op[markNameIdx] === null ? 'end' : 'begin'
           elems.push({id: `${op[idCtrIdx]}@${op[idActorIdx]}`, mark, expand: !!op[expandIdx], visible})

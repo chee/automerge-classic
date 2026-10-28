@@ -56,7 +56,7 @@ function generator(rand) {
     if (typeof node === 'string') {
       if (!path.includes('')) out.push({path, kind: 'text', text: node})
     } else if (Array.isArray(node)) {
-      out.push({path, kind: 'list', length: node.length, counters: node.map(item => item instanceof Classic.Counter)})
+      out.push({path, kind: 'list', length: node.length})
       node.forEach((child, index) => objects(child, [...path, index], out))
     } else if (node !== null && Object.getPrototypeOf(node) === Object.prototype) {
       const conflicted = Object.keys(node).filter(key => Object.keys(Classic.getConflicts(node, key) || {}).length > 1)
@@ -85,7 +85,7 @@ function generator(rand) {
     }
     if (target.kind === 'list') {
       const index = int(target.length), count = 1 + int(Math.min(2, target.length - index))
-      if (target.length > 0 && rand() < 0.3 && !target.counters.slice(index, index + count).includes(true)) {
+      if (target.length > 0 && rand() < 0.3) {
         return (A, draft) => { A.deleteAt(resolve(draft), index, count) }
       }
       const at = int(target.length + 1)

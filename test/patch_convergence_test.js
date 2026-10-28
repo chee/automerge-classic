@@ -358,5 +358,114 @@ describe('patch convergence', () => {
       assert.strictEqual(Automerge.toJS(merged).c, 'gone')
       assert.strictEqual(Automerge.toJS(Automerge.load(Automerge.save(merged))).c, 'gone')
     })
+
+    it('deletes an incremented counter from a list', () => {
+      let doc = Automerge.from({l: [new Automerge.Counter(1), 'x', new Automerge.Counter(2)]}, ACTOR_A)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l[0].increment(2) })
+      const patches = []
+      doc = Automerge.change(doc, {time: 0, patchCallback: p => patches.push(...p)}, draft => { Automerge.deleteAt(draft.l, 0) })
+      assert.deepStrictEqual(patches, [{action: 'del', path: ['l', 0]}])
+      assert.deepStrictEqual(Automerge.decodeChange(Automerge.getLastLocalChange(doc)).ops.map(op => op.pred), [[`2@${ACTOR_A}`]])
+      assert.deepStrictEqual(plain(Automerge.toJS(doc)), {l: ['x', 2]})
+      assert.deepStrictEqual(plain(Automerge.toJS(Automerge.load(Automerge.save(doc)))), {l: ['x', 2]})
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l[1].increment(5) })
+      assert.deepStrictEqual(plain(Automerge.toJS(doc)), {l: ['x', 7]})
+      assert.deepStrictEqual(plain(Automerge.toJS(Automerge.load(Automerge.save(doc)))), {l: ['x', 7]})
+    })
+
+    it('deletes an incremented list counter concurrently with an increment', () => {
+      let base = Automerge.from({l: [new Automerge.Counter(1), 'x', new Automerge.Counter(2)]}, ACTOR_A)
+      base = Automerge.change(base, {time: 0}, draft => { draft.l[0].increment(2) })
+      let deleter = Automerge.merge(Automerge.init(ACTOR_B), base)
+      deleter = Automerge.change(deleter, {time: 0}, draft => { Automerge.deleteAt(draft.l, 0) })
+      let incrementer = Automerge.merge(Automerge.init('c'.repeat(32)), base)
+      incrementer = Automerge.change(incrementer, {time: 0}, draft => { draft.l[0].increment(1); draft.l[2].increment(1) })
+      const deletion = Automerge.getChanges(base, deleter), increments = Automerge.getChanges(base, incrementer)
+      const orders = [
+        [deletion, increments, [{action: 'inc', path: ['l', 1], value: 1}]],
+        [increments, deletion, [{action: 'del', path: ['l', 0]}]]
+      ]
+      for (const [first, second, expectedPatches] of orders) {
+        const patches = []
+        let doc = Automerge.applyChanges(Automerge.clone(base), first)[0]
+        doc = Automerge.applyChanges(doc, second, {patchCallback: p => patches.push(...p)})[0]
+        assert.deepStrictEqual(patches, expectedPatches)
+        assert.deepStrictEqual(plain(Automerge.toJS(doc)), {l: ['x', 3]})
+        assert.deepStrictEqual(plain(Automerge.toJS(Automerge.load(Automerge.save(doc)))), {l: ['x', 3]})
+      }
+      assert.deepStrictEqual(plain(Automerge.toJS(Automerge.merge(deleter, incrementer))), {l: ['x', 3]})
+      assert.deepStrictEqual(plain(Automerge.toJS(Automerge.merge(incrementer, deleter))), {l: ['x', 3]})
+    })
+
+    it('deletes several list elements including incremented counters in one splice', () => {
+      let doc = Automerge.from({l: ['a', new Automerge.Counter(1), new Automerge.Counter(2), 'b', new Automerge.Counter(3), 'c']}, ACTOR_A)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l[1].increment(5); draft.l[2].increment(1); draft.l[4].increment(7) })
+      let other = Automerge.merge(Automerge.init(ACTOR_B), doc)
+      other = Automerge.change(other, {time: 0}, draft => {
+        draft.l[1].increment(1)
+        draft.l[4].increment(1)
+        Automerge.insertAt(draft.l, 3, 'new')
+      })
+      const patches = []
+      doc = Automerge.change(doc, {time: 0, patchCallback: p => patches.push(...p)}, draft => { Automerge.deleteAt(draft.l, 1, 4) })
+      assert.deepStrictEqual(patches, [{action: 'del', path: ['l', 1], length: 4}])
+      assert.deepStrictEqual(plain(Automerge.toJS(doc)), {l: ['a', 'c']})
+      for (const merged of [Automerge.merge(Automerge.clone(doc), other), Automerge.merge(other, doc)]) {
+        assert.deepStrictEqual(plain(Automerge.toJS(merged)), {l: ['a', 'new', 'c']})
+        assert.deepStrictEqual(plain(Automerge.toJS(Automerge.load(Automerge.save(merged)))), {l: ['a', 'new', 'c']})
+      }
+    })
+
+    it('deletes incremented list counters across block boundaries', () => {
+      let base = Automerge.from({l: Array.from({length: 1000}, (_, i) => new Automerge.Counter(i))}, ACTOR_A)
+      base = Automerge.change(base, {time: 0}, draft => { for (let i = 0; i < 1000; i++) draft.l[i].increment(1) })
+      let deleter = Automerge.merge(Automerge.init(ACTOR_B), base)
+      deleter = Automerge.change(deleter, {time: 0}, draft => { for (let i = 998; i >= 0; i -= 2) Automerge.deleteAt(draft.l, i) })
+      let incrementer = Automerge.merge(Automerge.init('c'.repeat(32)), base)
+      incrementer = Automerge.change(incrementer, {time: 0}, draft => { for (let i = 0; i < 1000; i++) draft.l[i].increment(10) })
+      const expected = Array.from({length: 500}, (_, i) => 2 * i + 12)
+      for (const merged of [Automerge.merge(Automerge.clone(deleter), incrementer), Automerge.merge(incrementer, deleter)]) {
+        assert.deepStrictEqual(plain(Automerge.toJS(merged)).l, expected)
+        assert.deepStrictEqual(plain(Automerge.toJS(Automerge.load(Automerge.save(merged)))).l, expected)
+      }
+    })
+
+    it('keeps a concurrent value when an incremented list counter is deleted', () => {
+      const base = Automerge.from({l: ['x', 'y']}, ACTOR_A)
+      let counter = Automerge.merge(Automerge.init('c'.repeat(32)), base)
+      counter = Automerge.change(counter, {time: 0}, draft => { draft.l[0] = new Automerge.Counter(5) })
+      let value = Automerge.merge(Automerge.init(ACTOR_B), base)
+      value = Automerge.change(value, {time: 0}, draft => { draft.l[0] = 'b' })
+      let incrementer = Automerge.merge(Automerge.init('d'.repeat(32)), counter)
+      incrementer = Automerge.change(incrementer, {time: 0}, draft => { draft.l[0].increment(2) })
+      let deleter = Automerge.merge(Automerge.init('e'.repeat(32)), counter)
+      deleter = Automerge.change(deleter, {time: 0}, draft => { Automerge.deleteAt(draft.l, 0) })
+      let doc = Automerge.merge(Automerge.merge(Automerge.clone(counter), value), incrementer)
+      assert.deepStrictEqual(plain(Automerge.toJS(doc)), {l: [7, 'y']})
+      assert.deepStrictEqual(plain(Automerge.getConflicts(doc.l, 0)), {[`6@${ACTOR_B}`]: 'b', [`6@${'c'.repeat(32)}`]: 7})
+      doc = Automerge.merge(doc, deleter)
+      assert.deepStrictEqual(plain(Automerge.toJS(doc)), {l: ['b', 'y']})
+      assert.strictEqual(Automerge.getConflicts(doc.l, 0), undefined)
+      const loaded = Automerge.load(Automerge.save(doc))
+      assert.deepStrictEqual(plain(Automerge.toJS(loaded)), {l: ['b', 'y']})
+      assert.strictEqual(Automerge.getConflicts(loaded.l, 0), undefined)
+    })
+
+    it('resolves a list element conflict between counters by operation ID', () => {
+      const base = Automerge.from({l: ['x']}, ACTOR_A)
+      let low = Automerge.merge(Automerge.init(ACTOR_A), base)
+      low = Automerge.change(low, {time: 0}, draft => { draft.l[0] = new Automerge.Counter(1) })
+      low = Automerge.change(low, {time: 0}, draft => { draft.l[0].increment(1) })
+      let high = Automerge.merge(Automerge.init(ACTOR_B), base)
+      high = Automerge.change(high, {time: 0}, draft => { draft.l[0] = new Automerge.Counter(1) })
+      const conflicts = {[`4@${ACTOR_A}`]: 2, [`4@${ACTOR_B}`]: 1}
+      for (const doc of [Automerge.merge(Automerge.clone(low), high), Automerge.merge(high, low)]) {
+        assert.deepStrictEqual(plain(Automerge.toJS(doc)), {l: [1]})
+        assert.deepStrictEqual(plain(Automerge.getConflicts(doc.l, 0)), conflicts)
+        const loaded = Automerge.load(Automerge.save(doc))
+        assert.deepStrictEqual(plain(Automerge.toJS(loaded)), {l: [1]})
+        assert.deepStrictEqual(plain(Automerge.getConflicts(loaded.l, 0)), conflicts)
+      }
+    })
   })
 })

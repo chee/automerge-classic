@@ -147,7 +147,8 @@ function updateListObject(patch, obj, updated, textV2) {
     if (edit.action === 'insert' || edit.action === 'update') {
       const oldValues = conflicts[edit.index] || {}
       let lastValue = getStoredValue(edit.value, oldValues[edit.opId], updated, textV2)
-      const values = {[edit.opId]: lastValue}
+      let values = {[edit.opId]: lastValue}
+      const first = i
 
       // Successive updates for the same index are an indication of a conflict on that list element.
       // Edits are sorted in increasing order by Lamport timestamp, so the last value (with the
@@ -158,6 +159,11 @@ function updateListObject(patch, obj, updated, textV2) {
         const conflict = patch.edits[i]
         lastValue = getStoredValue(conflict.value, oldValues[conflict.opId], updated, textV2)
         values[conflict.opId] = lastValue
+      }
+      if (i > first) {
+        const opIds = Object.keys(values).sort(lamportCompare)
+        values = Object.fromEntries(opIds.map(opId => [opId, values[opId]]))
+        lastValue = values[opIds[opIds.length - 1]]
       }
 
       const visible = textV2 && lastValue instanceof Text ? lastValue.toJSON() : lastValue
@@ -177,7 +183,7 @@ function updateListObject(patch, obj, updated, textV2) {
         const elemId = `${startElemId.counter + index}@${startElemId.actorId}`
         const scalar = getStoredValue({ value, datatype }, undefined, updated, textV2)
         newValues.push(scalar)
-        newConflicts.push({[elemId]: {value: scalar, datatype, type: 'value'}})
+        newConflicts.push({[elemId]: scalar})
         newElems.push(elemId)
       })
       list.splice(edit.index, 0, ...newValues)
