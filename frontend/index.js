@@ -7,6 +7,7 @@ import { Context } from './context.js'
 import { Text } from './text.js'
 import { Counter } from './counter.js'
 import { Float64, Int, Uint } from './numbers.js'
+const MAX_CACHE_LAYER = 64
 /**
  * Actor IDs must consist only of hexadecimal digits so that they can be encoded
  * compactly in binary form.
@@ -34,31 +35,36 @@ function updateRootObject(doc, updated, state) {
     newDoc = cloneMapObject(doc[CACHE]._root, '_root')
     updated._root = newDoc
   }
-  for (let objectId of Object.keys(updated)) {
+  const updatedIds = Object.keys(updated)
+  for (let objectId of updatedIds) {
     reorderNewKeys(updated[objectId])
   }
+
+  const previous = doc[CACHE], base = Object.getPrototypeOf(previous)
+  const layered = base !== Object.prototype
+  const previousIds = layered ? Object.keys(previous) : []
+  let cache
+  if (previousIds.length + updatedIds.length > MAX_CACHE_LAYER) {
+    cache = {}
+    for (const objectId in previous) cache[objectId] = previous[objectId] // eslint-disable-line guard-for-in
+  } else {
+    cache = Object.create(layered ? base : previous)
+    for (const objectId of previousIds) cache[objectId] = previous[objectId]
+  }
+  for (const objectId of updatedIds) cache[objectId] = updated[objectId]
+
   Object.defineProperty(newDoc, OPTIONS,  {value: doc[OPTIONS]})
-  Object.defineProperty(newDoc, CACHE,    {value: updated})
+  Object.defineProperty(newDoc, CACHE,    {value: cache})
   Object.defineProperty(newDoc, STATE,    {value: state})
   if (interopAttach) interopAttach(newDoc)
 
   if (doc[OPTIONS].freeze) {
-    for (let objectId of Object.keys(updated)) {
+    for (let objectId of updatedIds) {
       const object = updated[objectId]
       if (object instanceof Text) object.chunks.forEach(chunk => Object.freeze(chunk))
       Object.freeze(object instanceof Text ? object.chunks : object[CONFLICTS])
       Object.freeze(object)
     }
-  }
-
-  for (let objectId of Object.keys(doc[CACHE])) {
-    if (!updated[objectId]) {
-      updated[objectId] = doc[CACHE][objectId]
-    }
-  }
-
-  if (doc[OPTIONS].freeze) {
-    Object.freeze(updated)
   }
   return newDoc
 }
@@ -172,7 +178,7 @@ function init(options) {
   Object.defineProperty(root, OBJECT_ID, {value: '_root'})
   Object.defineProperty(root, OPTIONS,   {value: Object.freeze(options)})
   Object.defineProperty(root, CONFLICTS, {value: Object.freeze({})})
-  Object.defineProperty(root, CACHE,     {value: Object.freeze(cache)})
+  Object.defineProperty(root, CACHE,     {value: cache})
   Object.defineProperty(root, STATE,     {value: Object.freeze(state)})
   if (interopAttach) interopAttach(root)
   return Object.freeze(root)

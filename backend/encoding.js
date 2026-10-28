@@ -9,11 +9,24 @@ const utf8encoder = new TextEncoder()
 const utf8decoder = new TextDecoder('utf-8')
 
 function stringToUtf8(string) {
-  return utf8encoder.encode(string)
+  if (string.length > 32) return utf8encoder.encode(string)
+  const bytes = new Uint8Array(string.length)
+  for (let i = 0; i < string.length; i++) {
+    const code = string.charCodeAt(i)
+    if (code > 127) return utf8encoder.encode(string)
+    bytes[i] = code
+  }
+  return bytes
 }
 
 function utf8ToString(buffer) {
-  return utf8decoder.decode(buffer)
+  if (buffer.byteLength > 7) return utf8decoder.decode(buffer)
+  let string = ''
+  for (let i = 0; i < buffer.byteLength; i++) {
+    if (buffer[i] > 127) return utf8decoder.decode(buffer)
+    string += String.fromCharCode(buffer[i])
+  }
+  return string
 }
 
 /**
@@ -21,8 +34,13 @@ function utf8ToString(buffer) {
  */
 function hexStringToBytes(value) {
   if (typeof value !== 'string') throw new TypeError('value is not a string')
-  if (!/^([0-9a-f][0-9a-f])*$/.test(value)) throw new RangeError('value is not hexadecimal')
-  return new Uint8Array((value.match(/../g) || []).map(b => parseInt(b, 16)))
+  if (value.length % 2 !== 0 || !/^[0-9a-f]*$/.test(value)) throw new RangeError('value is not hexadecimal')
+  const bytes = new Uint8Array(value.length >> 1)
+  for (let i = 0; i < bytes.length; i++) {
+    const high = value.charCodeAt(2 * i), low = value.charCodeAt(2 * i + 1)
+    bytes[i] = (high > 57 ? high - 87 : high - 48) << 4 | (low > 57 ? low - 87 : low - 48)
+  }
+  return bytes
 }
 
 const BYTE_TO_HEX = Array.from({length: 256}, (_, i) => i.toString(16).padStart(2, '0'))

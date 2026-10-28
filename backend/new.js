@@ -17,24 +17,12 @@ const PRED_COLUMN_IDS = CHANGE_COLUMNS
 
 const COLUMN_OPERATIONS = new WeakMap()
 const COLUMN_DATA = new WeakMap()
+const COLUMN_SPLICES = new WeakMap()
 const COLUMN_SLAB_OPTIONS = {slabRows: 24}
 
 function operationValueCount(column, value) {
   if ((column.columnId & 7) === COLUMN_TYPE.VALUE_RAW) return value ? value.byteLength : 0
   return Array.isArray(value) ? value.length : 1
-}
-
-function cacheColumnOperations(columns, operations) {
-  const offsets = columns.map(() => [0])
-  for (const operation of operations) {
-    for (let index = 0; index < columns.length; index++) {
-      const count = operationValueCount(columns[index], operation[index])
-      offsets[index].push(offsets[index][offsets[index].length - 1] + count)
-    }
-  }
-  const cache = {operations, offsets}
-  COLUMN_OPERATIONS.set(columns, cache)
-  return cache
 }
 
 function columnOperationCache(columns) {
@@ -44,7 +32,9 @@ function columnOperationCache(columns) {
   const operations = []
   while (!columns[actionIdx].decoder.done) operations.push(readOperation(columns))
   for (const column of columns) column.decoder.reset()
-  return cacheColumnOperations(columns, operations)
+  cache = {operations}
+  COLUMN_OPERATIONS.set(columns, cache)
+  return cache
 }
 
 function columnDataType(columnId) {
@@ -85,60 +75,61 @@ function columnDecoders(encoders) {
   return encoders.map(column => ({columnId: column.columnId, decoder: decoderByColumnId(column.columnId, column.encoder.buffer)}))
 }
 
-function makeDataColumn(template, data) {
-  let decoder
-  const column = {
-    columnId: template.columnId,
-    get decoder() {
-      if (!decoder) decoder = decoderByColumnId(template.columnId, ColumnData.toBuffer(data))
-      return decoder
-    }
+const DATA_COLUMN = {
+  get decoder() {
+    if (!this.cachedDecoder) this.cachedDecoder = decoderByColumnId(this.columnId, ColumnData.toBuffer(this.columnData))
+    return this.cachedDecoder
+  },
+  get columnData() {
+    return columnDataForColumns(this.columns)[this.index]
   }
-  if (template.columnName) column.columnName = template.columnName
-  Object.defineProperty(column, 'columnData', {value: data})
-  return column
+}
+
+function columnsFromOperations(template, operations) {
+  const columns = []
+  for (const {columnId, columnName} of template) {
+    const column = Object.create(DATA_COLUMN)
+    column.columnId = columnId
+    if (columnName) column.columnName = columnName
+    column.columns = columns
+    column.index = columns.length
+    column.cachedDecoder = undefined
+    columns.push(column)
+  }
+  COLUMN_OPERATIONS.set(columns, {operations})
+  return columns
 }
 
 function columnDataForColumns(columns) {
   let data = COLUMN_DATA.get(columns)
   if (data) return data
-  const operations = columnOperationCache(columns).operations
-  data = columns.map((column, index) => column.columnData || operationColumnData(operations, index, column.columnId))
+  const splice = COLUMN_SPLICES.get(columns)
+  if (splice) {
+    data = splice.data.map((column, index) => {
+      let start = 0, end = 0
+      for (let row = 0; row < splice.endRow; row++) {
+        const count = operationValueCount(columns[index], splice.operations[row][index])
+        if (row < splice.startRow) start += count
+        end += count
+      }
+      const inserted = operationColumnValues(splice.inserted, index, columns[index].columnId)
+      return ColumnData.splice(column, start, end - start, inserted)
+    })
+    COLUMN_SPLICES.delete(columns)
+  } else {
+    const operations = columnOperationCache(columns).operations
+    data = columns.map((column, index) => operationColumnData(operations, index, column.columnId))
+  }
   COLUMN_DATA.set(columns, data)
   return data
 }
 
-function columnsFromOperations(template, operations) {
-  const data = template.map((column, index) => operationColumnData(operations, index, column.columnId))
-  const columns = template.map((column, index) => makeDataColumn(column, data[index]))
-  COLUMN_DATA.set(columns, data)
-  cacheColumnOperations(columns, operations)
-  return columns
-}
-
-function spliceColumns(columns, startRow, endRow, operations, outputOperations) {
-  const cache = columnOperationCache(columns)
-  const data = columnDataForColumns(columns).map((column, index) => {
-    const inserted = operationColumnValues(operations, index, columns[index].columnId)
-    const start = cache.offsets[index][startRow]
-    const end = cache.offsets[index][endRow]
-    return ColumnData.splice(column, start, end - start, inserted)
-  })
-  const output = columns.map((column, index) => makeDataColumn(column, data[index]))
-  COLUMN_DATA.set(output, data)
-  const offsets = columns.map((column, columnIndex) => {
-    const oldOffsets = cache.offsets[columnIndex]
-    const result = oldOffsets.slice(0, startRow + 1)
-    let offset = result[result.length - 1]
-    for (const operation of operations) {
-      offset += operationValueCount(column, operation[columnIndex])
-      result.push(offset)
-    }
-    const delta = offset - oldOffsets[endRow]
-    for (let row = endRow + 1; row < oldOffsets.length; row++) result.push(oldOffsets[row] + delta)
-    return result
-  })
-  COLUMN_OPERATIONS.set(output, {operations: outputOperations, offsets})
+function spliceColumns(columns, startRow, endRow, inserted, outputOperations) {
+  const output = columnsFromOperations(columns, outputOperations)
+  const data = COLUMN_DATA.get(columns)
+  if (data) {
+    COLUMN_SPLICES.set(output, {data, operations: COLUMN_OPERATIONS.get(columns).operations, startRow, endRow, inserted})
+  }
   return output
 }
 
@@ -228,6 +219,11 @@ function deepCopyUpdate(objectTree, path, value) {
     deepCopyUpdate(child, path.slice(1), value)
     objectTree[path[0]] = child
   }
+}
+
+function writableObjectMeta(docState) {
+  if (docState.objectMeta === docState.sharedObjectMeta) docState.objectMeta = Object.assign({}, docState.objectMeta)
+  return docState.objectMeta
 }
 
 function visibleRow(row, succNum, counters) {
@@ -769,6 +765,7 @@ function splitBlock(block, maxBlockSize, operations) {
     let columns
     if (operations) {
       columns = columnsFromOperations(block.columns, operations.slice(opsSoFar, opsSoFar + opsToCopy))
+      columnDataForColumns(columns)
     } else {
       const encoders = columnEncoders(block.columns)
       copyColumns(encoders, block.columns, opsToCopy)
@@ -807,7 +804,17 @@ function concatBlocks(blocks) {
   const encoders = columnEncoders(blocks[0].columns)
 
   for (let block of blocks) {
-    if (block.columns.every(column => column.columnData)) {
+    const cache = COLUMN_DATA.has(block.columns) ? null : COLUMN_OPERATIONS.get(block.columns)
+    if (cache) {
+      for (let index = 0; index < encoders.length; index++) {
+        const {columnId, encoder} = encoders[index]
+        if ((columnId & 7) === COLUMN_TYPE.VALUE_RAW) {
+          for (const operation of cache.operations) if (operation[index]) encoder.appendRawBytes(operation[index])
+        } else {
+          for (const value of operationColumnValues(cache.operations, index, columnId)) encoder.appendValue(value)
+        }
+      }
+    } else if (block.columns.every(column => column.columnData)) {
       for (let index = 0; index < block.columns.length; index++) {
         appendColumnData(encoders[index].encoder, block.columns[index])
       }
@@ -1260,8 +1267,9 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   // When the change contains a new make* operation (i.e. with an even-numbered action), record the
   // new parent-child relationship in objectMeta. TODO: also handle link/move operations.
   if (op[actionIdx] % 2 === 0 && !docState.objectMeta[opId]) {
-    docState.objectMeta[opId] = {parentObj: objectId, parentKey: elemId, opId, type, children: {}}
-    deepCopyUpdate(docState.objectMeta, [objectId, 'children', elemId, opId], {objectId: opId, type, props: {}})
+    const objectMeta = writableObjectMeta(docState)
+    objectMeta[opId] = {parentObj: objectId, parentKey: elemId, opId, type, children: {}}
+    deepCopyUpdate(objectMeta, [objectId, 'children', elemId, opId], {objectId: opId, type, props: {}})
   }
 
   // firstOp is true if the current operation is the first of a sequence of ops for the same key
@@ -1361,7 +1369,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
     }
 
     // Copy so that objectMeta is not modified if an exception is thrown while applying change
-    deepCopyUpdate(docState.objectMeta, [objectId, 'children', elemId], values)
+    deepCopyUpdate(writableObjectMeta(docState), [objectId, 'children', elemId], values)
   }
 
   let patchKey = emissions.length > 0 ? emissions[0][0] : undefined
@@ -2026,14 +2034,15 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
 
   for (let change of decodedChanges) {
     // Skip any duplicate changes that we have already seen
-    if (docState.changeIndexByHash[change.hash] !== undefined || changeHashes.has(change.hash)) continue
+    if (docState.changeIndexByHash[change.hash] !== undefined || docState.appliedHashes.has(change.hash) ||
+        changeHashes.has(change.hash)) continue
 
     const expectedSeq = (clock[change.actor] || 0) + 1
     let causallyReady = true
 
     for (let dep of change.deps) {
       const depIndex = docState.changeIndexByHash[dep]
-      if ((depIndex === undefined || depIndex === -1) && !changeHashes.has(dep)) {
+      if ((depIndex === undefined || depIndex === -1) && !docState.appliedHashes.has(dep) && !changeHashes.has(dep)) {
         causallyReady = false
       }
     }
@@ -2421,12 +2430,14 @@ class BackendDoc {
     }
 
     // decoded change has the form { actor, seq, startOp, time, message, deps, actorIds, hash, columns, buffer }
-    let decodedChanges = changeBuffers.map(buffer => {
+    return this.applyDecodedChanges(changeBuffers.map(buffer => {
       const decoded = decodeChangeColumns(buffer)
       decoded.buffer = buffer
       return decoded
-    })
+    }), isLocal)
+  }
 
+  applyDecodedChanges(decodedChanges, isLocal) {
     let queue = this.queue.concat(decodedChanges)
     if (!this.haveHashGraph) {
       const hashes = new Set(queue.map(change => change.hash))
@@ -2440,14 +2451,16 @@ class BackendDoc {
     let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
     let docState = {
       maxOp: this.maxOp,
-      changeIndexByHash: Object.create(this.changeIndexByHash),
+      changeIndexByHash: this.changeIndexByHash,
+      appliedHashes: new Set(),
       actorIds: this.actorIds,
       actorIndexById: new Map(this.actorIndexById),
       heads: this.heads,
       clock: this.clock,
       blocks: this.blocks.slice(),
       visibleMapOps: {base: this.visibleMapOps, changes: new Map()},
-      objectMeta: Object.assign({}, this.objectMeta),
+      objectMeta: this.objectMeta,
+      sharedObjectMeta: this.objectMeta,
       objectsWithMarks: new Set(this.objectsWithMarks)
     }
     let allApplied = [], objectIds = new Set()
@@ -2455,9 +2468,7 @@ class BackendDoc {
     while (true) {
       const [applied, enqueued] = applyChanges(patches, queue, docState, objectIds, this.haveHashGraph)
       queue = enqueued
-      for (let i = 0; i < applied.length; i++) {
-        docState.changeIndexByHash[applied[i].hash] = this.changes.length + allApplied.length + i
-      }
+      for (const change of applied) docState.appliedHashes.add(change.hash)
       if (applied.length > 0) allApplied = allApplied.concat(applied)
       if (queue.length === 0) break
 
@@ -2466,10 +2477,7 @@ class BackendDoc {
       if (applied.length === 0) {
         if (this.haveHashGraph) break
         this.computeHashGraph()
-        docState.changeIndexByHash = Object.create(this.changeIndexByHash)
-        for (let i = 0; i < allApplied.length; i++) {
-          docState.changeIndexByHash[allApplied[i].hash] = this.changes.length + i
-        }
+        docState.changeIndexByHash = this.changeIndexByHash
       }
     }
 

@@ -1,4 +1,4 @@
-import { encodeChange, splitContainers } from './columnar.js'
+import { encodeChangeColumns, splitContainers } from './columnar.js'
 import { decodeBundle, encodeBundle, encodeDocumentBundle } from './bundle.js'
 import { BackendDoc } from './new.js'
 import { documentOps } from './fragments.js'
@@ -72,14 +72,14 @@ function applyLocalChange(backend, change) {
   }
 
   state.adjustInsertAnchors(change)
-  const binaryChange = encodeChange(change)
-  const patch = state.applyChanges([binaryChange], true)
+  const decoded = encodeChangeColumns(change)
+  const patch = state.applyDecodedChanges([decoded], true)
   backend.frozen = true
 
   // On the patch we send out, omit the last local change hash
   const lastHash = hashByActor(state, change.actor, change.seq - 1)
   patch.deps = patch.deps.filter(head => head !== lastHash)
-  return [{state, heads: state.heads}, patch, binaryChange, state.changes.length === changesBefore + 1]
+  return [{state, heads: state.heads}, patch, decoded.buffer, state.changes.length === changesBefore + 1]
 }
 
 /**

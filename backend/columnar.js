@@ -669,11 +669,15 @@ function decodeColumnInfo(decoder) {
 }
 
 function encodeColumnInfo(encoder, columns) {
-  const nonEmptyColumns = columns.filter(column => column.encoder.buffer.byteLength > 0)
+  const nonEmptyColumns = []
+  for (const column of columns) {
+    const byteLength = column.encoder.buffer.byteLength
+    if (byteLength > 0) nonEmptyColumns.push([column.columnId, byteLength])
+  }
   encoder.appendUint53(nonEmptyColumns.length)
-  for (let column of nonEmptyColumns) {
-    encoder.appendUint53(column.columnId)
-    encoder.appendUint53(column.encoder.buffer.byteLength)
+  for (const [columnId, byteLength] of nonEmptyColumns) {
+    encoder.appendUint53(columnId)
+    encoder.appendUint53(byteLength)
   }
 }
 
@@ -753,6 +757,10 @@ function decodeContainerHeader(decoder, computeHash) {
 }
 
 function encodeChange(changeObj, actorOrder) {
+  return encodeChangeColumns(changeObj, actorOrder).buffer
+}
+
+function encodeChangeColumns(changeObj, actorOrder) {
   if (changeObj.hash !== undefined && changeObj.hash !== null &&
       (typeof changeObj.hash !== 'string' || !/^[0-9a-f]{64}$/i.test(changeObj.hash))) {
     throw new RangeError('Change hash must be a 32-byte hexadecimal string')
@@ -767,31 +775,48 @@ function encodeChange(changeObj, actorOrder) {
     }
     extraBytes = new Uint8Array(change.extra_bytes)
   }
-  return encodeChangeContainer(change, actorIds, extraBytes).bytes
+  return encodeChangeContainer(change, actorIds, extraBytes)
 }
 
 function encodeChangeContainer(change, actorIds, extraBytes) {
+  if (!Array.isArray(change.deps)) throw new TypeError('deps is not an array')
+  const deps = change.deps.slice().sort(), message = change.message || ''
+  let columns
   const { hash, bytes } = encodeContainer(CHUNK_TYPE_CHANGE, encoder => {
-    if (!Array.isArray(change.deps)) throw new TypeError('deps is not an array')
-    encoder.appendUint53(change.deps.length)
-    for (let hash of change.deps.slice().sort()) {
+    encoder.appendUint53(deps.length)
+    for (let hash of deps) {
       encoder.appendRawBytes(hexStringToBytes(hash))
     }
     encoder.appendHexString(change.actor)
     encoder.appendUint53(change.seq)
     encoder.appendUint53(change.startOp)
     encoder.appendInt53(change.time)
-    encoder.appendPrefixedString(change.message || '')
+    encoder.appendPrefixedString(message)
     encoder.appendUint53(actorIds.length - 1)
     for (let actor of actorIds.slice(1)) encoder.appendHexString(actor)
 
-    const columns = encodeOps(change.ops)
-    encodeColumnInfo(encoder, columns)
-    for (let column of columns) encoder.appendRawBytes(column.encoder.buffer)
+    columns = []
+    for (const column of encodeOps(change.ops)) {
+      const buffer = column.encoder.buffer
+      if (buffer.byteLength > 0) columns.push({columnId: column.columnId, bufferLen: buffer.byteLength, buffer})
+    }
+    encoder.appendUint53(columns.length)
+    for (const column of columns) {
+      encoder.appendUint53(column.columnId)
+      encoder.appendUint53(column.bufferLen)
+    }
+    for (const column of columns) encoder.appendRawBytes(column.buffer)
     if (extraBytes) encoder.appendRawBytes(extraBytes)
   })
 
-  return {hash, bytes: (bytes.byteLength >= DEFLATE_MIN_SIZE) ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, deflateRaw) : bytes}
+  const decoded = {
+    actor: change.actor, seq: change.seq, startOp: change.startOp, time: change.time, message, deps, actorIds
+  }
+  if (extraBytes && extraBytes.byteLength > 0) decoded.extraBytes = extraBytes
+  decoded.columns = columns
+  decoded.hash = bytesToHexString(hash)
+  decoded.buffer = (bytes.byteLength >= DEFLATE_MIN_SIZE) ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, deflateRaw) : bytes
+  return decoded
 }
 
 function decodeChangeColumns(buffer) {
@@ -1125,7 +1150,7 @@ function documentChanges(buffer) {
   }
 
   const numActors = actorIds.length
-  const readActor = decoder => {
+  function readActor(decoder) {
     const actorNum = decoder.readValue()
     if (actorNum !== null && !actorIds[actorNum]) throw new RangeError(`No actor index ${actorNum}`)
     return actorNum
@@ -1231,7 +1256,7 @@ function documentChanges(buffer) {
       for (const pred of op.pred) used.add(pred.actorNum)
     }
     used.delete(change.actorNum)
-    const changeActors = [change.actorNum].concat([...used].sort((a, b) => actorIds[a] < actorIds[b] ? -1 : 1))
+    const changeActors = [change.actorNum].concat([...used].sort((a, b) => (actorIds[a] < actorIds[b] ? -1 : 1)))
     const actorIndex = new Map(changeActors.map((actorNum, index) => [actorNum, index]))
     const changeOps = change.ops.map(op => ({
       obj: op.objCtr === null ? '_root' : {counter: op.objCtr, actorNum: actorIndex.get(op.objActor)},
@@ -1251,14 +1276,13 @@ function documentChanges(buffer) {
       headSet.delete(hashes[index])
       return hashes[index]
     }).sort()
-    const { hash, bytes } = encodeChangeContainer(
+    const { hash, buffer } = encodeChangeContainer(
       {actor, seq: change.seq, startOp, time: change.time, message: change.message, deps, ops: changeOps},
       changeActors.map(actorNum => actorIds[actorNum]), change.extraBytes
     )
-    const hexHash = bytesToHexString(hash)
-    hashes.push(hexHash)
-    headSet.add(hexHash)
-    result.push({actor, seq: change.seq, deps, hash: hexHash, numOps: change.ops.length, bytes})
+    hashes.push(hash)
+    headSet.add(hash)
+    result.push({actor, seq: change.seq, deps, hash, numOps: change.ops.length, bytes: buffer})
   }
 
   const actualHeads = [...headSet].sort()
@@ -1292,6 +1316,6 @@ export {
   COLUMN_TYPE, VALUE_TYPE, ACTIONS, OBJECT_TYPE, DOC_OPS_COLUMNS, CHANGE_COLUMNS, DOCUMENT_COLUMNS,
   encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue, decodeColumns, decodeOps, encodeOp,
   encodeColumnInfo, decodeColumnInfo, encodeContainer, decodeContainerHeader, deflateColumn, inflateColumn,
-  splitContainers, encodeChange, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
+  splitContainers, encodeChange, encodeChangeColumns, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
   encodeDocumentHeader, decodeDocumentHeader, documentChanges
 }

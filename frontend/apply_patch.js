@@ -3,7 +3,7 @@ import { CONFLICTS, ELEM_IDS, NEW_KEYS, OBJECT_ID } from './constants.js'
 // Set of patch objects already applied in the current patch application (a
 // non-enumerable property of the `updated` map)
 const APPLIED_PATCHES = Symbol('_appliedPatches')
-import { Text, instantiateText, elemAt, spliceChunks, strings } from './text.js'
+import { Text, elemAt, instantiateText, spliceChunks, strings } from './text.js'
 import { Counter } from './counter.js'
 import { ImmutableString } from '../src/immutable_string.js'
 /**
@@ -210,7 +210,9 @@ function updateTextObject(patch, obj, updated, textV2) {
   let chunks = base ? base.chunks : [], length = base ? base.length : 0
   let str = base ? base.toJSON() : ''
   if (str.length !== length) str = undefined
-  const char = value => typeof value === 'string' ? value : '\ufffc'
+  function char(value) {
+    return typeof value === 'string' ? value : '\ufffc'
+  }
 
   for (const edit of patch.edits) {
     if (edit.action === 'insert') {
