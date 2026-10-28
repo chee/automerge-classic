@@ -1,3 +1,4 @@
+import { equalBytes } from '../src/common.js'
 import { BooleanDecoder, BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, RLEDecoder, RLEEncoder } from './encoding.js'
 const DEFAULT_SLAB_ROWS = 1024
 const DEFAULT_SLAB_BYTES = 64 * 1024
@@ -19,20 +20,16 @@ function checkLimit(value, name) {
   return value
 }
 
-function normalizeOptions(options) {
-  let slabRows, slabBytes
-  if (options === undefined) options = {}
+function normalizeOptions(options = {}) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) {
     throw new TypeError('options must be an object')
   }
   for (let key of Object.keys(options)) {
     if (key !== 'slabRows' && key !== 'slabBytes') throw new RangeError(`unsupported column option: ${key}`)
   }
-  slabRows = options.slabRows === undefined ? DEFAULT_SLAB_ROWS : options.slabRows
-  slabBytes = options.slabBytes === undefined ? DEFAULT_SLAB_BYTES : options.slabBytes
   return {
-    slabRows: checkLimit(slabRows, 'slabRows'),
-    slabBytes: checkLimit(slabBytes, 'slabBytes')
+    slabRows: checkLimit(options.slabRows === undefined ? DEFAULT_SLAB_ROWS : options.slabRows, 'slabRows'),
+    slabBytes: checkLimit(options.slabBytes === undefined ? DEFAULT_SLAB_BYTES : options.slabBytes, 'slabBytes')
   }
 }
 
@@ -88,14 +85,6 @@ function encodeValues(type, values) {
   return encoder.buffer
 }
 
-function equalBytes(left, right) {
-  if (left.byteLength !== right.byteLength) return false
-  for (let index = 0; index < left.byteLength; index++) {
-    if (left[index] !== right[index]) return false
-  }
-  return true
-}
-
 function decodeValues(type, data, rows, canonical) {
   if (type === 'raw') {
     if (data.byteLength !== rows) throw new RangeError('encoded row count does not match logical length')
@@ -132,18 +121,13 @@ function encodeSlabs(type, values, options) {
   return slabs
 }
 
-function addStarts(slabs) {
-  let start = 0
-  return slabs.map(slab => {
-    const result = {start, rows: slab.rows, data: slab.data}
-    start += slab.rows
+function makeColumn(type, slabs, options) {
+  let length = 0
+  const withStarts = slabs.map(slab => {
+    const result = {start: length, rows: slab.rows, data: slab.data}
+    length += slab.rows
     return result
   })
-}
-
-function makeColumn(type, slabs, options) {
-  const withStarts = addStarts(slabs)
-  const length = withStarts.length === 0 ? 0 : withStarts[withStarts.length - 1].start + withStarts[withStarts.length - 1].rows
   const column = {type, length, slabRows: options.slabRows, slabBytes: options.slabBytes, slabs: withStarts}
   VALID_COLUMNS.add(column)
   return column
@@ -181,10 +165,8 @@ function loadSlabs(type, slabs, length, options) {
   let total = 0
   if (!Array.isArray(slabs)) throw new TypeError('slabs must be an array')
   const loaded = slabs.map(slab => {
-    let rows, data
     if (slab === null || typeof slab !== 'object' || Array.isArray(slab)) throw new TypeError('slab must be an object')
-    rows = checkLimit(slab.rows, 'slab rows')
-    data = slab.data
+    const rows = checkLimit(slab.rows, 'slab rows'), data = slab.data
     if (!(data instanceof Uint8Array)) throw new TypeError('slab data must be a Uint8Array')
     decodeValues(type, data, rows, true)
     total += rows
@@ -197,10 +179,9 @@ function loadSlabs(type, slabs, length, options) {
 }
 
 function loadSaved(saved, overrides) {
-  let options
   if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) throw new TypeError('saved column must be an object')
   checkType(saved.type)
-  options = normalizeOptions(overrides === undefined ? {
+  const options = normalizeOptions(overrides === undefined ? {
     slabRows: saved.slabRows,
     slabBytes: saved.slabBytes
   } : overrides)
@@ -208,7 +189,6 @@ function loadSaved(saved, overrides) {
 }
 
 function loadColumn(type, source, length, options) {
-  let normalized
   if (typeof type !== 'string') {
     if (source !== undefined && (source === null || typeof source !== 'object' || Array.isArray(source))) {
       throw new TypeError('options must be an object')
@@ -218,18 +198,16 @@ function loadColumn(type, source, length, options) {
   checkType(type)
   if (source instanceof Uint8Array) {
     checkCount(length, 'column length')
-    normalized = normalizeOptions(options)
+    const normalized = normalizeOptions(options)
     decodeValues(type, source, length, true)
-    if (length === 0) return makeColumn(type, [], normalized)
-    return makeColumn(type, [{rows: length, data: source}], normalized)
+    return makeColumn(type, length === 0 ? [] : [{rows: length, data: source}], normalized)
   }
   if (Array.isArray(source)) {
     if (length !== undefined && typeof length === 'object') {
       options = length
       length = undefined
     }
-    normalized = normalizeOptions(options)
-    return loadSlabs(type, source, length, normalized)
+    return loadSlabs(type, source, length, normalizeOptions(options))
   }
   throw new TypeError('column source must be a Uint8Array or an array of slabs')
 }
@@ -270,7 +248,6 @@ function get(column, index) {
 }
 
 function *range(column, start, end) {
-  let slabIndex
   if (start === undefined) start = 0
   checkColumn(column)
   checkIndex(column, start, true)
@@ -278,7 +255,7 @@ function *range(column, start, end) {
   checkIndex(column, end, true)
   if (end < start) throw new RangeError('range end precedes start')
   if (start === end) return
-  slabIndex = findSlab(column, start)
+  let slabIndex = findSlab(column, start)
   while (slabIndex < column.slabs.length) {
     const slab = column.slabs[slabIndex]
     const values = slabValues(column, slab)
@@ -296,32 +273,30 @@ function clone(column) {
 }
 
 function splice(column, index, deleteCount, inserted = []) {
-  let end, leftIndex, rightIndex, leftSlab, rightSlab, leftValues, rightValues
-  let prefix, suffix, middle, options
   checkColumn(column)
   checkIndex(column, index, true)
   checkCount(deleteCount, 'deleteCount')
   if (deleteCount > column.length - index) throw new RangeError('deleteCount out of bounds')
   checkValues(column.type, inserted)
   if (deleteCount === 0 && inserted.length === 0) return clone(column)
-  end = index + deleteCount
-  leftIndex = index < column.length ? findSlab(column, index) : column.slabs.length
-  rightIndex = end < column.length ? findSlab(column, end) : column.slabs.length
-  leftSlab = leftIndex < column.slabs.length ? column.slabs[leftIndex] : undefined
-  rightSlab = rightIndex < column.slabs.length ? column.slabs[rightIndex] : undefined
-  prefix = column.slabs.slice(0, leftIndex)
-  suffix = column.slabs.slice(rightIndex + (rightSlab && end > rightSlab.start ? 1 : 0))
-  middle = []
+  const end = index + deleteCount
+  const leftIndex = index < column.length ? findSlab(column, index) : column.slabs.length
+  const rightIndex = end < column.length ? findSlab(column, end) : column.slabs.length
+  const leftSlab = column.slabs[leftIndex], rightSlab = column.slabs[rightIndex]
+  const prefix = column.slabs.slice(0, leftIndex)
+  const suffix = column.slabs.slice(rightIndex + (rightSlab && end > rightSlab.start ? 1 : 0))
+  const middle = []
+  let leftValues
   if (leftSlab && leftSlab.start < index) {
     leftValues = slabValues(column, leftSlab)
     middle.push(...leftValues.slice(0, index - leftSlab.start))
   }
   middle.push(...inserted)
   if (rightSlab && end > rightSlab.start) {
-    rightValues = rightSlab === leftSlab && leftValues ? leftValues : slabValues(column, rightSlab)
+    const rightValues = rightSlab === leftSlab && leftValues ? leftValues : slabValues(column, rightSlab)
     middle.push(...rightValues.slice(end - rightSlab.start))
   }
-  options = {slabRows: column.slabRows, slabBytes: column.slabBytes}
+  const options = {slabRows: column.slabRows, slabBytes: column.slabBytes}
   return makeColumn(column.type, prefix.concat(encodeSlabs(column.type, middle, options), suffix), options)
 }
 

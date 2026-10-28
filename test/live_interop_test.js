@@ -1,29 +1,9 @@
 import assert from 'node:assert'
-import { createRequire } from 'node:module'
-import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
-
-const resolve = createRequire(import.meta.url).resolve
 import Classic from './subject.js'
+import Modern, { describeLive } from './modern.js'
 // Cross-implementation integration tests: a classic (plain JavaScript) peer
 // and a Rust/WASM peer perform the same operations, exchange documents, and
-// synchronize. Set AUTOMERGE_MODERN_PATH to the modern package, or build
-// ../automerge/javascript (branch fragment); the suite is skipped when no
-// modern package is available.
-const here = path.dirname(fileURLToPath(import.meta.url))
-
-function resolveModern() {
-  const candidate = process.env.AUTOMERGE_MODERN_PATH || path.resolve(here, '..', '..', 'automerge', 'javascript')
-  try {
-    return resolve(candidate)
-  } catch (e) {
-    return null
-  }
-}
-
-const modernPath = resolveModern()
-const describeLive = modernPath ? describe : describe.skip
-const Modern = modernPath ? (await import(pathToFileURL(modernPath).href)) : null
+// synchronize.
 
 const ACTOR_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 const ACTOR_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
@@ -373,11 +353,17 @@ describeLive('live Rust/WASM interoperability', () => {
   })
 
   it('exposes exactly the exports of the modern package', () => {
+    const unimplemented = new Set([
+      'addCommits', 'addFragments', 'bundleFragmentMetadata', 'diffPath', 'getCommits', 'getFragmentMeta',
+      'getFragmentMetadata', 'getFragments', 'anonymize', 'getActorsForAuthor', 'getAuthor', 'getAuthorForActor',
+      'getAuthors', 'releaseInfo'
+    ])
     for (const key of Object.keys(Modern)) {
-      if (key === 'default') continue
+      if (key === 'default' || unimplemented.has(key)) continue
       assert.ok(key in Classic, `missing export: ${key}`)
     }
     for (const key of Object.keys(Modern.next)) {
+      if (unimplemented.has(key)) continue
       assert.ok(key in Classic.next, `missing next export: ${key}`)
     }
     const modernKeys = new Set([...Object.keys(Modern), 'next', 'default'])

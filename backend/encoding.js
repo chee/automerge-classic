@@ -20,33 +20,19 @@ function utf8ToString(buffer) {
  * Converts a string consisting of hexadecimal digits into an Uint8Array.
  */
 function hexStringToBytes(value) {
-  if (typeof value !== 'string') {
-    throw new TypeError('value is not a string')
-  }
-  if (!/^([0-9a-f][0-9a-f])*$/.test(value)) {
-    throw new RangeError('value is not hexadecimal')
-  }
-  if (value === '') {
-    return new Uint8Array(0)
-  } else {
-    return new Uint8Array(value.match(/../g).map(b => parseInt(b, 16)))
-  }
+  if (typeof value !== 'string') throw new TypeError('value is not a string')
+  if (!/^([0-9a-f][0-9a-f])*$/.test(value)) throw new RangeError('value is not hexadecimal')
+  return new Uint8Array((value.match(/../g) || []).map(b => parseInt(b, 16)))
 }
 
-const NIBBLE_TO_HEX = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
-const BYTE_TO_HEX = new Array(256)
-for (let i = 0; i < 256; i++) {
-  BYTE_TO_HEX[i] = `${NIBBLE_TO_HEX[(i >>> 4) & 0xf]}${NIBBLE_TO_HEX[i & 0xf]}`;
-}
+const BYTE_TO_HEX = Array.from({length: 256}, (_, i) => i.toString(16).padStart(2, '0'))
 
 /**
  * Converts a Uint8Array into the equivalent hexadecimal string.
  */
 function bytesToHexString(bytes) {
-  let hex = '', len = bytes.byteLength
-  for (let i = 0; i < len; i++) {
-    hex += BYTE_TO_HEX[bytes[i]]
-  }
+  let hex = ''
+  for (let i = 0; i < bytes.byteLength; i++) hex += BYTE_TO_HEX[bytes[i]]
   return hex
 }
 
@@ -92,7 +78,6 @@ class Encoder {
     const newBuf = new Uint8Array(newSize)
     newBuf.set(this.buf, 0)
     this.buf = newBuf
-    return this
   }
 
   /**
@@ -100,8 +85,7 @@ class Encoder {
    */
   appendByte(value) {
     if (this.offset >= this.buf.byteLength) this.grow()
-    this.buf[this.offset] = value
-    this.offset += 1
+    this.buf[this.offset++] = value
   }
 
   /**
@@ -254,15 +238,6 @@ class Encoder {
   }
 
   /**
-   * Appends a UTF-8 string to the buffer, without any metadata. Returns the
-   * number of bytes appended.
-   */
-  appendRawString(value) {
-    if (typeof value !== 'string') throw new TypeError('value is not a string')
-    return this.appendRawBytes(stringToUtf8(value))
-  }
-
-  /**
    * Appends the contents of byte buffer `data` to the buffer, prefixed with the
    * number of bytes in the buffer (as a LEB128-encoded unsigned integer).
    */
@@ -278,8 +253,7 @@ class Encoder {
    */
   appendPrefixedString(value) {
     if (typeof value !== 'string') throw new TypeError('value is not a string')
-    this.appendPrefixedBytes(stringToUtf8(value))
-    return this
+    return this.appendPrefixedBytes(stringToUtf8(value))
   }
 
   /**
@@ -288,8 +262,7 @@ class Encoder {
    * with its length in bytes.
    */
   appendHexString(value) {
-    this.appendPrefixedBytes(hexStringToBytes(value))
-    return this
+    return this.appendPrefixedBytes(hexStringToBytes(value))
   }
 
   /**
@@ -345,8 +318,7 @@ class Decoder {
    * Reads one byte (0 to 255) from the buffer.
    */
   readByte() {
-    this.offset += 1
-    return this.buf[this.offset - 1]
+    return this.buf[this.offset++]
   }
 
   /**
@@ -516,14 +488,6 @@ class Decoder {
   }
 
   /**
-   * Extracts `length` bytes from the buffer, starting from the current position,
-   * and returns the UTF-8 string decoding of those bytes.
-   */
-  readRawString(length) {
-    return utf8ToString(this.readRawBytes(length))
-  }
-
-  /**
    * Extracts a subarray from the current position in the buffer, prefixed with
    * its length in bytes (encoded as an unsigned LEB128 integer).
    */
@@ -593,78 +557,24 @@ class RLEEncoder extends Encoder {
    */
   _appendValue(value, repetitions = 1) {
     if (repetitions <= 0) return
-    if (this.state === 'empty') {
-      this.state = (value === null ? 'nulls' : (repetitions === 1 ? 'loneValue' : 'repetition'))
+    const state = this.state, open = state === 'loneValue' || state === 'literal'
+    if (value === null ? state === 'nulls' : state === 'repetition' && value === this.lastValue) {
+      this.count += repetitions
+    } else if (open && value === this.lastValue) {
+      if (state === 'literal') this.flush()
+      this.state = 'repetition'
+      this.count = 1 + repetitions
+    } else if (open && value !== null && repetitions === 1) {
+      if (state === 'loneValue') this.literal = []
+      this.literal.push(this.lastValue)
+      this.state = 'literal'
+      this.lastValue = value
+    } else {
+      if (state === 'literal') this.literal.push(this.lastValue)
+      this.flush()
+      this.state = value === null ? 'nulls' : (repetitions === 1 ? 'loneValue' : 'repetition')
       this.lastValue = value
       this.count = repetitions
-    } else if (this.state === 'loneValue') {
-      if (value === null) {
-        this.flush()
-        this.state = 'nulls'
-        this.count = repetitions
-      } else if (value === this.lastValue) {
-        this.state = 'repetition'
-        this.count = 1 + repetitions
-      } else if (repetitions > 1) {
-        this.flush()
-        this.state = 'repetition'
-        this.count = repetitions
-        this.lastValue = value
-      } else {
-        this.state = 'literal'
-        this.literal = [this.lastValue]
-        this.lastValue = value
-      }
-    } else if (this.state === 'repetition') {
-      if (value === null) {
-        this.flush()
-        this.state = 'nulls'
-        this.count = repetitions
-      } else if (value === this.lastValue) {
-        this.count += repetitions
-      } else if (repetitions > 1) {
-        this.flush()
-        this.state = 'repetition'
-        this.count = repetitions
-        this.lastValue = value
-      } else {
-        this.flush()
-        this.state = 'loneValue'
-        this.lastValue = value
-      }
-    } else if (this.state === 'literal') {
-      if (value === null) {
-        this.literal.push(this.lastValue)
-        this.flush()
-        this.state = 'nulls'
-        this.count = repetitions
-      } else if (value === this.lastValue) {
-        this.flush()
-        this.state = 'repetition'
-        this.count = 1 + repetitions
-      } else if (repetitions > 1) {
-        this.literal.push(this.lastValue)
-        this.flush()
-        this.state = 'repetition'
-        this.count = repetitions
-        this.lastValue = value
-      } else {
-        this.literal.push(this.lastValue)
-        this.lastValue = value
-      }
-    } else if (this.state === 'nulls') {
-      if (value === null) {
-        this.count += repetitions
-      } else if (repetitions > 1) {
-        this.flush()
-        this.state = 'repetition'
-        this.count = repetitions
-        this.lastValue = value
-      } else {
-        this.flush()
-        this.state = 'loneValue'
-        this.lastValue = value
-      }
     }
   }
 
@@ -1027,10 +937,7 @@ class DeltaDecoder extends RLEDecoder {
    * beginning of the buffer.
    */
   reset() {
-    this.offset = 0
-    this.lastValue = undefined
-    this.count = 0
-    this.state = undefined
+    super.reset()
     this.absoluteValue = 0
   }
 
@@ -1122,9 +1029,7 @@ class BooleanEncoder extends Encoder {
     remaining -= firstCopy
 
     while (remaining > 0 && !decoder.done) {
-      decoder.count = decoder.readUint53()
-      if (decoder.count === 0) throw new RangeError('Zero-length runs are not allowed')
-      decoder.lastValue = !decoder.lastValue
+      decoder.readRecord()
       this.appendUint53(this.count)
 
       const numCopied = Math.min(decoder.count, remaining)
@@ -1185,14 +1090,7 @@ class BooleanDecoder extends Decoder {
    */
   readValue() {
     if (this.done) return false
-    while (this.count === 0) {
-      this.count = this.readUint53()
-      this.lastValue = !this.lastValue
-      if (this.count === 0 && !this.firstRun) {
-        throw new RangeError('Zero-length runs are not allowed')
-      }
-      this.firstRun = false
-    }
+    while (this.count === 0) this.readRecord()
     this.count -= 1
     return this.lastValue
   }
@@ -1202,22 +1100,18 @@ class BooleanDecoder extends Decoder {
    */
   skipValues(numSkip) {
     while (numSkip > 0 && !this.done) {
-      if (this.count === 0) {
-        this.count = this.readUint53()
-        this.lastValue = !this.lastValue
-        if (this.count === 0 && !this.firstRun) {
-          throw new RangeError('Zero-length runs are not allowed')
-        }
-        this.firstRun = false
-      }
-      if (this.count < numSkip) {
-        numSkip -= this.count
-        this.count = 0
-      } else {
-        this.count -= numSkip
-        numSkip = 0
-      }
+      if (this.count === 0) this.readRecord()
+      const consume = Math.min(numSkip, this.count)
+      numSkip -= consume
+      this.count -= consume
     }
+  }
+
+  readRecord() {
+    this.count = this.readUint53()
+    this.lastValue = !this.lastValue
+    if (this.count === 0 && !this.firstRun) throw new RangeError('Zero-length runs are not allowed')
+    this.firstRun = false
   }
 }
 

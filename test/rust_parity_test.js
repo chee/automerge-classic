@@ -41,10 +41,10 @@ describe('Rust implementation parity', () => {
       assert.deepStrictEqual(Object.keys(doc), ['za', 'z�', 'z\u{1F600}'])
     })
 
-    it('preserves object-literal insertion order in generated operations', () => {
-      let doc = Automerge.from({m: {zebra: 1, apple: 2, mango: 3}}, {actor: ACTOR_A})
+    it('generates operations for object literals breadth-first in UTF-8 key order', () => {
+      let doc = Automerge.from({m: {zebra: 1, apple: {x: 1}, mango: 3}, b: 1}, {actor: ACTOR_A})
       const ops = Automerge.decodeChange(Automerge.getAllChanges(doc).pop()).ops
-      assert.deepStrictEqual(ops.map(op => op.key), ['m', 'zebra', 'apple', 'mango'])
+      assert.deepStrictEqual(ops.map(op => op.key), ['b', 'm', 'apple', 'mango', 'zebra', 'x'])
     })
   })
 

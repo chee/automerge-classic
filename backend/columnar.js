@@ -1,6 +1,6 @@
 import { deflateSync as deflateRaw, inflateSync as inflateRaw } from 'fflate'
 import { copyObject, equalBytes, parseOpId } from '../src/common.js'
-import { BooleanDecoder, BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, Encoder, RLEDecoder, RLEEncoder, bytesToHexString, hexStringToBytes, utf8ToString } from './encoding.js'
+import { BooleanDecoder, BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, Encoder, RLEDecoder, RLEEncoder, bytesToHexString, hexStringToBytes, stringToUtf8, utf8ToString } from './encoding.js'
 // Maybe we should be using the platform's built-in hash implementation?
 // Node has the crypto module: https://nodejs.org/api/crypto.html and browsers have
 // https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/digest
@@ -49,6 +49,10 @@ const ACTIONS = ['makeMap', 'set', 'makeList', 'del', 'makeText', 'inc', 'makeTa
 
 // Tables were a v1-only feature; documents containing them materialize as plain maps of rows
 const OBJECT_TYPE = {makeMap: 'map', makeList: 'list', makeText: 'text', makeTable: 'map'}
+const NUMBER_TYPES = new Map([
+  ['counter', VALUE_TYPE.COUNTER], ['timestamp', VALUE_TYPE.TIMESTAMP], ['uint', VALUE_TYPE.LEB128_UINT],
+  ['int', VALUE_TYPE.LEB128_INT], ['float64', VALUE_TYPE.IEEE754]
+])
 const UNKNOWN_COLUMNS = Symbol('unknownColumns')
 const RAW_VALUE = Symbol('rawValue')
 
@@ -103,10 +107,9 @@ const DOCUMENT_COLUMNS = [
  */
 function actorIdToActorNum(opId, actorIds) {
   if (!opId || !opId.actorId) return opId
-  const counter = opId.counter
-  const actorNum = actorIds instanceof Map ? actorIds.get(opId.actorId) : actorIds.indexOf(opId.actorId)
-  if (actorNum === undefined || actorNum < 0) throw new RangeError('missing actorId') // should not happen
-  return {counter, actorNum, actorId: opId.actorId}
+  const actorNum = actorIds.get(opId.actorId)
+  if (actorNum === undefined) throw new RangeError('missing actorId') // should not happen
+  return {counter: opId.counter, actorNum, actorId: opId.actorId}
 }
 
 /**
@@ -179,10 +182,7 @@ function parseAllOpIds(changes, single, actorOrder) {
   }
   const actorIndex = new Map(actorIds.map((actor, index) => [actor, index]))
   for (let change of newChanges) {
-    change.actorNum = actorIndex.get(change.actor)
-    for (let i = 0; i < change.ops.length; i++) {
-      let op = change.ops[i]
-      op.id = {counter: change.startOp + i, actorNum: change.actorNum, actorId: change.actor}
+    for (let op of change.ops) {
       op.obj = actorIdToActorNum(op.obj, actorIndex)
       op.elemId = actorIdToActorNum(op.elemId, actorIndex)
       op.child = actorIdToActorNum(op.child, actorIndex)
@@ -257,37 +257,6 @@ function encodeOperationAction(op, columns) {
 }
 
 /**
- * Given the datatype for a number, determine the typeTag and the value to encode
- * otherwise guess
- */
-function getNumberTypeAndValue(op) {
-  switch (op.datatype) {
-    case "counter":
-      return [ VALUE_TYPE.COUNTER, op.value ]
-    case "timestamp":
-      return [ VALUE_TYPE.TIMESTAMP, op.value ]
-    case "uint":
-      return [ VALUE_TYPE.LEB128_UINT, op.value ]
-    case "int":
-      return [ VALUE_TYPE.LEB128_INT, op.value ]
-    case "float64": {
-      const buf64 = new ArrayBuffer(8), view64 = new DataView(buf64)
-      view64.setFloat64(0, op.value, true)
-      return [ VALUE_TYPE.IEEE754,  new Uint8Array(buf64) ]
-    }
-    default:
-      // increment operators get resolved here ...
-      if (Number.isInteger(op.value) && op.value <= Number.MAX_SAFE_INTEGER && op.value >= Number.MIN_SAFE_INTEGER) {
-        return [ VALUE_TYPE.LEB128_INT, op.value ]
-      } else {
-        const buf64 = new ArrayBuffer(8), view64 = new DataView(buf64)
-        view64.setFloat64(0, op.value, true)
-        return [ VALUE_TYPE.IEEE754,  new Uint8Array(buf64) ]
-      }
-  }
-}
-
-/**
  * Encodes the `value` property of operation `op` into the two columns
  * `valLen` and `valRaw`.
  */
@@ -306,7 +275,7 @@ function encodeValue(op, columns) {
   } else if (op.value === true) {
     columns.valLen.appendValue(VALUE_TYPE.TRUE)
   } else if (typeof op.value === 'string') {
-    const numBytes = columns.valRaw.appendRawString(op.value)
+    const numBytes = columns.valRaw.appendRawBytes(stringToUtf8(op.value))
     columns.valLen.appendValue(numBytes << 4 | VALUE_TYPE.UTF8)
   } else if (ArrayBuffer.isView(op.value)) {
     const numBytes = columns.valRaw.appendRawBytes(
@@ -314,14 +283,17 @@ function encodeValue(op, columns) {
     )
     columns.valLen.appendValue(numBytes << 4 | VALUE_TYPE.BYTES)
   } else if (typeof op.value === 'number') {
-    let [typeTag, value] = getNumberTypeAndValue(op)
-    let numBytes
+    let typeTag = NUMBER_TYPES.get(op.datatype), numBytes
+    // increment operators get resolved here ...
+    if (!typeTag) typeTag = Number.isSafeInteger(op.value) ? VALUE_TYPE.LEB128_INT : VALUE_TYPE.IEEE754
     if (typeTag === VALUE_TYPE.LEB128_UINT) {
-      numBytes = columns.valRaw.appendUint53(value)
+      numBytes = columns.valRaw.appendUint53(op.value)
     } else if (typeTag === VALUE_TYPE.IEEE754) {
-      numBytes = columns.valRaw.appendRawBytes(value)
+      const bytes = new Uint8Array(8)
+      new DataView(bytes.buffer).setFloat64(0, op.value, true)
+      numBytes = columns.valRaw.appendRawBytes(bytes)
     } else {
-      numBytes = columns.valRaw.appendInt53(value)
+      numBytes = columns.valRaw.appendInt53(op.value)
     }
     columns.valLen.appendValue(numBytes << 4 | typeTag)
   } else if (typeof op.datatype === 'number' && op.datatype >= VALUE_TYPE.MIN_UNKNOWN &&
@@ -342,34 +314,20 @@ function encodeValue(op, columns) {
  * corresponding to the value, and `datatypeTag` is a datatype annotation such as 'counter'.
  */
 function decodeValue(sizeTag, bytes) {
-  if (sizeTag === VALUE_TYPE.NULL) {
-    return {value: null}
-  } else if (sizeTag === VALUE_TYPE.FALSE) {
-    return {value: false}
-  } else if (sizeTag === VALUE_TYPE.TRUE) {
-    return {value: true}
-  } else if (sizeTag % 16 === VALUE_TYPE.UTF8) {
-    return {value: utf8ToString(bytes)}
-  } else {
-    if (sizeTag % 16 === VALUE_TYPE.LEB128_UINT) {
-      return {value: new Decoder(bytes).readUint53(), datatype: "uint"}
-    } else if (sizeTag % 16 === VALUE_TYPE.LEB128_INT) {
-      return {value: new Decoder(bytes).readInt53(), datatype: "int"}
-    } else if (sizeTag % 16 === VALUE_TYPE.IEEE754) {
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-      if (bytes.byteLength === 8) {
-        return {value: view.getFloat64(0, true), datatype: "float64"}
-      } else {
-        throw new RangeError(`Invalid length for floating point number: ${bytes.byteLength}`)
-      }
-    } else if (sizeTag % 16 === VALUE_TYPE.COUNTER) {
-      return {value: new Decoder(bytes).readInt53(), datatype: 'counter'}
-    } else if (sizeTag % 16 === VALUE_TYPE.TIMESTAMP) {
-      return {value: new Decoder(bytes).readInt53(), datatype: 'timestamp'}
-    } else {
-      return {value: bytes, datatype: sizeTag % 16}
-    }
+  if (sizeTag === VALUE_TYPE.NULL) return {value: null}
+  if (sizeTag === VALUE_TYPE.FALSE) return {value: false}
+  if (sizeTag === VALUE_TYPE.TRUE) return {value: true}
+  const type = sizeTag % 16
+  if (type === VALUE_TYPE.UTF8) return {value: utf8ToString(bytes)}
+  if (type === VALUE_TYPE.LEB128_UINT) return {value: new Decoder(bytes).readUint53(), datatype: 'uint'}
+  if (type === VALUE_TYPE.LEB128_INT) return {value: new Decoder(bytes).readInt53(), datatype: 'int'}
+  if (type === VALUE_TYPE.IEEE754) {
+    if (bytes.byteLength !== 8) throw new RangeError(`Invalid length for floating point number: ${bytes.byteLength}`)
+    return {value: new DataView(bytes.buffer, bytes.byteOffset, 8).getFloat64(0, true), datatype: 'float64'}
   }
+  if (type === VALUE_TYPE.COUNTER) return {value: new Decoder(bytes).readInt53(), datatype: 'counter'}
+  if (type === VALUE_TYPE.TIMESTAMP) return {value: new Decoder(bytes).readInt53(), datatype: 'timestamp'}
+  return {value: bytes, datatype: type}
 }
 
 /**
@@ -419,41 +377,26 @@ function decodeValueColumns(columns, colIndex, actorIds, result) {
   return 1
 }
 
+function encodeOp(op, columns) {
+  encodeObjectId(op, columns)
+  encodeOperationKey(op, columns)
+  columns.insert.appendValue(!!op.insert)
+  encodeOperationAction(op, columns)
+  encodeValue(op, columns)
+  if (columns.expand) columns.expand.appendValue(!!op.expand)
+  const markName = op.markName === undefined ? op.name : op.markName
+  columns.markName.appendValue(markName === undefined ? null : markName)
+}
+
 /**
  * Encodes an array of operations in a set of columns. The operations need to
- * be parsed with `parseAllOpIds()` beforehand. If `forDocument` is true, we use
- * the column structure of a whole document, otherwise we use the column
- * structure for an individual change. Returns an array of
+ * be parsed with `parseAllOpIds()` beforehand. Returns an array of
  * `{columnId, columnName, encoder}` objects.
  */
-function encodeOps(ops, forDocument) {
-  const columns = {
-    objActor  : new RLEEncoder('uint'),
-    objCtr    : new RLEEncoder('uint'),
-    keyActor  : new RLEEncoder('uint'),
-    keyCtr    : new DeltaEncoder(),
-    keyStr    : new RLEEncoder('utf8'),
-    insert    : new BooleanEncoder(),
-    action    : new RLEEncoder('uint'),
-    valLen    : new RLEEncoder('uint'),
-    valRaw    : new Encoder(),
-    chldActor : new RLEEncoder('uint'),
-    chldCtr   : new DeltaEncoder(),
-    markName  : new RLEEncoder('utf8')
-  }
-
-  if (ops.some(op => !!op.expand)) columns.expand = new BooleanEncoder()
-
-  if (forDocument) {
-    columns.idActor   = new RLEEncoder('uint')
-    columns.idCtr     = new DeltaEncoder()
-    columns.succNum   = new RLEEncoder('uint')
-    columns.succActor = new RLEEncoder('uint')
-    columns.succCtr   = new DeltaEncoder()
-  } else {
-    columns.predNum   = new RLEEncoder('uint')
-    columns.predCtr   = new DeltaEncoder()
-    columns.predActor = new RLEEncoder('uint')
+function encodeOps(ops) {
+  const expand = ops.some(op => op.expand), columns = {}
+  for (const {columnName, columnId} of CHANGE_COLUMNS) {
+    if (columnName !== 'expand' || expand) columns[columnName] = encoderByColumnId(columnId)
   }
 
   const unknownColumnIds = new Set()
@@ -466,15 +409,7 @@ function encodeOps(ops, forDocument) {
     .map(columnId => ({columnId, encoder: encoderByColumnId(columnId)}))
 
   for (let op of ops) {
-    encodeObjectId(op, columns)
-    encodeOperationKey(op, columns)
-    columns.insert.appendValue(!!op.insert)
-    encodeOperationAction(op, columns)
-    encodeValue(op, columns)
-    if (columns.expand) columns.expand.appendValue(!!op.expand)
-    const markName = op.markName === undefined ? op.name : op.markName
-    columns.markName.appendValue(markName === undefined ? null : markName)
-
+    encodeOp(op, columns)
     if (op.child && op.child.counter) {
       columns.chldActor.appendValue(op.child.actorNum)
       columns.chldCtr.appendValue(op.child.counter)
@@ -482,32 +417,18 @@ function encodeOps(ops, forDocument) {
       columns.chldActor.appendValue(null)
       columns.chldCtr.appendValue(null)
     }
-
-    if (forDocument) {
-      columns.idActor.appendValue(op.id.actorNum)
-      columns.idCtr.appendValue(op.id.counter)
-      columns.succNum.appendValue(op.succ.length)
-      op.succ.sort(compareParsedOpIds)
-      for (let i = 0; i < op.succ.length; i++) {
-        columns.succActor.appendValue(op.succ[i].actorNum)
-        columns.succCtr.appendValue(op.succ[i].counter)
-      }
-    } else {
-      columns.predNum.appendValue(op.pred.length)
-      op.pred.sort(compareParsedOpIds)
-      for (let i = 0; i < op.pred.length; i++) {
-        columns.predActor.appendValue(op.pred[i].actorNum)
-        columns.predCtr.appendValue(op.pred[i].counter)
-      }
+    columns.predNum.appendValue(op.pred.length)
+    op.pred.sort(compareParsedOpIds)
+    for (const pred of op.pred) {
+      columns.predActor.appendValue(pred.actorNum)
+      columns.predCtr.appendValue(pred.counter)
     }
     appendUnknownOperation(unknownColumns, op[UNKNOWN_COLUMNS])
   }
 
-  let columnList = []
-  for (let {columnName, columnId} of forDocument ? DOC_OPS_COLUMNS : CHANGE_COLUMNS) {
-    if (columns[columnName]) columnList.push({columnId, columnName, encoder: columns[columnName]})
-  }
-  return columnList.concat(unknownColumns).sort((a, b) => a.columnId - b.columnId)
+  return CHANGE_COLUMNS.filter(({columnName}) => columns[columnName])
+    .map(({columnId, columnName}) => ({columnId, columnName, encoder: columns[columnName]}))
+    .concat(unknownColumns).sort((a, b) => a.columnId - b.columnId)
 }
 
 function appendUnknownOperation(columns, values) {
@@ -521,30 +442,25 @@ function appendUnknownOperation(columns, values) {
       lastCardinality = present ? value : 0
       column.encoder.appendValue(lastCardinality)
     } else if (type === COLUMN_TYPE.VALUE_RAW) {
-      if (present && Array.isArray(value)) {
-        for (const bytes of value) column.encoder.appendRawBytes(bytes)
-      } else if (present) {
-        column.encoder.appendRawBytes(value)
+      if (present) {
+        for (const bytes of Array.isArray(value) ? value : [value]) column.encoder.appendRawBytes(bytes)
       }
     } else if (Array.isArray(value)) {
       for (const item of value) column.encoder.appendValue(item)
-    } else if (columnId >> 4 === lastGroup) {
-      let blank = null
-      if (type === COLUMN_TYPE.BOOLEAN) blank = false
-      if (type === COLUMN_TYPE.VALUE_LEN) blank = 0
-      column.encoder.appendValue(blank, lastCardinality)
     } else {
-      let blank = null
-      if (type === COLUMN_TYPE.BOOLEAN) blank = false
-      if (type === COLUMN_TYPE.VALUE_LEN) blank = 0
-      column.encoder.appendValue(present ? value : blank)
+      const blank = type === COLUMN_TYPE.BOOLEAN ? false : (type === COLUMN_TYPE.VALUE_LEN ? 0 : null)
+      if (columnId >> 4 === lastGroup) {
+        column.encoder.appendValue(blank, lastCardinality)
+      } else {
+        column.encoder.appendValue(present ? value : blank)
+      }
     }
   }
 }
 
 function validDatatype(value, datatype) {
   if (datatype === undefined) {
-    return (typeof value === 'string' || typeof value === 'boolean' || value === null)
+    return (typeof value === 'string' || typeof value === 'boolean' || value === null || value instanceof Uint8Array)
   } else {
     return typeof value === 'number'
   }
@@ -866,17 +782,17 @@ function encodeChange(changeObj, actorOrder) {
     encoder.appendUint53(actorIds.length - 1)
     for (let actor of actorIds.slice(1)) encoder.appendHexString(actor)
 
-    const columns = encodeOps(change.ops, false)
+    const columns = encodeOps(change.ops)
     encodeColumnInfo(encoder, columns)
     for (let column of columns) encoder.appendRawBytes(column.encoder.buffer)
     if (extraBytes) encoder.appendRawBytes(extraBytes)
   })
 
-  return (bytes.byteLength >= DEFLATE_MIN_SIZE) ? deflateChange(bytes) : bytes
+  return (bytes.byteLength >= DEFLATE_MIN_SIZE) ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, deflateRaw) : bytes
 }
 
 function decodeChangeColumns(buffer) {
-  if (buffer[8] === CHUNK_TYPE_DEFLATE) buffer = inflateChange(buffer)
+  if (buffer[8] === CHUNK_TYPE_DEFLATE) buffer = recodeChange(buffer, CHUNK_TYPE_CHANGE, inflateRaw)
   const decoder = new Decoder(buffer)
   const header = decodeContainerHeader(decoder, true)
   const chunkDecoder = new Decoder(header.chunkData)
@@ -940,7 +856,7 @@ function decodeChange(buffer, raw = false) {
  * computes the hash of the change if `computeHash` is true.
  */
 function decodeChangeMeta(buffer, computeHash) {
-  if (buffer[8] === CHUNK_TYPE_DEFLATE) buffer = inflateChange(buffer)
+  if (buffer[8] === CHUNK_TYPE_DEFLATE) buffer = recodeChange(buffer, CHUNK_TYPE_CHANGE, inflateRaw)
   const header = decodeContainerHeader(new Decoder(buffer), computeHash)
   if (header.chunkType !== CHUNK_TYPE_CHANGE) {
     throw new RangeError('Buffer chunk type is not a change')
@@ -951,33 +867,13 @@ function decodeChangeMeta(buffer, computeHash) {
   return meta
 }
 
-/**
- * Compresses a binary change using DEFLATE.
- */
-function deflateChange(buffer) {
-  const header = decodeContainerHeader(new Decoder(buffer), false)
-  if (header.chunkType !== CHUNK_TYPE_CHANGE) throw new RangeError(`Unexpected chunk type: ${header.chunkType}`)
-  const compressed = deflateRaw(header.chunkData)
+function recodeChange(buffer, chunkType, transform) {
+  const data = transform(decodeContainerHeader(new Decoder(buffer), false).chunkData)
   const encoder = new Encoder()
   encoder.appendRawBytes(buffer.subarray(0, 8)) // copy MAGIC_BYTES and checksum
-  encoder.appendByte(CHUNK_TYPE_DEFLATE)
-  encoder.appendUint53(compressed.byteLength)
-  encoder.appendRawBytes(compressed)
-  return encoder.buffer
-}
-
-/**
- * Decompresses a binary change that has been compressed with DEFLATE.
- */
-function inflateChange(buffer) {
-  const header = decodeContainerHeader(new Decoder(buffer), false)
-  if (header.chunkType !== CHUNK_TYPE_DEFLATE) throw new RangeError(`Unexpected chunk type: ${header.chunkType}`)
-  const decompressed = inflateRaw(header.chunkData)
-  const encoder = new Encoder()
-  encoder.appendRawBytes(buffer.subarray(0, 8)) // copy MAGIC_BYTES and checksum
-  encoder.appendByte(CHUNK_TYPE_CHANGE)
-  encoder.appendUint53(decompressed.byteLength)
-  encoder.appendRawBytes(decompressed)
+  encoder.appendByte(chunkType)
+  encoder.appendUint53(data.byteLength)
+  encoder.appendRawBytes(data)
   return encoder.buffer
 }
 
@@ -1015,18 +911,6 @@ function decodeChanges(binaryChanges) {
     }
   }
   return decoded
-}
-
-function sortOpIds(a, b) {
-  if (a === b) return 0
-  if (a === '_root') return -1
-  if (b === '_root') return +1
-  const a_ = parseOpId(a), b_ = parseOpId(b)
-  if (a_.counter < b_.counter) return -1
-  if (a_.counter > b_.counter) return +1
-  if (a_.actorId < b_.actorId) return -1
-  if (a_.actorId > b_.actorId) return +1
-  return 0
 }
 
 function isBlankUnknownValue(columnId, value) {
@@ -1120,7 +1004,7 @@ function groupChangeOps(changes, ops) {
   }
 
   for (let change of changes) {
-    change.ops.sort((op1, op2) => sortOpIds(op1.id, op2.id))
+    change.ops.sort((op1, op2) => compareParsedOpIds(parseOpId(op1.id), parseOpId(op2.id)))
     change.startOp = change.maxOp - change.ops.length + 1
     delete change.maxOp
     for (let i = 0; i < change.ops.length; i++) {
@@ -1139,13 +1023,13 @@ function decodeDocumentChanges(changes, expectedHeads) {
   for (let i = 0; i < changes.length; i++) {
     let change = changes[i]
     change.deps = []
-    for (let index of change.depsNum.map(d => d.depsIndex)) {
+    for (let {depsIndex: index} of change.depsNum) {
       if (!changes[index] || !changes[index].hash) {
         throw new RangeError(`No hash for index ${index} while processing index ${i}`)
       }
       const hash = changes[index].hash
       change.deps.push(hash)
-      if (heads[hash]) delete heads[hash]
+      delete heads[hash]
     }
     change.deps.sort()
     delete change.depsNum
@@ -1162,20 +1046,14 @@ function decodeDocumentChanges(changes, expectedHeads) {
   }
 
   const actualHeads = Object.keys(heads).sort()
-  let headsEqual = (actualHeads.length === expectedHeads.length), i = 0
-  while (headsEqual && i < actualHeads.length) {
-    headsEqual = (actualHeads[i] === expectedHeads[i])
-    i++
-  }
-  if (!headsEqual) {
+  if (actualHeads.length !== expectedHeads.length || actualHeads.some((head, i) => head !== expectedHeads[i])) {
     throw new RangeError(`Mismatched heads hashes: expected ${expectedHeads.join(', ')}, got ${actualHeads.join(', ')}`)
   }
 }
 
 function encodeDocumentHeader(doc) {
   const { changesColumns, opsColumns, actorIds, heads, headsIndexes, extraBytes } = doc
-  for (let column of changesColumns) deflateColumn(column)
-  for (let column of opsColumns) deflateColumn(column)
+  for (let column of changesColumns.concat(opsColumns)) deflateColumn(column)
 
   return encodeContainer(CHUNK_TYPE_DOCUMENT, encoder => {
     encoder.appendUint53(actorIds.length)
@@ -1188,8 +1066,7 @@ function encodeDocumentHeader(doc) {
     }
     encodeColumnInfo(encoder, changesColumns)
     encodeColumnInfo(encoder, opsColumns)
-    for (let column of changesColumns) encoder.appendRawBytes(column.encoder.buffer)
-    for (let column of opsColumns) encoder.appendRawBytes(column.encoder.buffer)
+    for (let column of changesColumns.concat(opsColumns)) encoder.appendRawBytes(column.encoder.buffer)
     for (let index of headsIndexes) encoder.appendUint53(index)
     if (extraBytes) encoder.appendRawBytes(extraBytes)
   }).bytes
@@ -1213,13 +1090,9 @@ function decodeDocumentHeader(buffer) {
 
   const changesColumns = decodeColumnInfo(decoder)
   const opsColumns = decodeColumnInfo(decoder)
-  for (let i = 0; i < changesColumns.length; i++) {
-    changesColumns[i].buffer = decoder.readRawBytes(changesColumns[i].bufferLen)
-    inflateColumn(changesColumns[i])
-  }
-  for (let i = 0; i < opsColumns.length; i++) {
-    opsColumns[i].buffer = decoder.readRawBytes(opsColumns[i].bufferLen)
-    inflateColumn(opsColumns[i])
+  for (let column of changesColumns.concat(opsColumns)) {
+    column.buffer = decoder.readRawBytes(column.bufferLen)
+    inflateColumn(column)
   }
   if (!decoder.done) {
     for (let i = 0; i < numHeads; i++) headsIndexes.push(decoder.readUint53())
@@ -1260,9 +1133,8 @@ function inflateColumn(column) {
 
 export {
   COLUMN_TYPE, VALUE_TYPE, ACTIONS, OBJECT_TYPE, DOC_OPS_COLUMNS, CHANGE_COLUMNS, DOCUMENT_COLUMNS,
-  encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue, decodeColumns, decodeOps,
-  parseAllOpIds, encodeObjectId, encodeOperationKey, encodeOperationAction, encodeValue,
-  encodeColumnInfo, decodeColumnInfo, encodeContainer, decodeContainerHeader,
+  encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue, decodeColumns, decodeOps, encodeOp,
+  encodeColumnInfo, decodeColumnInfo, encodeContainer, decodeContainerHeader, deflateColumn, inflateColumn,
   splitContainers, encodeChange, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
-  encodeDocumentHeader, decodeDocumentHeader, decodeDocument
+  encodeDocumentHeader, decodeDocumentHeader
 }

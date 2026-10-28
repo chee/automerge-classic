@@ -316,7 +316,7 @@ describe('patch convergence', () => {
       assert.strictEqual(Automerge.toJS(Automerge.load(Automerge.save(doc))).c.value, 17)
     })
 
-    it('keeps concurrent conflict values when incrementing', () => {
+    it('overwrites concurrent non-counter values when incrementing', () => {
       let doc1 = Automerge.init(ACTOR_A)
       doc1 = Automerge.change(doc1, {time: 0}, draft => { draft.k = 90 })
       let doc2 = Automerge.from({}, ACTOR_B)
@@ -326,12 +326,8 @@ describe('patch convergence', () => {
       doc1 = Automerge.change(doc1, {time: 0}, draft => { draft.k.increment(1) })
       assert.strictEqual(Automerge.toJS(doc1).k.value, 5)
       assert.strictEqual(Automerge.toJS(Automerge.load(Automerge.save(doc1))).k.value, 5)
-      // the losing concurrent value survives as a conflict; this matches the
-      // Rust implementation's replay behaviour (its local and reload views
-      // hide the conflict, inconsistently with its own replay)
-      const conflicts = Automerge.getConflicts(doc1, 'k')
-      assert.strictEqual(conflicts[`1@${ACTOR_A}`], 90)
-      assert.strictEqual(conflicts[`1@${ACTOR_B}`].value, 5)
+      assert.strictEqual(Automerge.getConflicts(doc1, 'k'), undefined)
+      assert.strictEqual(Automerge.getConflicts(Automerge.applyChanges(Automerge.init(), Automerge.getAllChanges(doc1))[0], 'k'), undefined)
       doc1 = Automerge.change(doc1, {time: 0}, draft => { delete draft.k })
       assert.strictEqual(Automerge.toJS(doc1).k, undefined)
       assert.strictEqual(Automerge.toJS(Automerge.load(Automerge.save(doc1))).k, undefined)

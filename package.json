@@ -66,6 +66,7 @@
     "fflate": "^0.8.3"
   },
   "devDependencies": {
+    "@automerge/automerge": "^3.5.0",
     "@types/node": "^22.20.1",
     "@vitest/coverage-v8": "^4.1.10",
     "copyfiles": "^2.4.1",

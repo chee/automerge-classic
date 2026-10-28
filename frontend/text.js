@@ -2,17 +2,12 @@ import { OBJECT_ID } from './constants.js'
 import { isObject } from '../src/common.js'
 class Text {
   constructor (text) {
-    if (typeof text === 'string') {
-      const elems = [...text].map(value => ({value}))
-      return instantiateText(undefined, elems) // eslint-disable-line
-    } else if (Array.isArray(text)) {
-      const elems = text.map(value => ({value}))
-      return instantiateText(undefined, elems) // eslint-disable-line
-    } else if (text === undefined) {
-      return instantiateText(undefined, []) // eslint-disable-line
-    } else {
+    if (typeof text === 'string') text = [...text]
+    if (text === undefined) text = []
+    if (!Array.isArray(text)) {
       throw new TypeError(`Unsupported initial value for Text: ${text}`)
     }
+    return instantiateText(undefined, text.map(value => ({value}))) // eslint-disable-line
   }
 
   get length () {
@@ -126,10 +121,8 @@ class Text {
   set (index, value) {
     if (this.context) {
       this.context.setListIndex(this.path, index, value)
-    } else if (!this[OBJECT_ID]) {
-      this.elems[index].value = value
     } else {
-      throw new TypeError('Automerge.Text object cannot be modified outside of a change block')
+      localElems(this)[index].value = value
     }
     return this
   }
@@ -140,10 +133,8 @@ class Text {
   insertAt(index, ...values) {
     if (this.context) {
       this.context.splice(this.path, index, 0, values)
-    } else if (!this[OBJECT_ID]) {
-      this.elems.splice(index, 0, ...values.map(value => ({value})))
     } else {
-      throw new TypeError('Automerge.Text object cannot be modified outside of a change block')
+      localElems(this).splice(index, 0, ...values.map(value => ({value})))
     }
     return this
   }
@@ -155,10 +146,8 @@ class Text {
   deleteAt(index, numDelete = 1) {
     if (this.context) {
       this.context.splice(this.path, index, numDelete, [])
-    } else if (!this[OBJECT_ID]) {
-      this.elems.splice(index, numDelete)
     } else {
-      throw new TypeError('Automerge.Text object cannot be modified outside of a change block')
+      localElems(this).splice(index, numDelete)
     }
     return this
   }
@@ -169,9 +158,15 @@ for (let method of ['concat', 'every', 'filter', 'find', 'findIndex', 'forEach',
                     'indexOf', 'join', 'lastIndexOf', 'map', 'reduce', 'reduceRight',
                     'slice', 'some', 'toLocaleString']) {
   Text.prototype[method] = function (...args) {
-    const array = [...this]
-    return array[method](...args)
+    return [...this][method](...args)
   }
+}
+
+function localElems(text) {
+  if (text[OBJECT_ID]) {
+    throw new TypeError('Automerge.Text object cannot be modified outside of a change block')
+  }
+  return text.elems
 }
 
 function instantiateText(objectId, elems) {

@@ -72,13 +72,7 @@ class WriteableCounter extends Counter {
  * located.
 */
 function getWriteableCounter(value, context, path, objectId, key) {
-  const instance = Object.create(WriteableCounter.prototype)
-  instance.value = value
-  instance.context = context
-  instance.path = path
-  instance.objectId = objectId
-  instance.key = key
-  return instance
+  return Object.assign(Object.create(WriteableCounter.prototype), {value, context, path, objectId, key})
 }
 
 export { Counter, getWriteableCounter }

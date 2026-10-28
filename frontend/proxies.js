@@ -6,7 +6,7 @@ function parseListIndex(key) {
   if (typeof key !== 'number') {
     throw new TypeError('A list index must be a number, but you passed ' + JSON.stringify(key))
   }
-  if (key < 0 || isNaN(key) || key === Infinity || key === -Infinity) {
+  if (key < 0 || isNaN(key) || key === Infinity) {
     throw new RangeError('A list index must be positive, but you passed ' + key)
   }
   return key
@@ -48,7 +48,7 @@ function listMethods(context, listId, path) {
     },
 
     pop() {
-      let list = context.getObject(listId)
+      const list = context.getObject(listId)
       if (list.length == 0) return
       const last = context.getObjectField(path, listId, list.length - 1)
       context.splice(path, list.length - 1, 1, [])
@@ -63,15 +63,14 @@ function listMethods(context, listId, path) {
     },
 
     shift() {
-      let list = context.getObject(listId)
-      if (list.length == 0) return
+      if (context.getObject(listId).length == 0) return
       const first = context.getObjectField(path, listId, 0)
       context.splice(path, 0, 1, [])
       return first
     },
 
     splice(start, deleteCount, ...values) {
-      let list = context.getObject(listId)
+      const list = context.getObject(listId)
       start = parseListIndex(start)
       if (deleteCount === undefined || deleteCount > list.length - start) {
         deleteCount = list.length - start
@@ -120,20 +119,12 @@ const MapHandler = {
   },
 
   set (target, key, value) {
-    const { context, path, readonly } = target
-    if (Array.isArray(readonly) && readonly.indexOf(key) >= 0) {
-      throw new RangeError(`Object property "${key}" cannot be modified`)
-    }
-    context.setMapKey(path, key, value)
+    target.context.setMapKey(target.path, key, value)
     return true
   },
 
   deleteProperty (target, key) {
-    const { context, path, readonly } = target
-    if (Array.isArray(readonly) && readonly.indexOf(key) >= 0) {
-      throw new RangeError(`Object property "${key}" cannot be modified`)
-    }
-    context.deleteMapKey(path, key)
+    target.context.deleteMapKey(target.path, key)
     return true
   },
 
@@ -144,13 +135,7 @@ const MapHandler = {
 
   getOwnPropertyDescriptor (target, key) {
     const { context, objectId } = target
-    const object = context.getObject(objectId)
-    if (key in object) {
-      return {
-        configurable: true, enumerable: true,
-        value: context.getObjectField(objectId, key)
-      }
-    }
+    if (key in context.getObject(objectId)) return {configurable: true, enumerable: true}
   },
 
   ownKeys (target) {
@@ -212,52 +197,36 @@ const ListHandler = {
     if (key === 'length') return {writable: true, value: object.length}
     if (key === OBJECT_ID) return {configurable: false, enumerable: false, value: objectId}
 
-    if (typeof key === 'string' && /^[0-9]+$/.test(key)) {
-      const index = parseListIndex(key)
-      if (index < object.length) return {
-        configurable: true, enumerable: true,
-        value: context.getObjectField(objectId, index)
-      }
+    if (typeof key === 'string' && /^[0-9]+$/.test(key) && parseListIndex(key) < object.length) {
+      return {configurable: true, enumerable: true}
     }
   },
 
   ownKeys (target) {
     const [context, objectId, /* path */] = target
-    const object = context.getObject(objectId)
-    let keys = ['length']
-    for (let key of Object.keys(object)) keys.push(key)
-    return keys
+    return ['length', ...Object.keys(context.getObject(objectId))]
   }
-}
-
-function mapProxy(context, objectId, path, readonly) {
-  return new Proxy({context, objectId, path, readonly}, MapHandler)
-}
-
-function listProxy(context, objectId, path) {
-  return new Proxy([context, objectId, path], ListHandler)
 }
 
 /**
  * Instantiates a proxy object for the given `objectId`.
  * This function is added as a method to the context object by rootObjectProxy().
  * When it is called, `this` is the context object.
- * `readonly` is a list of map property names that cannot be modified.
  */
-function instantiateProxy(path, objectId, readonly) {
+function instantiateProxy(path, objectId) {
   const object = this.getObject(objectId)
   if (Array.isArray(object)) {
-    return listProxy(this, objectId, path)
+    return new Proxy([this, objectId, path], ListHandler)
   } else if (object instanceof Text) {
     return object.getWriteable(this, path)
   } else {
-    return mapProxy(this, objectId, path, readonly)
+    return new Proxy({context: this, objectId, path}, MapHandler)
   }
 }
 
 function rootObjectProxy(context) {
   context.instantiateObject = instantiateProxy
-  return mapProxy(context, '_root', [])
+  return new Proxy({context, objectId: '_root', path: []}, MapHandler)
 }
 
 export { rootObjectProxy }

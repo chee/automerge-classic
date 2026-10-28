@@ -59,7 +59,7 @@ describe('TypeScript support', () => {
       const actorId = '1234'
       const s1 = Automerge.from<BirdList>({ birds: [] }, actorId)
       assert.strictEqual(Automerge.getActorId(s1), '1234')
-      const s2 = Automerge.from<BirdList>({ birds: [] }, { actorId })
+      const s2 = Automerge.from<BirdList>({ birds: [] }, { actor: actorId })
       assert.strictEqual(Automerge.getActorId(s2), '1234')
     })
 

@@ -1,7 +1,6 @@
-import { deflateSync as deflateRaw, inflateSync as inflateRaw } from 'fflate'
 import { parseOpId } from '../src/common.js'
-import { BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, Encoder, RLEDecoder, RLEEncoder, bytesToHexString, hexStringToBytes } from './encoding.js'
-import { CHANGE_COLUMNS, COLUMN_TYPE, decodeChangeColumns, decodeChangeMeta, decodeColumnInfo, decodeColumns, decodeContainerHeader, decodeOps, encodeChange, encodeColumnInfo, encodeContainer, encodeOperationAction, encodeValue } from './columnar.js'
+import { Decoder, Encoder, bytesToHexString, hexStringToBytes } from './encoding.js'
+import { CHANGE_COLUMNS, decodeChangeColumns, decodeChangeMeta, decodeColumnInfo, decodeColumns, decodeContainerHeader, decodeOps, deflateColumn, encodeChange, encodeColumnInfo, encodeContainer, encodeOp, encoderByColumnId, inflateColumn, makeDecoders } from './columnar.js'
 const CHUNK_TYPE_BUNDLE = 3
 
 const BUNDLE_CHANGE_COLUMNS = [
@@ -39,31 +38,20 @@ const BUNDLE_OPS_COLUMNS = [
   {columnName: 'idCtrInverse', columnId: 0xb3}
 ]
 
-function column(columnName, columnId, encoder) {
-  return {columnName, columnId, encoder}
-}
-
 function appendColumns(encoder, columns) {
-  const encoded = columns.map(col => {
-    const buffer = col.encoder.buffer
-    if (buffer.byteLength < 256) return col
-    return Object.assign({}, col, {columnId: col.columnId | 8, encoder: {buffer: deflateRaw(buffer)}})
-  })
-  encodeColumnInfo(encoder, encoded)
-  for (const col of encoded) encoder.appendRawBytes(col.encoder.buffer)
+  for (const col of columns) deflateColumn(col)
+  encodeColumnInfo(encoder, columns)
+  for (const col of columns) encoder.appendRawBytes(col.encoder.buffer)
 }
 
 function readColumns(decoder, spec) {
   const validIds = new Set(spec.map(col => col.columnId))
   const columns = decodeColumnInfo(decoder)
   for (const col of columns) {
-    const compressed = (col.columnId & 8) !== 0
-    const columnId = compressed ? col.columnId ^ 8 : col.columnId
+    const columnId = col.columnId & 8 ? col.columnId ^ 8 : col.columnId
     if (!validIds.has(columnId)) throw new RangeError(`Unexpected bundle column: ${col.columnId}`)
-    const buffer = decoder.readRawBytes(col.bufferLen)
-    col.columnId = columnId
-    col.buffer = compressed ? inflateRaw(buffer) : buffer
-    col.bufferLen = col.buffer.byteLength
+    col.buffer = decoder.readRawBytes(col.bufferLen)
+    inflateColumn(col)
   }
   return columns
 }
@@ -117,16 +105,8 @@ function decodeBundleInput(changeBuffers) {
 }
 
 function encodeChangeColumns(changes, actors) {
-  const actor = new RLEEncoder('uint')
-  const seq = new DeltaEncoder()
-  const startOp = new DeltaEncoder()
-  const maxOp = new DeltaEncoder()
-  const time = new DeltaEncoder()
-  const message = new RLEEncoder('utf8')
-  const depsNum = new RLEEncoder('uint')
-  const depsIndex = new DeltaEncoder()
-  const extraLen = new RLEEncoder('uint')
-  const extraRaw = new Encoder()
+  const columns = BUNDLE_CHANGE_COLUMNS.map(({columnName, columnId}) => ({columnName, columnId, encoder: encoderByColumnId(columnId)}))
+  const [actor, seq, startOp, maxOp, time, message, depsNum, depsIndex, extraLen, extraRaw] = columns.map(col => col.encoder)
   const selected = new Map(changes.map((change, index) => [change.hash, index]))
   const actorIndex = new Map(actors.map((actor, index) => [actor, index]))
   const seen = new Map(), external = [], externalIndex = new Map()
@@ -158,28 +138,13 @@ function encodeChangeColumns(changes, actors) {
     extraRaw.appendRawBytes(extra)
   }
 
-  let messageEncoder = message
   if (changes.length > 0 && message.buffer.byteLength === 0) {
-    messageEncoder = new Encoder()
-    messageEncoder.appendInt53(0)
-    messageEncoder.appendUint53(changes.length)
+    const nulls = new Encoder()
+    nulls.appendInt53(0)
+    nulls.appendUint53(changes.length)
+    columns[5].encoder = nulls
   }
-
-  return {
-    external,
-    columns: [
-      column('actor', 0x01, actor),
-      column('seq', 0x03, seq),
-      column('startOp', 0x13, startOp),
-      column('maxOp', 0x23, maxOp),
-      column('time', 0x33, time),
-      column('message', 0x45, messageEncoder),
-      column('depsNum', 0x50, depsNum),
-      column('depsIndex', 0x53, depsIndex),
-      column('extraLen', 0x60, extraLen),
-      column('extraRaw', 0x67, extraRaw)
-    ]
-  }
+  return {external, columns}
 }
 
 function parseBundleOpId(opId, actorIndex) {
@@ -191,76 +156,31 @@ function parseBundleOpId(opId, actorIndex) {
 
 function encodeBundleOps(changes, actors) {
   const actorIndex = new Map(actors.map((actor, index) => [actor, index]))
-  const columns = {
-    objActor: new RLEEncoder('uint'),
-    objCtr: new DeltaEncoder(),
-    keyActor: new RLEEncoder('uint'),
-    keyCtr: new DeltaEncoder(),
-    keyStr: new RLEEncoder('utf8'),
-    idActor: new RLEEncoder('uint'),
-    idCtr: new DeltaEncoder(),
-    insert: new BooleanEncoder(),
-    action: new RLEEncoder('uint'),
-    valLen: new RLEEncoder('uint'),
-    valRaw: new Encoder(),
-    predNum: new RLEEncoder('uint'),
-    predActor: new RLEEncoder('uint'),
-    predCtr: new DeltaEncoder(),
-    markName: new RLEEncoder('utf8')
+  const expand = changes.some(change => change.ops.some(op => op.expand)), columns = {}
+  for (const {columnName, columnId} of BUNDLE_OPS_COLUMNS) {
+    if (columnName !== 'expand' || expand) columns[columnName] = encoderByColumnId(columnId)
   }
-  if (changes.some(change => change.ops.some(op => !!op.expand))) columns.expand = new BooleanEncoder()
 
   for (const change of changes) {
     const changeActor = actorIndex.get(change.actor)
     for (let opIndex = 0; opIndex < change.ops.length; opIndex++) {
       const op = change.ops[opIndex]
-      if (op.obj === '_root') {
-        columns.objActor.appendValue(null)
-        columns.objCtr.appendValue(null)
-      } else {
-        const obj = parseBundleOpId(op.obj, actorIndex)
-        if (!(obj.counter > 0)) throw new RangeError(`Unexpected objectId reference: ${JSON.stringify(obj)}`)
-        columns.objActor.appendValue(obj.actorNum)
-        columns.objCtr.appendValue(obj.counter)
-      }
-      if (op.key !== undefined) {
-        columns.keyActor.appendValue(null)
-        columns.keyCtr.appendValue(null)
-        columns.keyStr.appendValue(op.key)
-      } else if (op.elemId === '_head' && op.insert) {
-        columns.keyActor.appendValue(null)
-        columns.keyCtr.appendValue(0)
-        columns.keyStr.appendValue(null)
-      } else if (op.elemId) {
-        const elemId = parseBundleOpId(op.elemId, actorIndex)
-        if (!(elemId.counter > 0)) throw new RangeError(`Unexpected operation key: ${JSON.stringify(op)}`)
-        columns.keyActor.appendValue(elemId.actorNum)
-        columns.keyCtr.appendValue(elemId.counter)
-        columns.keyStr.appendValue(null)
-      } else {
-        throw new RangeError(`Unexpected operation key: ${JSON.stringify(op)}`)
-      }
-      const counter = change.startOp + opIndex
+      if (op.obj !== '_root') op.obj = parseBundleOpId(op.obj, actorIndex)
+      if (op.elemId && op.elemId !== '_head') op.elemId = parseBundleOpId(op.elemId, actorIndex)
+      encodeOp(op, columns)
       columns.idActor.appendValue(changeActor)
-      columns.idCtr.appendValue(counter)
-      columns.insert.appendValue(!!op.insert)
-      encodeOperationAction(op, columns)
-      encodeValue(op, columns)
+      columns.idCtr.appendValue(change.startOp + opIndex)
       columns.predNum.appendValue(op.pred.length)
       for (const pred of op.pred) {
         const id = parseBundleOpId(pred, actorIndex)
         columns.predActor.appendValue(id.actorNum)
         columns.predCtr.appendValue(id.counter)
       }
-      if (columns.expand) columns.expand.appendValue(!!op.expand)
-      const markName = op.markName === undefined ? op.name : op.markName
-      columns.markName.appendValue(markName === undefined ? null : markName)
     }
   }
 
-  return BUNDLE_OPS_COLUMNS
-    .filter(spec => columns[spec.columnName])
-    .map(spec => column(spec.columnName, spec.columnId, columns[spec.columnName]))
+  return BUNDLE_OPS_COLUMNS.filter(({columnName}) => columns[columnName])
+    .map(({columnName, columnId}) => ({columnName, columnId, encoder: columns[columnName]}))
 }
 
 function encodeBundle(changeBuffers) {
@@ -273,19 +193,10 @@ function encodeBundle(changeBuffers) {
     encoder.appendUint53(external.length)
     for (const dep of external) encoder.appendRawBytes(hexStringToBytes(dep))
     encoder.appendUint53(actors.length)
-    for (const actor of actors) encoder.appendPrefixedBytes(hexStringToBytes(actor))
+    for (const actor of actors) encoder.appendHexString(actor)
     appendColumns(encoder, changeColumns)
     appendColumns(encoder, opColumns)
   }).bytes
-}
-
-function decoderFor(columns, columnId) {
-  const column = columns.find(col => col.columnId === columnId)
-  const buffer = column ? column.buffer : new Uint8Array(0)
-  if ((columnId & 7) === COLUMN_TYPE.INT_DELTA) return new DeltaDecoder(buffer)
-  if ((columnId & 7) === COLUMN_TYPE.STRING_RLE) return new RLEDecoder('utf8', buffer)
-  if ((columnId & 7) === COLUMN_TYPE.VALUE_RAW) return new Decoder(buffer)
-  return new RLEDecoder('uint', buffer)
 }
 
 function required(decoder, name) {
@@ -295,16 +206,8 @@ function required(decoder, name) {
 }
 
 function decodeChangeRows(columns, actors) {
-  const actor = decoderFor(columns, 0x01)
-  const seq = decoderFor(columns, 0x03)
-  const startOp = decoderFor(columns, 0x13)
-  const maxOp = decoderFor(columns, 0x23)
-  const time = decoderFor(columns, 0x33)
-  const message = decoderFor(columns, 0x45)
-  const depsNum = decoderFor(columns, 0x50)
-  const depsIndex = decoderFor(columns, 0x53)
-  const extraLen = decoderFor(columns, 0x60)
-  const extraRaw = decoderFor(columns, 0x67)
+  const [actor, seq, startOp, maxOp, time, message, depsNum, depsIndex, extraLen, extraRaw] =
+    makeDecoders(columns, BUNDLE_CHANGE_COLUMNS).map(col => col.decoder)
   const changes = []
 
   while (!actor.done) {
@@ -435,7 +338,7 @@ function decodeBundle(buffer) {
   }
   const actors = [], numActors = decoder.readUint53()
   for (let index = 0; index < numActors; index++) {
-    actors.push(bytesToHexString(decoder.readPrefixedBytes()))
+    actors.push(decoder.readHexString())
   }
   const changeColumns = readColumns(decoder, BUNDLE_CHANGE_COLUMNS)
   const changeRows = decodeChangeRows(changeColumns, actors)
@@ -446,7 +349,7 @@ function decodeBundle(buffer) {
   const ops = decodeOps(opRows, 'bundle')
   addOpsToChanges(changeRows, ops)
   const {changes, changeBytes} = reconstructChanges(changeRows, external, actors)
-  return {changes, changeBytes, rawChanges: changeBytes, deps: external, actors}
+  return {changes, changeBytes, deps: external, actors}
 }
 
 export {

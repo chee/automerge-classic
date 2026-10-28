@@ -45,9 +45,7 @@ function equalBytes(array1, array2) {
  * Creates an array containing the value `null` repeated `length` times.
  */
 function createArrayOfNulls(length) {
-  const array = new Array(length)
-  for (let i = 0; i < length; i++) array[i] = null
-  return array
+  return new Array(length).fill(null)
 }
 
 /**
@@ -59,29 +57,11 @@ function compareUtf8(left, right) {
   if (left === right) return 0
   let leftIndex = 0, rightIndex = 0
   while (leftIndex < left.length && rightIndex < right.length) {
-    let leftCode = left.charCodeAt(leftIndex++), rightCode = right.charCodeAt(rightIndex++)
-    if (leftCode >= 0xd800 && leftCode <= 0xdbff) {
-      const low = left.charCodeAt(leftIndex)
-      if (low >= 0xdc00 && low <= 0xdfff) {
-        leftCode = 0x10000 + ((leftCode - 0xd800) << 10) + low - 0xdc00
-        leftIndex++
-      } else {
-        leftCode = 0xfffd
-      }
-    } else if (leftCode >= 0xdc00 && leftCode <= 0xdfff) {
-      leftCode = 0xfffd
-    }
-    if (rightCode >= 0xd800 && rightCode <= 0xdbff) {
-      const low = right.charCodeAt(rightIndex)
-      if (low >= 0xdc00 && low <= 0xdfff) {
-        rightCode = 0x10000 + ((rightCode - 0xd800) << 10) + low - 0xdc00
-        rightIndex++
-      } else {
-        rightCode = 0xfffd
-      }
-    } else if (rightCode >= 0xdc00 && rightCode <= 0xdfff) {
-      rightCode = 0xfffd
-    }
+    let leftCode = left.codePointAt(leftIndex), rightCode = right.codePointAt(rightIndex)
+    leftIndex += leftCode > 0xffff ? 2 : 1
+    rightIndex += rightCode > 0xffff ? 2 : 1
+    if (leftCode >= 0xd800 && leftCode <= 0xdfff) leftCode = 0xfffd
+    if (rightCode >= 0xd800 && rightCode <= 0xdfff) rightCode = 0xfffd
     if (leftCode < rightCode) return -1
     if (leftCode > rightCode) return 1
   }
@@ -99,24 +79,7 @@ function compareUtf8(left, right) {
 function wellFormedString(string) {
   if (string.isWellFormed && string.isWellFormed()) return string
   if (string.toWellFormed) return string.toWellFormed()
-  let result = ''
-  for (let i = 0; i < string.length; i++) {
-    const code = string.charCodeAt(i)
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const low = string.charCodeAt(i + 1)
-      if (low >= 0xdc00 && low <= 0xdfff) {
-        result += string[i] + string[i + 1]
-        i++
-      } else {
-        result += '�'
-      }
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      result += '�'
-    } else {
-      result += string[i]
-    }
-  }
-  return result
+  return string.replace(/([\ud800-\udbff][\udc00-\udfff])|[\ud800-\udfff]/g, (match, pair) => pair || '\ufffd')
 }
 
 export {

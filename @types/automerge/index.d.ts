@@ -16,14 +16,12 @@ declare namespace Automerge {
 
   type InitOptions<T> =
     | string // = actorId
-    | { 
+    | {
       actor?: string | null
-      actorId?: string
       allowMissingChanges?: boolean
       convertImmutableStringsToText?: boolean
-      deferActorId?: boolean
       freeze?: boolean
-      patchCallback?: PatchCallback<T> | LegacyPatchCallback<T>
+      patchCallback?: PatchCallback<T>
       unchecked?: boolean
     }
 
@@ -32,11 +30,10 @@ declare namespace Automerge {
     | {
       message?: string
       time?: number
-      patchCallback?: PatchCallback<T> | LegacyPatchCallback<T>
+      patchCallback?: PatchCallback<T>
     }
 
   type PatchCallback<T> = (patches: Patch[], info: PatchInfo<T>) => void
-  type LegacyPatchCallback<T> = (patch: BackendPatch, before: T, after: T, local: boolean, changes: BinaryChange[]) => void
   function merge<T>(localdoc: Doc<T>, remotedoc: Doc<T>, options?: ApplyOptions<T>): Doc<T>
 
   function change<T>(doc: Doc<T>, options: ChangeOptions<T>, callback: ChangeFn<T>): Doc<T>
@@ -181,7 +178,7 @@ declare namespace Automerge {
   }
 
   interface ApplyOptions<T> {
-    patchCallback?: PatchCallback<T> | LegacyPatchCallback<T>
+    patchCallback?: PatchCallback<T>
   }
 
   type PatchSource =
@@ -517,7 +514,6 @@ export import free = Automerge.free
 export import InitOptions = Automerge.InitOptions
 export import ChangeOptions = Automerge.ChangeOptions
 export import PatchCallback = Automerge.PatchCallback
-export import LegacyPatchCallback = Automerge.LegacyPatchCallback
 export import merge = Automerge.merge
 export import change = Automerge.change
 export import emptyChange = Automerge.emptyChange

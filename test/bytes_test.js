@@ -21,7 +21,7 @@ describe('byte values', () => {
 
   it('preserves conflicting byte values', () => {
     let left = Automerge.from({bytes: new Uint8Array([0])}, 'aa')
-    let right = Automerge.clone(left, {actorId: 'bb'})
+    let right = Automerge.clone(left, {actor: 'bb'})
     left = Automerge.change(left, draft => { draft.bytes = new Uint8Array([1]) })
     right = Automerge.change(right, draft => { draft.bytes = new Uint8Array([2]) })
     const merged = Automerge.merge(left, right)

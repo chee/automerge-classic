@@ -28,6 +28,11 @@ function getValue(patch, object, updated, textV2) {
   }
 }
 
+function getStoredValue(patch, object, updated, textV2) {
+  const value = getValue(patch, object, updated, textV2)
+  return textV2 && typeof value === 'string' ? new ImmutableString(value) : value
+}
+
 /**
  * Compares two strings, interpreted as Lamport timestamps of the form
  * 'counter@actorId'. Returns 1 if ts1 is greater, or -1 if ts2 is greater.
@@ -65,13 +70,7 @@ function applyProperties(props, object, conflicts, updated, textV2) {
   for (let key of Object.keys(props).sort(compareUtf8)) {
     const values = {}, opIds = Object.keys(props[key]).sort(lamportCompare)
     for (let opId of opIds) {
-      const subpatch = props[key][opId]
-      if (conflicts[key] && conflicts[key][opId]) {
-        values[opId] = getValue(subpatch, conflicts[key][opId], updated, textV2)
-      } else {
-        values[opId] = getValue(subpatch, undefined, updated, textV2)
-      }
-      if (textV2 && typeof values[opId] === 'string') values[opId] = new ImmutableString(values[opId])
+      values[opId] = getStoredValue(props[key][opId], conflicts[key] && conflicts[key][opId], updated, textV2)
     }
 
     if (opIds.length === 0) {
@@ -146,10 +145,9 @@ function updateListObject(patch, obj, updated, textV2) {
     const edit = patch.edits[i]
 
     if (edit.action === 'insert' || edit.action === 'update') {
-      const oldValue = conflicts[edit.index] && conflicts[edit.index][edit.opId]
-      let lastValue = getValue(edit.value, oldValue, updated, textV2)
-      if (textV2 && typeof lastValue === 'string') lastValue = new ImmutableString(lastValue)
-      let values = {[edit.opId]: lastValue}
+      const oldValues = conflicts[edit.index] || {}
+      let lastValue = getStoredValue(edit.value, oldValues[edit.opId], updated, textV2)
+      const values = {[edit.opId]: lastValue}
 
       // Successive updates for the same index are an indication of a conflict on that list element.
       // Edits are sorted in increasing order by Lamport timestamp, so the last value (with the
@@ -158,18 +156,17 @@ function updateListObject(patch, obj, updated, textV2) {
              patch.edits[i + 1].action === 'update') {
         i++
         const conflict = patch.edits[i]
-        const oldValue2 = conflicts[conflict.index] && conflicts[conflict.index][conflict.opId]
-        lastValue = getValue(conflict.value, oldValue2, updated, textV2)
-        if (textV2 && typeof lastValue === 'string') lastValue = new ImmutableString(lastValue)
+        lastValue = getStoredValue(conflict.value, oldValues[conflict.opId], updated, textV2)
         values[conflict.opId] = lastValue
       }
 
+      const visible = textV2 && lastValue instanceof Text ? lastValue.toJSON() : lastValue
       if (edit.action === 'insert') {
-        list.splice(edit.index, 0, textV2 && lastValue instanceof Text ? lastValue.toJSON() : lastValue)
+        list.splice(edit.index, 0, visible)
         conflicts.splice(edit.index, 0, values)
         elemIds.splice(edit.index, 0, edit.elemId)
       } else {
-        list[edit.index] = textV2 && lastValue instanceof Text ? lastValue.toJSON() : lastValue
+        list[edit.index] = visible
         conflicts[edit.index] = values
       }
 
@@ -178,8 +175,7 @@ function updateListObject(patch, obj, updated, textV2) {
       const datatype = edit.datatype
       edit.values.forEach((value, index) => {
         const elemId = `${startElemId.counter + index}@${startElemId.actorId}`
-        value = getValue({ value, datatype }, undefined, updated, textV2)
-        const scalar = textV2 && typeof value === 'string' ? new ImmutableString(value) : value
+        const scalar = getStoredValue({ value, datatype }, undefined, updated, textV2)
         newValues.push(scalar)
         newConflicts.push({[elemId]: {value: scalar, datatype, type: 'value'}})
         newElems.push(elemId)
@@ -281,16 +277,6 @@ function interpretPatch(patch, obj, updated, textV2 = false) {
 }
 
 /**
- * Creates a writable copy of the immutable document root object `root`.
- */
-function cloneRootObject(root) {
-  if (root[OBJECT_ID] !== '_root') {
-    throw new RangeError(`Not the root object: ${root[OBJECT_ID]}`)
-  }
-  return cloneMapObject(root, '_root')
-}
-
-/**
  * Moves the keys added to the map object `object` since it was cloned to the
  * end of its enumeration order, sorted by UTF-8 encoding. This matches the
  * Rust implementation, where each apply appends its new keys in sorted order
@@ -309,5 +295,5 @@ function reorderNewKeys(object) {
 }
 
 export {
-  interpretPatch, cloneRootObject, lamportCompare, reorderNewKeys
+  interpretPatch, cloneMapObject, lamportCompare, reorderNewKeys
 }

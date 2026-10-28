@@ -1,7 +1,7 @@
 import { CACHE, CHANGE, CONFLICTS, ELEM_IDS, OBJECT_ID, OPTIONS, PROXY_PATH, STATE } from './constants.js'
 import { copyObject, isObject } from '../src/common.js'
 import uuid from '../src/uuid.js'
-import { cloneRootObject, interpretPatch, lamportCompare, reorderNewKeys } from './apply_patch.js'
+import { cloneMapObject, interpretPatch, lamportCompare, reorderNewKeys } from './apply_patch.js'
 import { rootObjectProxy } from './proxies.js'
 import { Context } from './context.js'
 import { Text } from './text.js'
@@ -31,7 +31,7 @@ function checkActorId(actorId) {
 function updateRootObject(doc, updated, state) {
   let newDoc = updated._root
   if (!newDoc) {
-    newDoc = cloneRootObject(doc[CACHE]._root)
+    newDoc = cloneMapObject(doc[CACHE]._root, '_root')
     updated._root = newDoc
   }
   for (let objectId of Object.keys(updated)) {
@@ -44,13 +44,9 @@ function updateRootObject(doc, updated, state) {
 
   if (doc[OPTIONS].freeze) {
     for (let objectId of Object.keys(updated)) {
-      if (updated[objectId] instanceof Text) {
-        Object.freeze(updated[objectId].elems)
-        Object.freeze(updated[objectId])
-      } else {
-        Object.freeze(updated[objectId])
-        Object.freeze(updated[objectId][CONFLICTS])
-      }
+      const object = updated[objectId]
+      Object.freeze(object instanceof Text ? object.elems : object[CONFLICTS])
+      Object.freeze(object)
     }
   }
 
@@ -75,10 +71,7 @@ function updateRootObject(doc, updated, state) {
  * string describing the change.
  */
 function makeChange(doc, context, options) {
-  const actor = getActorId(doc)
-  if (!actor) {
-    throw new Error('Actor ID must be initialized with setActorId() before making a change')
-  }
+  const actor = context.actorId
   const state = copyObject(doc[STATE])
   state.seq += 1
 
@@ -89,7 +82,7 @@ function makeChange(doc, context, options) {
     deps: state.deps,
     time: (options && Object.prototype.hasOwnProperty.call(options, 'time'))
       ? (typeof options.time === 'number' ? options.time : 0)
-      : Math.round(new Date().getTime() / 1000),
+      : Math.round(Date.now() / 1000),
     message: (options && typeof options.message === 'string') ? options.message : '',
     ops: context.ops
   }
@@ -110,61 +103,43 @@ function makeChange(doc, context, options) {
       state.maxOp = Math.max(state.maxOp, patch.maxOp)
       newDoc = updateRootObject(doc, context.updated, state)
     } else {
-      newDoc = applyPatchToDoc(doc, patch, state, true)
+      newDoc = applyPatchToDoc(doc, patch, state)
     }
     const patchCallback = options && options.patchCallback || doc[OPTIONS].patchCallback
     if (patchCallback) patchCallback(patch, doc, newDoc, true, [binaryChange])
     return [newDoc, change]
 
   } else {
-    const queuedRequest = {actor, seq: change.seq, before: doc}
-    state.requests = state.requests.concat([queuedRequest])
-    state.maxOp = state.maxOp + countOps(change.ops)
+    state.requests = state.requests.concat([{actor, seq: change.seq, before: doc}])
+    state.maxOp += change.ops.reduce((count, op) => count + (op.action === 'set' && op.values ? op.values.length : 1), 0)
     state.deps = []
-    return [updateRootObject(doc, context ? context.updated : {}, state), change]
+    return [updateRootObject(doc, context.updated, state), change]
   }
-}
-
-function countOps(ops) {
-  let count = 0
-  for (const op of ops) {
-    if (op.action === 'set' && op.values) {
-      count += op.values.length
-    } else {
-      count += 1
-    }
-  }
-  return count
 }
 
 /**
  * Returns the binary encoding of the last change made by the local actor.
  */
 function getLastLocalChange(doc) {
-  return doc[STATE] && doc[STATE].lastLocalChange ? doc[STATE].lastLocalChange : null
+  return doc[STATE] && doc[STATE].lastLocalChange || null
 }
 
 /**
  * Applies the changes described in `patch` to the document with root object
  * `doc`. The state object `state` is attached to the new root object.
- * `fromBackend` should be set to `true` if the patch came from the backend,
- * and to `false` if the patch is a transient local (optimistically applied)
- * change from the frontend.
  */
-function applyPatchToDoc(doc, patch, state, fromBackend) {
+function applyPatchToDoc(doc, patch, state) {
   const actor = getActorId(doc)
   const updated = {}
   interpretPatch(patch.diffs, doc, updated, !!doc[OPTIONS].textV2)
 
-  if (fromBackend) {
-    if (!patch.clock) throw new RangeError('patch is missing clock field')
-    if (patch.clock[actor] && patch.clock[actor] > state.seq) {
-      state.seq = patch.clock[actor]
-    }
-    state.clock = patch.clock
-    state.deps  = patch.deps
-    state.maxOp = Math.max(state.maxOp, patch.maxOp)
+  if (!patch.clock) throw new RangeError('patch is missing clock field')
+  if (patch.clock[actor] && patch.clock[actor] > state.seq) {
+    state.seq = patch.clock[actor]
   }
+  state.clock = patch.clock
+  state.deps  = patch.deps
+  state.maxOp = Math.max(state.maxOp, patch.maxOp)
   return updateRootObject(doc, updated, state)
 }
 
@@ -242,18 +217,8 @@ function change(doc, options, callback) {
   if (typeof options === 'function' && callback === undefined) {
     [options, callback] = [callback, options]
   }
-  if (typeof options === 'string') {
-    options = {message: options}
-  }
-  if (options !== undefined && !isObject(options)) {
-    throw new TypeError('Unsupported type of options')
-  }
-
-  const actorId = getActorId(doc)
-  if (!actorId) {
-    throw new Error('Actor ID must be initialized with setActorId() before making a change')
-  }
-  const context = new Context(doc, actorId)
+  options = changeOptions(options)
+  const context = new Context(doc, getActorId(doc))
   callback(rootObjectProxy(context))
 
   if (Object.keys(context.updated).length === 0) {
@@ -276,18 +241,16 @@ function emptyChange(doc, options) {
   if (doc[OBJECT_ID] !== '_root') {
     throw new TypeError('The first argument to Automerge.emptyChange must be the document root')
   }
-  if (typeof options === 'string') {
-    options = {message: options}
-  }
+  options = changeOptions(options)
+  return makeChange(doc, new Context(doc, getActorId(doc)), options)
+}
+
+function changeOptions(options) {
+  if (typeof options === 'string') return {message: options}
   if (options !== undefined && !isObject(options)) {
     throw new TypeError('Unsupported type of options')
   }
-
-  const actorId = getActorId(doc)
-  if (!actorId) {
-    throw new Error('Actor ID must be initialized with setActorId() before making a change')
-  }
-  return makeChange(doc, new Context(doc, actorId), options)
+  return options
 }
 
 /**
@@ -307,7 +270,7 @@ function applyPatch(doc, patch, backendState = undefined) {
       throw new RangeError('applyPatch must be called with the updated backend state')
     }
     state.backendState = backendState
-    return applyPatchToDoc(doc, patch, state, true)
+    return applyPatchToDoc(doc, patch, state)
   }
 
   let baseDoc
@@ -327,7 +290,7 @@ function applyPatch(doc, patch, backendState = undefined) {
     state.requests = []
   }
 
-  let newDoc = applyPatchToDoc(baseDoc, patch, state, true)
+  let newDoc = applyPatchToDoc(baseDoc, patch, state)
   if (state.requests.length === 0) {
     return newDoc
   } else {
@@ -345,8 +308,7 @@ function internalValue(object, key) {
   const container = context ? context.getObject(object[OBJECT_ID]) : object
   const values = container && container[CONFLICTS] && container[CONFLICTS][key]
   if (!values) return container && container[key]
-  const opIds = Object.keys(values).sort(lamportCompare).reverse()
-  return values[opIds[0]]
+  return values[Object.keys(values).sort(lamportCompare).pop()]
 }
 
 function getObjectId(object, prop) {
@@ -432,15 +394,12 @@ function getConflicts(object, key) {
   const container = context ? context.getObject(object[OBJECT_ID]) : object
   const values = container && container[CONFLICTS] && container[CONFLICTS][key]
   if (!values || Object.keys(values).length <= 1) return
-  if (!context) {
-    const conflicts = {}, proxies = new WeakMap()
-    for (const opId of Object.keys(values)) conflicts[opId] = readonlyConflict(values[opId], proxies)
-    return conflicts
-  }
-  const conflicts = {}
+  const conflicts = {}, proxies = new WeakMap()
   for (const opId of Object.keys(values)) {
     const value = values[opId]
-    if (isObject(value) && value[OBJECT_ID]) {
+    if (!context) {
+      conflicts[opId] = readonlyConflict(value, proxies)
+    } else if (isObject(value) && value[OBJECT_ID]) {
       const path = object[PROXY_PATH].concat([{key, objectId: value[OBJECT_ID]}])
       conflicts[opId] = context.instantiateObject(path, value[OBJECT_ID])
     } else {
@@ -473,11 +432,7 @@ function getBackendState(doc, callerName = null, argPos = 'first') {
  * containing the unique element ID of each list element/character.
  */
 function getElementIds(list) {
-  if (list instanceof Text) {
-    return list.elems.map(elem => elem.elemId)
-  } else {
-    return list[ELEM_IDS]
-  }
+  return list instanceof Text ? list.elems.map(elem => elem.elemId) : list[ELEM_IDS]
 }
 
 export {

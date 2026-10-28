@@ -32,16 +32,10 @@ function applyChanges(backend, changes) {
 }
 
 function hashByActor(state, actorId, index) {
-  if (state.hashesByActor[actorId] && state.hashesByActor[actorId][index]) {
-    return state.hashesByActor[actorId][index]
-  }
-  if (!state.haveHashGraph) {
-    state.computeHashGraph()
-    if (state.hashesByActor[actorId] && state.hashesByActor[actorId][index]) {
-      return state.hashesByActor[actorId][index]
-    }
-  }
-  throw new RangeError(`Unknown change: actorId = ${actorId}, seq = ${index + 1}`)
+  if (!state.hashesByActor[actorId]?.[index] && !state.haveHashGraph) state.computeHashGraph()
+  const hash = state.hashesByActor[actorId]?.[index]
+  if (!hash) throw new RangeError(`Unknown change: actorId = ${actorId}, seq = ${index + 1}`)
+  return hash
 }
 
 /**
@@ -73,12 +67,7 @@ function applyLocalChange(backend, change) {
   // using a few extra bytes of storage).
   if (change.seq > 1) {
     const lastHash = hashByActor(state, change.actor, change.seq - 2)
-    if (!lastHash) {
-      throw new RangeError(`Cannot find hash of localChange before seq=${change.seq}`)
-    }
-    let deps = {[lastHash]: true}
-    for (let hash of change.deps) deps[hash] = true
-    change.deps = Object.keys(deps).sort()
+    change.deps = [...new Set([lastHash, ...change.deps])].sort()
   }
 
   state.adjustInsertAnchors(change)
@@ -262,21 +251,13 @@ function stats(backend) {
   return backendState(backend, true).stats()
 }
 
-function saveBundle(changes) {
-  return encodeBundle(changes)
-}
-
 function saveBundleByHash(backend, hashes) {
   return encodeBundle(backendState(backend, true).getChangesByHash(hashes))
-}
-
-function readBundle(data) {
-  return decodeBundle(data)
 }
 
 export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
   load, loadChanges, loadIncremental, getPatch, getHeads, getAllChanges, getChanges,
   getChangesAdded, getChangeByHash, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta,
-  getChangesByHash, topoHistoryTraversal, stats, saveBundle, saveBundleByHash, readBundle
+  getChangesByHash, topoHistoryTraversal, stats, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
 }
