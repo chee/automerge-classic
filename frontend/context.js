@@ -1,6 +1,6 @@
 import { CACHE, CONFLICTS, ELEM_IDS, OBJECT_ID, OPTIONS, STATE } from './constants.js'
 import { interpretPatch, lamportCompare } from './apply_patch.js'
-import { Text, elemAt } from './text.js'
+import { Text, elemAt, textOffset } from './text.js'
 import { Counter, getWriteableCounter } from './counter.js'
 import { Float64, Int, Uint } from './numbers.js'
 import { compareUtf8, createArrayOfNulls, equalBytes, isObject, parseOpId, wellFormedString } from '../src/common.js'
@@ -20,6 +20,7 @@ class Context {
     this.cache = doc[CACHE]
     this.updated = {}
     this.ops = []
+    this.events = []
     this.textV2 = !!(doc[OPTIONS] && doc[OPTIONS].textV2)
     this.applyPatch = applyPatch || ((patch, object, updated) => interpretPatch(patch, object, updated, this.textV2))
   }
@@ -207,6 +208,7 @@ class Context {
       for (let nested of Object.keys(value).sort(compareUtf8)) {
         const opId = this.nextOpId()
         subpatch.props[nested] = {[opId]: this.setValue(objectId, nested, value[nested], false, [])}
+        this.events.push({objectId, kind: 'put', prop: nested, value: eventValue(subpatch.props[nested][opId])})
       }
     }))
     return subpatch
@@ -300,6 +302,7 @@ class Context {
         }
         const opId = this.nextOpId()
         subpatch.props[key] = {[opId]: this.setValue(objectId, key, value, false, pred)}
+        this.events.push({objectId, kind: 'put', prop: key, value: eventValue(subpatch.props[key][opId])})
       }
     })
   }
@@ -314,6 +317,7 @@ class Context {
     if (object[key] !== undefined) {
       const pred = getPred(object, key)
       this.addOp({action: 'del', obj: objectId, key, insert: false, pred})
+      this.events.push({objectId, kind: 'delMap', prop: key})
       this.applyAtPath(path, subpatch => {
         subpatch.props[key] = {}
       })
@@ -334,7 +338,9 @@ class Context {
     if (values.length === 0) return
 
     let elemId = getElemId(list, index, true)
-    const stringValues = subpatch.type === 'text' || !this.textV2
+    const isText = subpatch.type === 'text', objectId = subpatch.objectId
+    let at = isText && !newObject ? textOffset(list, index) : index
+    const stringValues = isText || !this.textV2
     const allPrimitive = values.length > 1 && values.every(v => stringValues && typeof v === 'string' ||
       typeof v === 'number' || typeof v === 'boolean' || v === null || isScalarObject(v))
     const descriptions = allPrimitive ? values.map(v => this.getValueDescription(v, true)) : []
@@ -350,12 +356,26 @@ class Context {
       }
       this.addOp(op)
       subpatch.edits.push(edit)
+      if (isText) {
+        spliceEvent(this.events, objectId, at, values.join(''), this.nextOpNum - 1)
+      } else {
+        for (let offset = 0; offset < values.length; offset++) {
+          this.events.push({objectId, kind: 'insert', prop: index + offset, value: eventValue(descriptions[offset])})
+        }
+      }
     } else {
       for (let offset = 0; offset < values.length; offset++) {
         let nextElemId = this.nextOpId()
         const valuePatch = this.setValue(subpatch.objectId, index + offset, values[offset], true, [], elemId, subpatch.type === 'text')
         elemId = nextElemId
         subpatch.edits.push({action: 'insert', index: index + offset, elemId, opId: elemId, value: valuePatch})
+        if (isText && typeof values[offset] === 'string') {
+          spliceEvent(this.events, objectId, at, values[offset], this.nextOpNum - 1)
+          at += values[offset].length
+        } else {
+          this.events.push({objectId, kind: 'insert', prop: at, value: eventValue(valuePatch)})
+          at++
+        }
       }
     }
   }
@@ -390,6 +410,7 @@ class Context {
         const opId = this.nextOpId()
         const valuePatch = this.setValue(objectId, index, value, false, pred, elemId)
         subpatch.edits.push({action: 'update', index, opId, value: valuePatch})
+        this.events.push({objectId, kind: 'put', prop: index, value: eventValue(valuePatch)})
       })
     }
   }
@@ -432,6 +453,12 @@ class Context {
         }
         this.addOp(op)
         subpatch.edits.push({action: 'remove', index: start, count: deletions})
+        if (list instanceof Text) {
+          const at = textOffset(list, start)
+          this.events.push({objectId, kind: 'del', prop: at, length: textOffset(list, start + deletions) - at})
+        } else {
+          this.events.push({objectId, kind: 'del', prop: start, length: deletions})
+        }
       }
       if (insertions.length > 0) this.insertListItems(subpatch, start, insertions, false)
     })
@@ -466,6 +493,10 @@ class Context {
     // they extend. Conflicting values that are not counters are overwritten
     // by the increment, as in the Rust implementation.
     const conflicts = (object[CONFLICTS] && object[CONFLICTS][key]) || {[pred[0]]: object[key]}
+    const counter = Object.keys(conflicts).sort(lamportCompare).find(opId => conflicts[opId] instanceof Counter)
+    this.events.push(Object.keys(conflicts).length > 1
+      ? {objectId, kind: 'put', prop: key, value: {value: conflicts[counter].value + delta, datatype: 'counter'}}
+      : {objectId, kind: 'inc', prop: key, value: delta})
     const values = {}
     for (const [opId, conflict] of Object.entries(conflicts)) {
       if (conflict instanceof Counter) values[opId] = {value: conflict.value + delta, datatype: 'counter'}
@@ -480,6 +511,20 @@ class Context {
       }
     })
   }
+}
+
+function spliceEvent(events, objectId, prop, text, counter) {
+  const last = events[events.length - 1]
+  if (last && last.kind === 'splice' && last.objectId === objectId && last.prop + last.text.length === prop) {
+    last.text += text
+    last.counter = counter
+  } else {
+    events.push({objectId, kind: 'splice', prop, text, counter})
+  }
+}
+
+function eventValue(description) {
+  return description.objectId ? {objectType: description.type} : {value: description.value, datatype: description.datatype}
 }
 
 function pathObjectId(path) {

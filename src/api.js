@@ -1,13 +1,15 @@
 import * as Frontend from '../frontend/index.js'
-import { CHANGE, CONFLICTS, OBJECT_ID, OPTIONS, STATE } from '../frontend/constants.js'
-import { decodeChange, decodeChangeColumns, decodeChanges, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
+import { CHANGE, OPTIONS, STATE } from '../frontend/constants.js'
+import { decodeChange, decodeChangeColumns, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
 import { compareUtf8, isObject, parseOpId, wellFormedString } from './common.js'
 import { ImmutableString, isImmutableString } from './immutable_string.js'
 import { graphemes, myersDiff, replaceHook } from './text_diff.js'
-import { instantiateText } from '../frontend/text.js'
+import { instantiateText, textOffset } from '../frontend/text.js'
 import * as backend from '../backend/index.js'
 
 const viewDocs = new WeakSet()
+const recentPatches = new WeakMap()
+const diffCache = new WeakMap()
 
 /**
  * Automerge.* API
@@ -89,7 +91,9 @@ export function emptyChange(doc, options) {
 }
 
 export function clone(doc, options = {}) {
-  return fromState(backend.clone(Frontend.getBackendState(doc, 'clone')), options)
+  const copy = fromState(backend.clone(Frontend.getBackendState(doc, 'clone')), options)
+  if (recentPatches.has(doc)) recentPatches.set(copy, recentPatches.get(doc))
+  return copy
 }
 
 export function free(doc) {
@@ -101,7 +105,7 @@ export function load(data, options = {}) {
   if ((!isObject(options) || !options.allowMissingChanges) && backend.getMissingDeps(state).length > 0) {
     throw new RangeError("change's deps should already be in the document")
   }
-  let doc = applyBackendPatch(init(options), backend.getPatch(state), state, [data], options, 'loadIncremental')
+  let doc = applyBackendPatch(init(options), backend.getPatch(state), state, options, 'loadIncremental')
   if (isObject(options) && options.convertImmutableStringsToText) {
     doc = changeWithSource(doc, {time: 0}, migrateImmutableStrings, 'loadIncremental')
   }
@@ -180,43 +184,65 @@ export function getChangesMetaSince(doc, heads) {
 function patchOptions(doc, options, source) {
   const normalized = typeof options === 'string' ? {message: options} : Object.assign({}, options)
   const callback = normalized.patchCallback || doc[OPTIONS] && doc[OPTIONS].patchCallback
-  if (callback) {
-    normalized.patchCallback = (patch, before, after, local, changes) => {
-      callPatchCallback(callback, before, after, changes, source)
-    }
+  normalized.patchCallback = (patch, before, after, local, changes, events) => {
+    const state = Frontend.getBackendState(after), clock = after[STATE].clock, beforeHeads = getHeads(before)
+    const actor = Frontend.getActorId(after), startOp = before[STATE].maxOp + 1
+    progress(before, after, callback, source, source === 'emptyChange' ? undefined : beforeHeads,
+      beforeHeads.length === 0 ? () => backend.clockDiff(state, {}, clock, diffValue, false)
+        : () => backend.localPatches(state, changes[0], actor, startOp, clock, events, diffValue),
+      events.length > 0 ? null : [])
   }
   return normalized
 }
 
-function callPatchCallback(callback, before, after, changes, source) {
-  const scope = documentHasMarkOps(after) ? changeScope(changes, before, after) : {}
-  const patches = patchesBetween(before, after, scope.objects, scope.clock)
-  if (patches.length > 0) callback(patches, {before, after, source})
+function progress(before, after, callback, source, beforeHeads, compute, patches = null) {
+  if (callback && !patches) patches = compute()
+  if (callback && patches.length > 0) callback(patches, {before, after, source})
+  const heads = getHeads(after), state = Frontend.getBackendState(after)
+  diffCache.set(state.state, {before: getHeads(before), after: heads, objectId: '_root', recursive: true, compute})
+  const changed = patches ? patches.length > 0 : !equals(getHeads(before), heads)
+  if (!changed) {
+    if (recentPatches.has(before)) recentPatches.set(after, recentPatches.get(before))
+  } else if (beforeHeads) {
+    recentPatches.set(after, {before: beforeHeads, after: heads, patches, compute})
+  }
 }
 
-function applyBackendPatch(doc, patch, backendState, changes, options, source) {
+function cachedDiff(doc, before, after, objectId, recursive) {
+  const state = Frontend.getBackendState(doc), key = state.source || state.state, cached = diffCache.get(key)
+  if (cached && cached.compute && equals(cached.before, before) && equals(cached.after, after) &&
+      cached.objectId === objectId && cached.recursive === recursive) return cached.compute()
+  diffCache.set(key, {before, after, objectId, recursive, compute: null})
+  return backend.diff(state, before, after, diffValue, objectId, recursive)
+}
+
+function applyBackendPatch(doc, patch, backendState, options, source, beforeHeads) {
   const newDoc = Frontend.applyPatch(doc, patch, backendState)
-  const patchCallback = options.patchCallback || doc[OPTIONS].patchCallback
-  if (patchCallback) callPatchCallback(patchCallback, doc, newDoc, changes, source)
+  const before = doc[STATE].clock, after = newDoc[STATE].clock, batch = getHeads(doc).length > 0
+  progress(doc, newDoc, options.patchCallback || doc[OPTIONS].patchCallback, source, beforeHeads,
+    () => backend.clockDiff(backendState, before, after, diffValue, batch))
   return newDoc
 }
 
 export function applyChanges(doc, changes, options = {}) {
-  return [applyChangesWithSource(doc, changes, options, 'applyChanges')]
+  return [applyChangesWithSource(doc, changes, options, 'applyChanges', getHeads(doc))]
 }
 
-function applyChangesWithSource(doc, changes, options, source) {
+function applyChangesWithSource(doc, changes, options, source, beforeHeads) {
   assertWritable(doc)
   const [newState, patch] = backend.applyChanges(Frontend.getBackendState(doc, 'applyChanges'), changes)
-  return applyBackendPatch(doc, patch, newState, changes, options, source)
+  return applyBackendPatch(doc, patch, newState, options, source, beforeHeads)
 }
 
 export function loadIncremental(doc, data, options = {}) {
   assertWritable(doc)
   const oldState = Frontend.getBackendState(doc, 'loadIncremental')
   const [newState, patch] = backend.loadIncremental(oldState, data)
-  if (!patch) return doc
-  return applyBackendPatch(doc, patch, newState, [data], options, 'loadIncremental')
+  if (!patch) {
+    diffCache.delete(oldState.state)
+    return doc
+  }
+  return applyBackendPatch(doc, patch, newState, options, 'loadIncremental')
 }
 
 export function saveIncremental(doc) {
@@ -396,7 +422,7 @@ export function addCommits(doc, commits, options) {
   }
   const changes = inputs.map(commit => commit.bytes)
   const [newState, patch] = backend.applyChanges(state, changes)
-  return applyBackendPatch(doc, patch, newState, changes, options || {}, 'addCommits')
+  return applyBackendPatch(doc, patch, newState, options || {}, 'addCommits', getHeads(doc))
 }
 
 export function addFragments(doc, fragments, options) {
@@ -416,8 +442,11 @@ export function addFragments(doc, fragments, options) {
     if (state.frozen) throw error
     throw new RangeError(`error loading fragment bundles: ${parseErrorMessage(data, error, 'chunk')}`)
   }
-  if (!patch) return doc
-  return applyBackendPatch(doc, patch, newState, [data], options || {}, 'addFragments')
+  if (!patch) {
+    diffCache.delete(state.state)
+    return doc
+  }
+  return applyBackendPatch(doc, patch, newState, options || {}, 'addFragments', getHeads(doc))
 }
 
 export function equals(val1, val2) {
@@ -446,6 +475,7 @@ export function view(doc, heads) {
   const [state, patch] = backend.view(Frontend.getBackendState(doc, 'view'), heads)
   const snapshot = Frontend.applyPatch(init({freeze: doc[OPTIONS].freeze}), patch, state)
   viewDocs.add(snapshot)
+  if (recentPatches.has(doc)) recentPatches.set(snapshot, recentPatches.get(doc))
   return snapshot
 }
 
@@ -468,7 +498,7 @@ export function changeAt(doc, heads, options, callback) {
   const oldState = Frontend.getBackendState(doc, 'changeAt')
   const changedState = Frontend.getBackendState(changed, 'changeAt', 'second')
   const changes = backend.getChangesAdded(oldState, changedState)
-  return {newDoc: applyChangesWithSource(doc, changes, options || {}, 'changeAt'), newHeads}
+  return {newDoc: applyChangesWithSource(doc, changes, options || {}, 'changeAt', heads), newHeads}
 }
 
 export function toJS(value) {
@@ -697,279 +727,16 @@ function isRecord(value) {
   return prototype === Object.prototype || prototype === null
 }
 
-// Text elements are matched by their element ID where both sides have one:
-// two elements can hold the same character and still be different elements,
-// and which one survives a change decides which marks apply to it. A block
-// marker that keeps its identity is updated in place, like the Rust
-// implementation, rather than deleted and reinserted.
-function textElements(value) {
-  if (value instanceof Frontend.Text) return value.elems
-  return [...value].map(item => ({value: item}))
-}
-
-function sameTextElement(left, right) {
-  if (left.elemId && right.elemId) return left.elemId === right.elemId
-  if (sameValue(left.value, right.value)) return true
-  if (!isRecord(left.value) || !isRecord(right.value)) return false
-  const leftId = left.value[OBJECT_ID], rightId = right.value[OBJECT_ID]
-  return Boolean(leftId) && leftId === rightId
-}
-
-/**
- * Emits a run of text elements as `splice` patches, starting a new patch
- * whenever the mark set changes, and calling `onBlock` for each non-string
- * element after emitting its placeholder insert. Returns the index reached.
- */
-function emitTextRuns(target, path, startIndex, items, marksOf, onBlock) {
-  let index = startIndex, text = '', textMarks
-  function flushText() {
-    if (text.length === 0) return
-    const patch = {action: 'splice', path: path.concat(index), value: text}
-    if (textMarks && Object.keys(textMarks).length > 0) patch.marks = Object.assign({}, textMarks)
-    target.push(patch)
-    index += text.length
-    text = ''
-    textMarks = undefined
-  }
-  for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
-    const item = items[itemIndex]
-    const itemMarks = marksOf(itemIndex) || {}
-    if (typeof item === 'string') {
-      if (text.length > 0 && !sameValue(textMarks, itemMarks)) flushText()
-      if (text.length === 0) textMarks = itemMarks
-      text += item
-      continue
-    }
-    flushText()
-    target.push({action: 'insert', path: path.concat(index), values: [{}]})
-    onBlock(item, index)
-    index++
-  }
-  flushText()
-  return index
-}
-
-function appendRichTextDiff(patches, beforeText, afterText, path, afterDoc) {
-  const before = textElements(beforeText), after = textElements(afterText)
-  const updatedPrefix = [], updatedSuffix = []
-  let prefix = 0
-  while (prefix < before.length && prefix < after.length && sameTextElement(before[prefix], after[prefix])) {
-    if (!sameValue(before[prefix].value, after[prefix].value)) updatedPrefix.push([prefix, prefix])
-    prefix++
-  }
-  let suffix = 0
-  while (suffix < before.length - prefix && suffix < after.length - prefix &&
-         sameTextElement(before[before.length - suffix - 1], after[after.length - suffix - 1])) {
-    if (!sameValue(before[before.length - suffix - 1].value, after[after.length - suffix - 1].value)) {
-      updatedSuffix.push([before.length - suffix - 1, after.length - suffix - 1])
-    }
-    suffix++
-  }
-  function width(items) {
-    return items.reduce((total, item) => total + textElementWidth(item.value), 0)
-  }
-  function appendUpdated(pairs) {
-    for (const [beforeIndex, afterIndex] of pairs.sort((left, right) => left[1] - right[1])) {
-      const at = width(after.slice(0, afterIndex))
-      // block attributes hold no marks, and their paths run through a text
-      // index that the document value cannot be walked through
-      appendRecordDiff(patches, before[beforeIndex].value, after[afterIndex].value, path.concat(at), null)
-    }
-  }
-  appendUpdated(updatedPrefix)
-  const removed = before.length - prefix - suffix
-  const offset = width(before.slice(0, prefix))
-  const deleteLength = width(before.slice(prefix, prefix + removed))
-  const inserted = after.slice(prefix, after.length - suffix).map(item => item.value)
-  const insertBeforeDelete = removed > 0 && inserted.length > 0 && inserted.every(value => typeof value === 'string')
-  if (removed > 0 && !insertBeforeDelete) appendDelete(patches, path.concat(offset), deleteLength)
-  const markState = afterDoc ? markRanges(afterDoc, path).values : []
-  const index = emitTextRuns(patches, path, offset, inserted, i => markState[prefix + i], (value, at) => {
-    const updatingBlock = removed === 1 && inserted.length === 1 &&
-      isRecord(before[prefix].value) && isRecord(value)
-    appendRecordDiff(patches, {}, value, path.concat(at), afterDoc, updatingBlock ? blockKeys(value) : undefined)
-  })
-  if (insertBeforeDelete) appendDelete(patches, path.concat(index), deleteLength)
-  appendUpdated(updatedSuffix)
-}
-
-function appendDelete(patches, path, length) {
-  const patch = {action: 'del', path}
-  if (length > 1) patch.length = length
-  patches.push(patch)
-}
-
-function patchPlaceholder(value) {
-  if (typeof value === 'string' || value instanceof Frontend.Text) return ''
-  if (Array.isArray(value)) return []
-  if (isRecord(value)) return {}
-  return copyPatchValue(value)
-}
-
-function opIdOfObject(value) {
-  const objectId = isObject(value) && value[OBJECT_ID]
-  if (!objectId) return null
-  if (objectId === '_root') return {counter: 0, actorId: ''}
-  return parseOpId(objectId)
-}
-
-function keyConflict(object, key) {
-  const conflicts = isObject(object) && object[CONFLICTS] && object[CONFLICTS][key]
-  return conflicts ? Object.keys(conflicts).length > 1 : false
-}
-
-function insertConflicts(patch, list, index, count) {
-  const conflicts = Array.from({length: count}, (_, offset) => keyConflict(list, index + offset))
-  if (conflicts.some(Boolean)) patch.conflicts = conflicts
-}
-
-/**
- * Patches are grouped into one emission unit per document object, and the
- * units are emitted in ascending order of the objects\' creation operation
- * IDs, matching the patch order of the Rust implementation. Units without an
- * operation ID (plain strings) sort with the nearest preceding identified
- * unit, staying in collection order within a tie.
- */
-function emitUnits(patches, units) {
-  let lastOpId = {counter: 0, actorId: ''}
-  for (const unit of units) {
-    if (unit.opId) lastOpId = unit.opId; else unit.opId = lastOpId
-  }
-  units.sort((a, b) => a.opId.counter - b.opId.counter ||
-    (a.opId.actorId < b.opId.actorId ? -1 : a.opId.actorId > b.opId.actorId ? 1 : 0))
-  for (const unit of units) {
-    for (const patch of unit.patches) patches.push(patch)
-  }
-}
-
-function collectArrayDiff(units, before, after, path, afterDoc) {
-  const unit = {opId: opIdOfObject(after), patches: []}
-  units.push(unit)
-  const beforeIds = Frontend.getElementIds(before), afterIds = Frontend.getElementIds(after)
-  function sameElement(beforeIndex, afterIndex) {
-    return (!beforeIds || !afterIds || beforeIds[beforeIndex] === afterIds[afterIndex]) &&
-      sameValue(valueAt(before, beforeIndex), valueAt(after, afterIndex))
-  }
-  let prefix = 0
-  while (prefix < before.length && prefix < after.length && sameElement(prefix, prefix)) prefix++
-  let suffix = 0
-  while (suffix < before.length - prefix && suffix < after.length - prefix &&
-         sameElement(before.length - suffix - 1, after.length - suffix - 1)) suffix++
-  const beforeMiddle = before.length - prefix - suffix
-  const afterMiddle = after.length - prefix - suffix
-  const common = Math.min(beforeMiddle, afterMiddle)
-  for (let index = prefix; index < prefix + common; index++) {
-    collectValueDiff(units, unit.patches, valueAt(before, index), valueAt(after, index),
-      path.concat(index), afterDoc, keyConflict(after, index))
-  }
-  const start = prefix + common
-  if (beforeMiddle > afterMiddle) {
-    appendDelete(unit.patches, path.concat(start), beforeMiddle - common)
-  } else if (afterMiddle > beforeMiddle) {
-    const values = Array.from({length: afterMiddle - common}, (_, offset) => valueAt(after, start + offset))
-    const patch = {action: 'insert', path: path.concat(start), values: values.map(patchPlaceholder)}
-    insertConflicts(patch, after, start, values.length)
-    unit.patches.push(patch)
-    collectInitializations(units, values.map((value, offset) => ({value, path: path.concat(start + offset)})), afterDoc)
-  }
-}
-
-function collectInitializations(units, initial, afterDoc) {
-  const queue = initial.slice()
-  for (let queueIndex = 0; queueIndex < queue.length; queueIndex++) {
-    const {value, path} = queue[queueIndex]
-    if (typeof value === 'string') {
-      if (value.length > 0) {
-        units.push({opId: null, patches: [{action: 'splice', path: path.concat(0), value}]})
-      }
-    } else if (value instanceof Frontend.Text) {
-      const unit = {opId: opIdOfObject(value), patches: []}
-      units.push(unit)
-      const markState = afterDoc ? markRangesForText(afterDoc, value).values : []
-      const items = Array.from({length: value.length}, (_, index) => value.get(index))
-      emitTextRuns(unit.patches, path, 0, items, index => markState[index], (item, at) => {
-        queue.push({value: item, path: path.concat(at)})
-      })
-    } else if (Array.isArray(value) && value.length > 0) {
-      const patch = {action: 'insert', path: path.concat(0), values: value.map(patchPlaceholder)}
-      insertConflicts(patch, value, 0, value.length)
-      units.push({opId: opIdOfObject(value), patches: [patch]})
-      for (let index = 0; index < value.length; index++) {
-        queue.push({value: valueAt(value, index), path: path.concat(index)})
-      }
-    } else if (isRecord(value)) {
-      const unit = {opId: opIdOfObject(value), patches: []}
-      units.push(unit)
-      for (const key of Object.keys(value).sort(compareUtf8)) {
-        const patch = {action: 'put', path: path.concat(key), value: patchPlaceholder(value[key])}
-        if (keyConflict(value, key)) patch.conflict = true
-        unit.patches.push(patch)
-        queue.push({value: valueAt(value, key), path: path.concat(key)})
-      }
-    }
-  }
-}
-
-function collectPutValue(units, inline, value, path, afterDoc, conflict) {
-  const patch = {action: 'put', path, value: patchPlaceholder(value)}
-  if (conflict) patch.conflict = true
-  inline.push(patch)
-  collectInitializations(units, [{value, path}], afterDoc)
-}
-
-function collectRecordDiff(units, before, after, path, afterDoc, orderedKeys) {
-  const unit = {opId: opIdOfObject(after), patches: []}
-  units.push(unit)
-  const beforeKeys = Object.keys(before).sort(compareUtf8)
-  const afterKeys = orderedKeys || Object.keys(after).sort(compareUtf8)
-  const beforeSet = new Set(beforeKeys), afterSet = new Set(afterKeys)
-  for (const key of beforeKeys) {
-    if (!afterSet.has(key)) unit.patches.push({action: 'del', path: path.concat(key)})
-  }
-  for (const key of afterKeys) {
-    const afterValue = valueAt(after, key)
-    if (!beforeSet.has(key)) {
-      collectPutValue(units, unit.patches, afterValue, path.concat(key), afterDoc, keyConflict(after, key))
-    } else {
-      collectValueDiff(units, unit.patches, valueAt(before, key), afterValue, path.concat(key), afterDoc,
-        keyConflict(after, key))
-    }
-  }
-}
-
-function collectValueDiff(units, inline, before, after, path, afterDoc, conflict) {
-  const beforeId = isObject(before) && Frontend.getObjectId(before)
-  const afterId = isObject(after) && Frontend.getObjectId(after)
-  if (sameValue(before, after) && (!beforeId || beforeId === afterId)) return
-  if (beforeId && afterId && beforeId !== afterId || typeof before === 'string' && typeof after === 'string') {
-    collectPutValue(units, inline, after, path, afterDoc, conflict)
-  } else if ((typeof before === 'string' || before instanceof Frontend.Text) &&
-             (typeof after === 'string' || after instanceof Frontend.Text)) {
-    const unit = {opId: opIdOfObject(after), patches: []}
-    units.push(unit)
-    appendRichTextDiff(unit.patches, before, after, path, afterDoc)
-  } else if (before instanceof Frontend.Counter && after instanceof Frontend.Counter) {
-    inline.push({action: 'inc', path, value: after.value - before.value})
-  } else if (Array.isArray(before) && Array.isArray(after)) {
-    collectArrayDiff(units, before, after, path, afterDoc)
-  } else if (isRecord(before) && isRecord(after)) {
-    collectRecordDiff(units, before, after, path, afterDoc)
-  } else {
-    collectPutValue(units, inline, after, path, afterDoc, conflict)
-  }
-}
-
-function appendRecordDiff(patches, before, after, path, afterDoc, orderedKeys) {
-  const units = []
-  collectRecordDiff(units, before, after, path, afterDoc, orderedKeys)
-  emitUnits(patches, units)
-}
-
 export function diff(doc, beforeHeads, afterHeads) {
   if (!Array.isArray(beforeHeads)) throw new TypeError('diff() before must be an array of heads')
   if (!Array.isArray(afterHeads)) throw new TypeError('diff() after must be an array of heads')
+  const recent = recentPatches.get(doc)
+  if (recent && equals(recent.before, beforeHeads) && equals(recent.after, afterHeads)) {
+    if (!recent.patches) recent.patches = recent.compute()
+    return recent.patches
+  }
   if (!hasHeads(doc, beforeHeads) || !hasHeads(doc, afterHeads)) return []
-  return backend.diff(Frontend.getBackendState(doc, 'diff'), beforeHeads, afterHeads, diffValue)
+  return cachedDiff(doc, beforeHeads, afterHeads, '_root', true)
 }
 
 function diffValue(value, inMark) {
@@ -1021,118 +788,12 @@ export function diffPath(doc, path, before, after, options) {
   } catch (error) {
     recursive = true
   }
-  const beforeHeads = knownHeads(doc, before), afterHeads = knownHeads(doc, after)
-  return backend.diff(Frontend.getBackendState(doc, 'diffPath'), beforeHeads, afterHeads, diffValue, objectId, recursive)
-}
-
-function patchesBetween(before, after, touched, clock) {
-  const patches = []
-  appendRecordDiff(patches, before, after, [], after)
-  appendConflictPatches(patches, before, after, [])
-  if (touched) appendMarkPatches(patches, before, after, before, after, [], touched, clock)
-  return patches
-}
-
-function commonKeys(before, after) {
-  if (Array.isArray(before) && Array.isArray(after)) {
-    return Array.from({length: Math.min(before.length, after.length)}, (_, index) => index)
-  }
-  if (isRecord(before) && isRecord(after)) {
-    return Object.keys(after).filter(key => Object.prototype.hasOwnProperty.call(before, key))
-  }
-  return []
-}
-
-function appendConflictPatches(patches, before, after, path) {
-  if (before === after) return
-  for (const key of commonKeys(before, after)) {
-    const beforeValue = valueAt(before, key), afterValue = valueAt(after, key)
-    if (beforeValue === afterValue && before[CONFLICTS]?.[key] === after[CONFLICTS]?.[key]) continue
-    const beforeConflicts = Frontend.getConflicts(before, key) || {}
-    const afterConflicts = Frontend.getConflicts(after, key) || {}
-    if (!sameValue(beforeConflicts, afterConflicts) && Object.keys(afterConflicts).length > 1) {
-      const patchPath = path.concat(key)
-      const put = patches.find(patch => patch.action === 'put' && sameValue(patch.path, patchPath))
-      if (put) put.conflict = true
-      else if (sameValue(before[key], after[key])) patches.push({action: 'conflict', path: patchPath})
-    }
-    appendConflictPatches(patches, beforeValue, afterValue, path.concat(key))
-  }
+  return cachedDiff(doc, knownHeads(doc, before), knownHeads(doc, after), objectId, recursive)
 }
 
 function markEqual(left, right) {
   return left.name === right.name && left.start === right.start && left.end === right.end &&
     sameValue(left.value, right.value)
-}
-
-// A change callback runs against two document versions that share one mutable
-// backend, so the earlier one answers history queries with the later changes
-// as well. Mark state before the change is therefore computed from the new
-// document with this batch of changes left out.
-function changeScope(changes, before, after) {
-  const objects = new Set()
-  if (!Array.isArray(changes)) return {objects}
-  const clock = before && before[STATE] && before[STATE].clock || {}
-  for (const change of decodeChanges(changes)) {
-    // a batch can contain changes the previous state already had, and those
-    // are part of it rather than left out of it
-    if ((clock[change.actor] || 0) >= change.seq) continue
-    for (const op of change.ops) {
-      if (op.action === 'markBegin' || op.action === 'markEnd') objects.add(op.obj)
-    }
-  }
-  return {objects, clock: Frontend.getBackendState(after).state.opClock(clock)}
-}
-
-function markValue(values, name) {
-  return values[name] === null ? undefined : values[name]
-}
-
-// The text patches of a change already carry the marks of the characters they
-// insert, so what is left to report is every element whose marks differ from
-// the ones a consumer would already have: its own marks in the previous state
-// if it survived the change, and the marks of the splice that inserted it
-// otherwise.
-function appendTextMarkPatches(patches, beforeDoc, afterDoc, before, after, path, clock) {
-  const beforeValues = markRangesForText(clock ? afterDoc : beforeDoc, before, clock).values
-  const afterValues = markRangesForText(afterDoc, after).values
-  const previous = new Map(before.elems.map((elem, index) => [elem.elemId, beforeValues[index]]))
-  const expected = after.elems.map((elem, index) =>
-    (previous.has(elem.elemId) ? previous.get(elem.elemId) : afterValues[index]))
-  const names = new Set(expected.concat(afterValues).flatMap(values => Object.keys(values)))
-  const offsets = textOffsets(after)
-  const added = []
-  for (const name of [...names].sort(compareUtf8)) {
-    let index = 0
-    while (index < after.length) {
-      if (sameValue(markValue(expected[index], name), markValue(afterValues[index], name))) {
-        index++
-        continue
-      }
-      const start = index, value = markValue(afterValues[index], name)
-      while (index < after.length && sameValue(markValue(afterValues[index], name), value) &&
-             !sameValue(markValue(expected[index], name), value)) index++
-      // A removed mark is reported the way the Rust implementation reports
-      // it: a mark patch whose value is null
-      added.push({name, value: value === undefined ? null : copyPatchValue(value),
-        start: offsets[start], end: offsets[index]})
-    }
-  }
-  if (added.length > 0) patches.push({action: 'mark', path, marks: added})
-}
-
-function appendMarkPatches(patches, beforeDoc, afterDoc, before, after, path, touched, clock) {
-  if (before instanceof Frontend.Text && after instanceof Frontend.Text) {
-    if (touched.has(Frontend.getObjectId(before)) || touched.has(Frontend.getObjectId(after))) {
-      appendTextMarkPatches(patches, beforeDoc, afterDoc, before, after, path, clock)
-    }
-    return
-  }
-  if (Array.isArray(before) && Array.isArray(after) && before.length !== after.length) return
-  for (const key of commonKeys(before, after)) {
-    appendMarkPatches(patches, beforeDoc, afterDoc, valueAt(before, key), valueAt(after, key), path.concat(key),
-      touched, clock)
-  }
 }
 
 export function applyPatch(doc, patch) {
@@ -1301,6 +962,8 @@ export function mark(doc, path, range, name, value) {
     action: 'markEnd', obj: objectId, elemId: end, insert: true,
     expand: expand === 'after' || expand === 'both', pred: []
   })
+  const at = textOffset(text, startIndex)
+  backend.markEvent(text.context.events, objectId, [[name, {value}]], at, endIndex <= startIndex ? 0 : textOffset(text, endIndex) - at)
   // Register the text as touched with a fresh copy: reusing the cached
   // object would let later edits in the same change mutate the previous
   // document snapshot in place, and the semantic diff would then see no
@@ -1782,12 +1445,11 @@ export function receiveSyncMessage(doc, oldSyncState, message, options = {}) {
   assertWritable(doc)
   const oldBackendState = Frontend.getBackendState(doc, 'receiveSyncMessage')
   const [backendState, syncState, patch] = backend.receiveSyncMessage(oldBackendState, oldSyncState, message)
-  if (!patch) return [doc, syncState, null]
-
-  // The patchCallback is passed as argument all changes that are applied.
-  // We get those from the sync message if a patchCallback is present.
-  const changes = options.patchCallback || doc[OPTIONS].patchCallback ? backend.decodeSyncMessage(message).changes : null
-  return [applyBackendPatch(doc, patch, backendState, changes, options, 'receiveSyncMessage'), syncState, null]
+  if (!patch) {
+    diffCache.delete(oldBackendState.state)
+    return [doc, syncState, null]
+  }
+  return [applyBackendPatch(doc, patch, backendState, options, 'receiveSyncMessage'), syncState, null]
 }
 
 export function hasOurChanges(doc, remoteState) {

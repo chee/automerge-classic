@@ -1,4 +1,4 @@
-import { CACHE, CHANGE, CONFLICTS, ELEM_IDS, OBJECT_ID, OPTIONS, PROXY_PATH, STATE } from './constants.js'
+import { CACHE, CHANGE, CONFLICTS, OBJECT_ID, OPTIONS, PROXY_PATH, STATE } from './constants.js'
 import { copyObject, isObject } from '../src/common.js'
 import uuid from '../src/uuid.js'
 import { cloneMapObject, interpretPatch, lamportCompare, reorderNewKeys } from './apply_patch.js'
@@ -113,7 +113,7 @@ function makeChange(doc, context, options) {
       newDoc = applyPatchToDoc(doc, patch, state)
     }
     const patchCallback = options && options.patchCallback || doc[OPTIONS].patchCallback
-    if (patchCallback) patchCallback(patch, doc, newDoc, true, [binaryChange])
+    if (patchCallback) patchCallback(patch, doc, newDoc, true, [binaryChange], context.events)
     return [newDoc, change]
 
   } else {
@@ -434,17 +434,9 @@ function getBackendState(doc, callerName = null, argPos = 'first') {
   return doc[STATE].backendState
 }
 
-/**
- * Given an array or text object from an Automerge document, returns an array
- * containing the unique element ID of each list element/character.
- */
-function getElementIds(list) {
-  return list instanceof Text ? list.elems.map(elem => elem.elemId) : list[ELEM_IDS]
-}
-
 export {
   init, from, change, emptyChange, applyPatch, setInteropAttach,
   getObjectId, getObjectById, getText, getActorId, setActorId, getConflicts, getLastLocalChange,
-  getBackendState, getElementIds,
+  getBackendState,
   Text, Counter, Float64, Int, Uint
 }

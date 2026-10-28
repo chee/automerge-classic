@@ -278,8 +278,8 @@ describe('modern API compatibility', () => {
     assert.deepStrictEqual(calls.pop(), {patches: [
       {action: 'del', path: ['text', 1]},
       {action: 'insert', path: ['text', 1], values: [{}]},
-      {action: 'put', path: ['text', 1, 'type'], value: ''},
       {action: 'put', path: ['text', 1, 'level'], value: 2},
+      {action: 'put', path: ['text', 1, 'type'], value: ''},
       {action: 'splice', path: ['text', 1, 'type', 0], value: 'heading'}
     ], source: 'change'})
 

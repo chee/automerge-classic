@@ -1,5 +1,5 @@
 import { compareUtf8, copyObject, parseOpId } from '../src/common.js'
-import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, decodeChangeColumns, decodeDocumentHeader, decodeValue, decoderByColumnId, documentChanges, encodeDocumentHeader, encoderByColumnId, makeDecoders } from './columnar.js'
+import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, decodeChangeColumns, decodeChangeMeta, decodeDocumentHeader, decodeValue, decoderByColumnId, documentChanges, encodeDocumentHeader, encoderByColumnId, makeDecoders } from './columnar.js'
 import * as ColumnData from './column_data.js'
 const MAX_BLOCK_SIZE = 600 // operations
 const MAX_MAP_BLOCK_SIZE = 100
@@ -24,7 +24,6 @@ const BLOCK_MARKS = new WeakMap()
 const HEADS_CLOCKS = new Map()
 const CHANGE_TARGETS = new WeakMap()
 const MAX_TOUCHED_ELEMENTS = 16
-const CHANGE_MAX_OPS = new WeakMap()
 const COLUMN_SLAB_OPTIONS = {slabRows: 24}
 
 function operationValueCount(column, value) {
@@ -2325,8 +2324,12 @@ const SET_ACTION = ACTIONS.indexOf('set'), DEL_ACTION = ACTIONS.indexOf('del'), 
 
 function changeTargets(buffer) {
   let targets = CHANGE_TARGETS.get(buffer)
-  if (targets) return targets
-  targets = []
+  if (!targets) CHANGE_TARGETS.set(buffer, targets = decodeTargets(buffer))
+  return targets
+}
+
+function decodeTargets(buffer) {
+  const targets = []
   const change = decodeChangeColumns(buffer)
   const columns = makeDecoders(change.columns, CHANGE_COLUMNS).map(column => column.decoder)
   function read(index) {
@@ -2338,12 +2341,11 @@ function changeTargets(buffer) {
     const element = insert ? [change.actorIds[0], counter] : keyStr === null && keyCtr ? [change.actorIds[keyActor], keyCtr] : null
     targets.push({objectId: objCtr === null ? '_root' : `${objCtr}@${change.actorIds[objActor]}`, mark: action === MARK_ACTION, element})
   }
-  CHANGE_TARGETS.set(buffer, targets)
   return targets
 }
 
-function changeObjects(buffer, objects, actorIndexById) {
-  for (const {objectId, mark, element} of changeTargets(buffer)) {
+function changeObjects(targets, objects, actorIndexById) {
+  for (const {objectId, mark, element} of targets) {
     let touched = objects.get(objectId)
     if (!touched) objects.set(objectId, touched = {elements: [], marks: false})
     if (mark) touched.marks = true
@@ -2605,12 +2607,65 @@ function propertyItems(rows, type, before, after) {
       const item = groupItem(entries, before, after, incs, isList)
       item.prop = isList ? index : rows[start][keyStrIdx]
       item.top = top
+      item.start = start
+      item.end = end
+      item.incs = incs
       items.push(item)
       if (item.diff !== DEL) index++
     }
     start = end
   }
   return items
+}
+
+function batchValues(rows, start, end, before, after, incs) {
+  let doc = null, change = null
+  for (let i = start; i < end; i++) {
+    const row = rows[i]
+    if (row[actionIdx] === INC_ACTION) {
+      if (covers(before, row) || change || !doc || doc.deleted) continue
+      for (let j = 0; j < doc.row[succNumIdx]; j++) {
+        if (doc.row[succCtrIdx][j] === row[idCtrIdx] && doc.row[succActorIdx][j] === row[idActorIdx]) change = Object.assign({}, doc)
+      }
+    } else if (covers(before, row)) {
+      if (!visibleAt(row, before, incs)) continue
+      const deleted = !visibleAt(row, after, incs)
+      if (deleted && doc && !doc.deleted) doc.expose = true
+      else doc = {row, deleted, conflict: Boolean(doc && !doc.deleted), expose: !deleted && Boolean(doc && doc.deleted)}
+    } else if (visibleAt(row, after, incs)) {
+      change = {row, conflict: Boolean(change && !change.deleted), deleted: false}
+    }
+  }
+  return {doc, change}
+}
+
+function compareRows(left, right, actorRank) {
+  return left[idCtrIdx] - right[idCtrIdx] || actorRank[left[idActorIdx]] - actorRank[right[idActorIdx]]
+}
+
+function batchEvents(ctx, objectId, rows, item, isList, events) {
+  const {doc, change} = batchValues(rows, item.start, item.end, ctx.before, ctx.after, item.incs), prop = item.prop
+  function put(value, conflict, expose) {
+    if (expose && isMakeRow(value.row)) exposeObject(ctx, opIdString(value.row, ctx.doc.actorIds))
+    events.push({objectId, kind: 'put', prop, value: rowValue(ctx, value.row, incrementsAt(value.row, ctx.after, item.incs)), conflict})
+  }
+  if (!doc && change) {
+    if (isList) events.push({objectId, kind: 'insert', prop, value: rowValue(ctx, change.row, incrementsAt(change.row, ctx.after, item.incs)), conflict: change.conflict})
+    else put(change, change.conflict, false)
+  } else if (doc && !change) {
+    if (doc.expose) put(doc, doc.conflict, true)
+    else if (doc.deleted) events.push(isList ? {objectId, kind: 'del', prop, length: 1} : {objectId, kind: 'delMap', prop})
+  } else if (doc && change) {
+    const order = compareRows(change.row, doc.row, ctx.actorRank)
+    if (order === 0) {
+      const inc = incrementsAt(doc.row, ctx.after, item.incs) - incrementsAt(doc.row, ctx.before, item.incs)
+      if (inc !== 0) events.push({objectId, kind: 'inc', prop, value: inc})
+    } else if (order < 0) {
+      if (isList || !doc.conflict) events.push({objectId, kind: 'conflict', prop})
+    } else {
+      put(change, isList ? !doc.deleted || change.conflict : (change.conflict && !doc.conflict) || !doc.deleted, false)
+    }
+  }
 }
 
 function compareMarkIds(left, right) {
@@ -2689,7 +2744,12 @@ function marksWithDiff(marks, diff) {
   return NO_MARK_DIFF
 }
 
-function textSpans(rows, before, after, actorRank) {
+function addedMarks(marks, raw) {
+  if (!marks.after) return []
+  return [...marks.after].filter(([, value]) => raw || value.value !== null).sort((left, right) => compareUtf8(left[0], right[0]))
+}
+
+function textSpans(rows, before, after, actorRank, addedKey) {
   const spans = [], machines = {before: {state: [], current: NO_MARKS}, after: {state: [], current: NO_MARKS}}
   let index = 0, next = null, marks = NO_MARK_DIFF
   function flush() {
@@ -2739,7 +2799,7 @@ function textSpans(rows, before, after, actorRank) {
     }
     if (action === MAKE_MAP_ACTION) {
       flush()
-      spans.push({diff, row, index, expose: covers(before, row)})
+      spans.push({diff, row, index, expose: covers(before, row), marks})
       if (diff !== DEL) index++
       continue
     }
@@ -2750,7 +2810,8 @@ function textSpans(rows, before, after, actorRank) {
     } else if (action === DEL_ACTION || action === INC_ACTION) {
       continue
     }
-    if (next && (diff !== next.diff || (marks !== next.marks && !sameMarkList(markChanges(marks), markChanges(next.marks))))) flush()
+    const changes = addedKey && diff === ADD ? addedKey : markChanges
+    if (next && (diff !== next.diff || (marks !== next.marks && !sameMarkList(changes(marks), changes(next.marks))))) flush()
     if (!next) next = {diff, text: '', length: 0, marks: marksWithDiff(marks, diff)}
     next.text += text
     next.length += text.length
@@ -2817,6 +2878,20 @@ function parentEntry(ctx, objectId) {
   if (skipped) {
     ctx.pathMap.set(objectId, skipped)
     return skipped
+  }
+  if (meta.parentObj === '_root' && ctx.after.every(counter => counter >= ctx.doc.maxOp)) {
+    const values = ctx.doc.visibleMapOps.get(JSON.stringify([null, null, meta.parentKey]))
+    if (values) {
+      let top = null
+      for (const value of values) {
+        const at = value.indexOf('@'), id = {counter: Number(value.slice(0, at)), actorId: ctx.doc.actorIds[Number(value.slice(at + 1))]}
+        if (!top || id.counter > top.counter || id.counter === top.counter && id.actorId > top.actorId) top = id
+      }
+      ctx.seen.add(objectId)
+      if (!top || `${top.counter}@${top.actorId}` !== objectId) return null
+      ctx.pathMap.set(objectId, {prop: meta.parentKey, parent: meta.parentObj})
+      return ctx.pathMap.get(objectId)
+    }
   }
   ctx.seen.add(objectId)
   updatePathMap(ctx, meta.parentObj)
@@ -2989,6 +3064,18 @@ function skippedEntry(ctx, parent, objectId) {
   return entries.get(objectId) || null
 }
 
+function markEvent(events, objectId, marks, index, length) {
+  let last = events[events.length - 1]
+  if (!last || last.kind !== 'mark') events.push(last = {objectId, kind: 'mark', marks: new Map()})
+  for (const [name, value] of marks) {
+    let ranges = last.marks.get(name)
+    if (!ranges) last.marks.set(name, ranges = [])
+    const tail = ranges[ranges.length - 1]
+    if (tail && sameScalar(tail.value, value) && tail.end === index) tail.end += length
+    else ranges.push({value, start: index, end: index + length})
+  }
+}
+
 function objectEvents(ctx, objectId, events) {
   const type = objectType(ctx, objectId), rows = diffRows(ctx, objectId, true), children = new Set(), skipped = []
   ctx.children.set(objectId, children)
@@ -2998,7 +3085,7 @@ function objectEvents(ctx, objectId, events) {
       .filter(isMakeRow).map(row => opIdString(row, ctx.doc.actorIds))))
   }
   if (type === 'text') {
-    for (const span of textSpans(rows, ctx.before, ctx.after, ctx.actorRank)) {
+    for (const span of textSpans(rows, ctx.before, ctx.after, ctx.actorRank, ctx.batch && (marks => addedMarks(marks, true)))) {
       if (span.skipped) {
         skipped.push({summary: span.skipped, base: span.index})
       } else if (span.row) {
@@ -3011,23 +3098,18 @@ function objectEvents(ctx, objectId, events) {
           if (span.expose) exposeObject(ctx, opIdString(span.row, ctx.doc.actorIds))
         } else if (span.diff === DEL) {
           events.push({objectId, kind: 'del', prop: span.index, length: 1})
+        } else if (ctx.batch) {
+          const marks = exportMarks(span.marks)
+          if (marks) markEvent(events, objectId, marks, span.index, 1)
         }
       } else if (span.diff === ADD) {
-        events.push({objectId, kind: 'splice', prop: span.index, text: span.text, marks: exportMarks(span.marks)})
+        const marks = addedMarks(span.marks, ctx.batch)
+        events.push({objectId, kind: 'splice', prop: span.index, text: span.text, marks: marks.length > 0 ? marks : null})
       } else if (span.diff === DEL) {
         events.push({objectId, kind: 'del', prop: span.index, length: span.text.length})
       } else {
         const marks = exportMarks(span.marks)
-        if (!marks) continue
-        let last = events[events.length - 1]
-        if (!last || last.kind !== 'mark') events.push(last = {objectId, kind: 'mark', marks: new Map()})
-        for (const [name, value] of marks) {
-          let ranges = last.marks.get(name)
-          if (!ranges) last.marks.set(name, ranges = [])
-          const tail = ranges[ranges.length - 1]
-          if (tail && sameScalar(tail.value, value) && tail.end === span.index) tail.end += span.text.length
-          else ranges.push({value, start: span.index, end: span.index + span.text.length})
-        }
+        if (marks) markEvent(events, objectId, marks, span.index, span.text.length)
       }
     }
     return
@@ -3040,7 +3122,9 @@ function objectEvents(ctx, objectId, events) {
     }
     if (item.diff !== DEL && isMakeRow(item.row)) children.add(opIdString(item.row, ctx.doc.actorIds))
     if (item.top && isMakeRow(item.top)) ctx.pathMap.set(opIdString(item.top, ctx.doc.actorIds), {prop: item.prop, parent: objectId})
-    if (item.diff === ADD) {
+    if (ctx.batch) {
+      batchEvents(ctx, objectId, rows, item, isList, events)
+    } else if (item.diff === ADD) {
       const value = rowValue(ctx, item.row, item.incAfter)
       if (item.expose && isMakeRow(item.row)) exposeObject(ctx, opIdString(item.row, ctx.doc.actorIds))
       events.push({objectId, kind: isList && !item.update ? 'insert' : 'put', prop: item.prop, value, conflict: item.conflict})
@@ -3106,20 +3190,63 @@ function descendsFrom(objectMeta, objectId, ancestor) {
   return true
 }
 
-function documentDiff(doc, beforeClock, afterClock, objectIds, valueOf, start, recursive) {
+function diffContext(doc, beforeClock, afterClock, objectIds, valueOf, start, batch) {
   const sortedActors = doc.actorIds.slice().sort()
-  const ctx = {
+  return {
     doc, valueOf, before: beforeClock, after: afterClock, rows: new Map(), pathMap: new Map(), seen: new Set(),
     actorRank: doc.actorIds.map(actor => sortedActors.indexOf(actor)),
-    patches: [], patchObjects: [], lastMarks: null, exposed: [],
+    patches: [], patchObjects: [], lastMarks: null, exposed: [], batch,
     touched: objectIds, children: new Map(), skipped: new Map(), skippedEntries: new Map(), truncated: new Map(), reachable: new Map([[start, true]])
   }
+}
+
+function documentDiff(doc, beforeClock, afterClock, objectIds, valueOf, start, recursive, batch) {
+  const ctx = diffContext(doc, beforeClock, afterClock, objectIds, valueOf, start, batch)
   const events = []
   for (const objectId of [...objectIds.keys()].sort(compareObjectIds)) {
-    if ((objectId === start || recursive && (start === '_root' || descendsFrom(doc.objectMeta, objectId, start))) && reachable(ctx, objectId)) {
+    if ((objectId === start || recursive && (start === '_root' || descendsFrom(doc.objectMeta, objectId, start))) && (batch || reachable(ctx, objectId))) {
       objectEvents(ctx, objectId, events)
     }
   }
+  return buildPatches(ctx, events)
+}
+
+function spliceMarks(ctx, event, actor) {
+  if (!ctx.doc.objectsWithMarks.has(event.objectId)) return null
+  const clock = ctx.after.slice()
+  clock[actor] = event.counter
+  const rows = objectRows(ctx.doc, event.objectId, 'text', ctx.before, clock, ctx.touched.get(event.objectId))
+  const span = textSpans(rows, ctx.before, clock, ctx.actorRank, marks => addedMarks(marks, false))
+    .find(span => span.diff === ADD && !span.row && span.index <= event.prop && event.prop < span.index + span.text.length)
+  return span ? exportMarks(span.marks) : null
+}
+
+function localPatches(doc, change, actor, startOp, afterClock, events, valueOf) {
+  const beforeClock = afterClock.slice(), objects = new Set(events.map(event => event.objectId)), parents = new Set(), objectIds = new Map()
+  beforeClock[actor] = startOp - 1
+  for (const objectId of objects) {
+    let meta = doc.objectMeta[objectId]
+    while (meta && meta.parentObj && !parents.has(meta.parentObj)) {
+      parents.add(meta.parentObj)
+      meta = doc.objectMeta[meta.parentObj]
+    }
+  }
+  const touchedParents = [...parents].filter(objectId => objects.has(objectId)).sort(compareObjectIds)
+  if (touchedParents.length > 0 || [...objects].some(objectId => doc.objectsWithMarks.has(objectId))) {
+    changeObjects(decodeTargets(change), objectIds, doc.actorIndexById)
+  }
+  const ctx = diffContext(doc, beforeClock, afterClock, objectIds, valueOf, '_root', false)
+  for (const objectId of touchedParents) objectEvents(ctx, objectId, [])
+  ctx.exposed = []
+  const sorted = events.slice().sort((left, right) => compareObjectIds(left.objectId, right.objectId)).map(event => {
+    if (event.kind === 'put' || event.kind === 'insert') return Object.assign({}, event, {value: valueOf(event.value), conflict: false})
+    if (event.kind === 'splice') return Object.assign({}, event, {marks: spliceMarks(ctx, event, actor)})
+    return event
+  })
+  return buildPatches(ctx, sorted)
+}
+
+function buildPatches(ctx, events) {
   for (const event of events) {
     while (ctx.exposed.length > 0 && compareObjectIds(ctx.exposed[0], event.objectId) < 0) flushExposed(ctx, ctx.exposed[0])
     if (ctx.exposed[0] === event.objectId) continue
@@ -3393,7 +3520,6 @@ class BackendDoc {
     // Update the document state only if `applyChanges` does not throw an exception
     for (let change of allApplied) {
       this.changes.push(change.buffer)
-      CHANGE_MAX_OPS.set(change.buffer, change.maxOp)
       this.historyHashes.push(change.hash)
       if (!this.hashesByActor[change.actor]) this.hashesByActor[change.actor] = []
       this.hashesByActor[change.actor][change.seq - 1] = change.hash
@@ -3687,11 +3813,12 @@ class BackendDoc {
   }
 
   opClock(clock) {
-    if (!this.haveHashGraph) this.computeHashGraph()
     return this.actorIds.map(actor => {
-      if (!(clock[actor] > 0)) return 0
-      const buffer = this.changes[this.changeIndexByHash[this.hashesByActor[actor][clock[actor] - 1]]]
-      return CHANGE_MAX_OPS.get(buffer) ?? changeMeta(buffer).maxOp
+      const seq = clock[actor] || 0
+      if (seq >= (this.clock[actor] || 0)) return this.maxOp
+      if (seq === 0) return 0
+      if (!(this.hashesByActor[actor] && this.hashesByActor[actor][seq])) this.computeHashGraph()
+      return decodeChangeMeta(this.changes[this.changeIndexByHash[this.hashesByActor[actor][seq]]]).startOp - 1
     })
   }
 
@@ -3716,14 +3843,32 @@ class BackendDoc {
 
   diff(beforeHeads, afterHeads, valueOf, objectId = '_root', recursive = true) {
     if (!this.haveHashGraph) this.computeHashGraph()
-    const before = this.headsClock(beforeHeads), after = this.headsClock(afterHeads), objectIds = new Map()
+    const before = this.headsClock(beforeHeads), after = this.headsClock(afterHeads)
+    return documentDiff(this, this.opClock(before), this.opClock(after), this.touchedObjects(before, after, changeTargets), valueOf, objectId, recursive, false)
+  }
+
+  touchedObjects(before, after, targetsOf) {
+    const objectIds = new Map()
+    if (Object.values(before).every(seq => !seq) || Object.values(after).every(seq => !seq)) {
+      for (const id of Object.keys(this.objectMeta)) objectIds.set(id, {elements: [], marks: true})
+      return objectIds
+    }
     for (const actor of new Set(Object.keys(before).concat(Object.keys(after)))) {
       const low = Math.min(before[actor] || 0, after[actor] || 0), high = Math.max(before[actor] || 0, after[actor] || 0)
       for (let seq = low + 1; seq <= high; seq++) {
-        changeObjects(this.changes[this.changeIndexByHash[this.hashesByActor[actor][seq - 1]]], objectIds, this.actorIndexById)
+        if (!(this.hashesByActor[actor] && this.hashesByActor[actor][seq - 1])) this.computeHashGraph()
+        changeObjects(targetsOf(this.changes[this.changeIndexByHash[this.hashesByActor[actor][seq - 1]]]), objectIds, this.actorIndexById)
       }
     }
-    return documentDiff(this, this.opClock(before), this.opClock(after), objectIds, valueOf, objectId, recursive)
+    return objectIds
+  }
+
+  clockDiff(before, after, valueOf, batch) {
+    return documentDiff(this, this.opClock(before), this.opClock(after), this.touchedObjects(before, after, decodeTargets), valueOf, '_root', true, batch)
+  }
+
+  localPatches(change, actorId, startOp, clock, events, valueOf) {
+    return localPatches(this, change, this.actorIndexById.get(actorId), startOp, this.opClock(clock), events, valueOf)
   }
 
   sequenceInserts(objectId, clock) {
@@ -3828,4 +3973,4 @@ class BackendDoc {
   }
 }
 
-export { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, bloomFilterContains }
+export { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, bloomFilterContains, markEvent }

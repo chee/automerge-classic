@@ -1,6 +1,6 @@
 import { OBJECT_ID } from './constants.js'
 import { isObject } from '../src/common.js'
-const strings = new WeakMap(), offsets = new WeakMap()
+const strings = new WeakMap(), offsets = new WeakMap(), widths = new WeakMap()
 const CHUNK_SIZE = 256
 class Text {
   constructor (text) {
@@ -181,6 +181,7 @@ function localElems(text) {
     throw new TypeError('Automerge.Text object cannot be modified outside of a change block')
   }
   strings.delete(text.chunks)
+  widths.delete(text.chunks[0])
   return text.chunks[0]
 }
 
@@ -191,6 +192,31 @@ function chunkStarts(chunks) {
   for (const chunk of chunks) starts.push(starts[starts.length - 1] + chunk.length)
   offsets.set(chunks, starts)
   return starts
+}
+
+function elemWidth(elem) {
+  return typeof elem.value === 'string' ? elem.value.length : 1
+}
+
+function textOffset(text, index) {
+  const string = strings.get(text.chunks)
+  if (string !== undefined && string.length === text.length) return index
+  let offset = 0
+  for (const chunk of text.chunks) {
+    let width = widths.get(chunk)
+    if (width === undefined) {
+      width = chunk.reduce((total, elem) => total + elemWidth(elem), 0)
+      widths.set(chunk, width)
+    }
+    if (index <= chunk.length) {
+      if (width === chunk.length) return offset + index
+      for (let i = 0; i < index; i++) offset += elemWidth(chunk[i])
+      return offset
+    }
+    offset += width
+    index -= chunk.length
+  }
+  return offset
 }
 
 function elemAt(chunks, index) {
@@ -232,4 +258,4 @@ function instantiateText(objectId, chunks) {
   return instance
 }
 
-export { Text, instantiateText, elemAt, spliceChunks, strings }
+export { Text, instantiateText, elemAt, spliceChunks, strings, textOffset }

@@ -92,7 +92,8 @@ function applyShadowPatch(root, patch) {
       parent.splice(key, 0, ...patch.values.map(shadowValue))
     }
   } else if (patch.action === 'splice') {
-    const marks = patch.marks ? Object.assign({}, patch.marks) : {}
+    const marks = {}
+    for (const [name, value] of Object.entries(patch.marks || {})) if (value !== null) marks[name] = value
     const elements = [...patch.value].map(value => ({value, marks: Object.assign({}, marks)}))
     parent.elems.splice(elementIndex(parent, key), 0, ...elements)
   } else if (patch.action === 'del') {

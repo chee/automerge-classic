@@ -1,6 +1,6 @@
 import { encodeChangeColumns, splitContainers } from './columnar.js'
 import { decodeBundle, encodeBundle, encodeDocumentBundle } from './bundle.js'
-import { BackendDoc } from './new.js'
+import { BackendDoc, markEvent } from './new.js'
 import { documentOps } from './fragments.js'
 import { backendState } from './util.js'
 /**
@@ -283,6 +283,14 @@ function diff(backend, beforeHeads, afterHeads, valueOf, objectId, recursive) {
   return (backend.source || backendState(backend, true)).diff(beforeHeads, afterHeads, valueOf, objectId, recursive)
 }
 
+function clockDiff(backend, before, after, valueOf, batch) {
+  return backendState(backend, true).clockDiff(before, after, valueOf, batch)
+}
+
+function localPatches(backend, change, actorId, startOp, clock, events, valueOf) {
+  return backendState(backend, true).localPatches(change, actorId, startOp, clock, events, valueOf)
+}
+
 function saveBundleByHash(backend, hashes) {
   const state = backendState(backend, true)
   return encodeDocumentBundle(state.getChangesByHash(hashes), documentOps(state))
@@ -292,5 +300,5 @@ export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
   load, loadChanges, loadIncremental, getPatch, view, viewOf, getHeads, getAllChanges, getChanges,
   getChangesAdded, getChangeByHash, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta,
-  getChangesByHash, topoHistoryTraversal, stats, diff, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
+  getChangesByHash, topoHistoryTraversal, stats, diff, clockDiff, localPatches, markEvent, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
 }
