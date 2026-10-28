@@ -72,6 +72,7 @@ declare namespace Automerge {
   function toJS<T>(doc: Doc<T>): T
   function view<T>(doc: Doc<T>, heads: Heads): Doc<T>
   function diff<T>(doc: Doc<T>, before: Heads, after: Heads): Patch[]
+  function diffPath(doc: Doc<unknown>, path: Prop[], before: Heads, after: Heads, opts?: DiffOptions): Patch[]
   function dump<T>(doc: Doc<T>): void
 
   function load<T>(data: BinaryDocument, options?: InitOptions<T>): Doc<T>
@@ -82,6 +83,13 @@ declare namespace Automerge {
   function saveBundle<T>(doc: Doc<T>, hashes: Heads): Uint8Array
   interface DecodedBundle {changes: DecodedChange[], deps: Heads}
   function readBundle(bundle: Uint8Array): DecodedBundle
+  function getFragmentMetadata(doc: Doc<unknown>, levels?: FragmentLevelRange): FragmentMeta[]
+  function getFragmentMeta(doc: Doc<unknown>, head: string): FragmentMeta | null
+  function bundleFragmentMetadata(doc: Doc<unknown>, fragments: FragmentMeta[]): Uint8Array[]
+  function getCommits(doc: Doc<unknown>): Commit[]
+  function getFragments(doc: Doc<unknown>, levels?: FragmentLevelRange): Fragment[]
+  function addCommits<T>(doc: Doc<T>, commits: Commit[], opts?: ApplyOptions<T>): Doc<T>
+  function addFragments<T>(doc: Doc<T>, fragments: Fragment[], opts?: ApplyOptions<T>): Doc<T>
 
   function generateSyncMessage<T>(doc: Doc<T>, syncState: SyncState): [SyncState, SyncMessage | null]
   function receiveSyncMessage<T>(doc: Doc<T>, syncState: SyncState, message: SyncMessage, options?: ApplyOptions<T>): [Doc<T>, SyncState, null]
@@ -181,6 +189,30 @@ declare namespace Automerge {
     patchCallback?: PatchCallback<T>
   }
 
+  type DiffOptions = {
+    recursive?: boolean
+  }
+
+  type FragmentLevelRange = number | {start?: number, end?: number} | null | undefined
+
+  type FragmentMeta = {
+    head: Hash
+    level: number
+    boundary: Heads
+    checkpoints: Heads
+    members: Heads
+  }
+
+  type Commit = {
+    head: Hash
+    parents: Heads
+    bytes: Uint8Array
+  }
+
+  type Fragment = FragmentMeta & {
+    bytes: Uint8Array
+  }
+
   type PatchSource =
     | 'from'
     | 'emptyChange'
@@ -189,6 +221,8 @@ declare namespace Automerge {
     | 'merge'
     | 'loadIncremental'
     | 'applyChanges'
+    | 'addCommits'
+    | 'addFragments'
     | 'receiveSyncMessage'
 
   interface PatchInfo<T> {
@@ -548,6 +582,7 @@ export import topoHistoryTraversal = Automerge.topoHistoryTraversal
 export import toJS = Automerge.toJS
 export import view = Automerge.view
 export import diff = Automerge.diff
+export import diffPath = Automerge.diffPath
 export import dump = Automerge.dump
 export import load = Automerge.load
 export import loadIncremental = Automerge.loadIncremental
@@ -557,6 +592,13 @@ export import saveSince = Automerge.saveSince
 export import saveBundle = Automerge.saveBundle
 export import readBundle = Automerge.readBundle
 export import DecodedBundle = Automerge.DecodedBundle
+export import getFragmentMetadata = Automerge.getFragmentMetadata
+export import getFragmentMeta = Automerge.getFragmentMeta
+export import bundleFragmentMetadata = Automerge.bundleFragmentMetadata
+export import getCommits = Automerge.getCommits
+export import getFragments = Automerge.getFragments
+export import addCommits = Automerge.addCommits
+export import addFragments = Automerge.addFragments
 export import generateSyncMessage = Automerge.generateSyncMessage
 export import receiveSyncMessage = Automerge.receiveSyncMessage
 export import initSyncState = Automerge.initSyncState
@@ -605,6 +647,11 @@ export import ObjID = Automerge.ObjID
 export import Clock = Automerge.Clock
 export import State = Automerge.State
 export import ApplyOptions = Automerge.ApplyOptions
+export import DiffOptions = Automerge.DiffOptions
+export import FragmentLevelRange = Automerge.FragmentLevelRange
+export import FragmentMeta = Automerge.FragmentMeta
+export import Commit = Automerge.Commit
+export import Fragment = Automerge.Fragment
 export import PatchSource = Automerge.PatchSource
 export import PatchInfo = Automerge.PatchInfo
 export import ChangeAtResult = Automerge.ChangeAtResult

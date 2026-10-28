@@ -183,12 +183,8 @@ function encodeBundleOps(changes, actors) {
     .map(({columnName, columnId}) => ({columnName, columnId, encoder: columns[columnName]}))
 }
 
-function encodeBundle(changeBuffers) {
-  if (!Array.isArray(changeBuffers)) throw new TypeError('encodeBundle() changes must be an array')
-  const {actors, changes} = decodeBundleInput(changeBuffers)
+function bundleContainer(changes, actors, opColumns) {
   const {external, columns: changeColumns} = encodeChangeColumns(changes, actors)
-  const opColumns = encodeBundleOps(changes, actors)
-
   return encodeContainer(CHUNK_TYPE_BUNDLE, encoder => {
     encoder.appendUint53(external.length)
     for (const dep of external) encoder.appendRawBytes(hexStringToBytes(dep))
@@ -197,6 +193,87 @@ function encodeBundle(changeBuffers) {
     appendColumns(encoder, changeColumns)
     appendColumns(encoder, opColumns)
   }).bytes
+}
+
+function encodeBundle(changeBuffers) {
+  if (!Array.isArray(changeBuffers)) throw new TypeError('encodeBundle() changes must be an array')
+  const {actors, changes} = decodeBundleInput(changeBuffers)
+  return bundleContainer(changes, actors, encodeBundleOps(changes, actors))
+}
+
+function documentBundleOps(changes, documentOps) {
+  const ranges = new Map()
+  for (const change of changes) {
+    if (!ranges.has(change.actor)) ranges.set(change.actor, [])
+    ranges.get(change.actor).push([change.startOp, change.startOp + change.ops.length - 1])
+  }
+  function inBundle(opId) {
+    const {counter, actorId} = parseOpId(opId)
+    return (ranges.get(actorId) || []).some(([start, end]) => counter >= start && counter <= end)
+  }
+
+  const ops = [], preds = new Map()
+  let group = null, target = null
+  function flush() {
+    for (const [id, pred] of preds) {
+      if (inBundle(id)) ops.push(Object.assign({id, action: 'del', insert: false, pred}, target))
+    }
+    preds.clear()
+  }
+  for (const op of documentOps) {
+    const elemId = op.insert ? op.id : op.elemId
+    const key = elemId === undefined ? `${op.obj}/${op.key}` : `${op.obj}@${elemId}`
+    if (key !== group) {
+      flush()
+      group = key
+      target = elemId === undefined ? {obj: op.obj, key: op.key} : {obj: op.obj, elemId}
+    }
+    op.pred = preds.get(op.id) || []
+    preds.delete(op.id)
+    if (inBundle(op.id)) ops.push(op)
+    for (const succ of op.succ) {
+      if (!preds.has(succ)) preds.set(succ, [])
+      preds.get(succ).push(op.id)
+    }
+  }
+  flush()
+  return ops
+}
+
+function encodeDocumentBundle(changeBuffers, documentOps) {
+  const {changes} = decodeBundleInput(changeBuffers)
+  const ops = documentBundleOps(changes, documentOps)
+  const actors = new Set(changes.map(change => change.actor))
+  for (const op of ops) {
+    for (const opId of [op.obj, op.elemId, ...op.pred]) {
+      if (opId !== undefined && opId !== '_root' && opId !== '_head') actors.add(parseOpId(opId).actorId)
+    }
+  }
+  const sortedActors = [...actors].sort()
+  const actorIndex = new Map(sortedActors.map((actor, index) => [actor, index]))
+  const columns = {}
+  for (const {columnName, columnId} of BUNDLE_OPS_COLUMNS) {
+    if (columnName !== 'expand' || ops.some(op => op.expand)) columns[columnName] = encoderByColumnId(columnId)
+  }
+  for (const op of ops) {
+    const encoded = Object.create(op)
+    if (op.obj !== '_root') encoded.obj = parseBundleOpId(op.obj, actorIndex)
+    if (op.elemId !== undefined && op.elemId !== '_head') encoded.elemId = parseBundleOpId(op.elemId, actorIndex)
+    encodeOp(encoded, columns)
+    columns.idActor.appendValue(actorIndex.get(parseOpId(op.id).actorId))
+    columns.predNum.appendValue(op.pred.length)
+    for (const pred of op.pred) {
+      const id = parseBundleOpId(pred, actorIndex)
+      columns.predActor.appendValue(id.actorNum)
+      columns.predCtr.appendValue(id.counter)
+    }
+  }
+  const inverse = ops.map((op, position) => Object.assign(parseOpId(op.id), {position}))
+    .sort((left, right) => actorIndex.get(left.actorId) - actorIndex.get(right.actorId) || left.counter - right.counter)
+  for (const {position} of inverse) columns.idCtrInverse.appendValue(position)
+  const opColumns = BUNDLE_OPS_COLUMNS.filter(({columnName}) => columns[columnName] && columnName !== 'idCtr')
+    .map(({columnName, columnId}) => ({columnName, columnId, encoder: columns[columnName]}))
+  return bundleContainer(changes, sortedActors, opColumns)
 }
 
 function required(decoder, name) {
@@ -354,5 +431,5 @@ function decodeBundle(buffer) {
 
 export {
   CHUNK_TYPE_BUNDLE, BUNDLE_CHANGE_COLUMNS, BUNDLE_OPS_COLUMNS,
-  encodeBundle, decodeBundle
+  encodeBundle, encodeDocumentBundle, decodeBundle
 }

@@ -1,6 +1,7 @@
 import { encodeChange, splitContainers } from './columnar.js'
-import { decodeBundle, encodeBundle } from './bundle.js'
+import { decodeBundle, encodeBundle, encodeDocumentBundle } from './bundle.js'
 import { BackendDoc } from './new.js'
+import { documentOps } from './fragments.js'
 import { backendState } from './util.js'
 /**
  * Returns an empty node state.
@@ -252,7 +253,8 @@ function stats(backend) {
 }
 
 function saveBundleByHash(backend, hashes) {
-  return encodeBundle(backendState(backend, true).getChangesByHash(hashes))
+  const state = backendState(backend, true)
+  return encodeDocumentBundle(state.getChangesByHash(hashes), documentOps(state))
 }
 
 export {

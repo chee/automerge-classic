@@ -4,7 +4,7 @@
 
 Make `@automerge/automerge-classic` a practical plain-JavaScript replacement for `@automerge/automerge` through a pnpm override. Preserve the current Automerge binary formats and JavaScript behavior, including modern primitive-string text, rich text, sync v2, bundles, incremental loading, package subpaths, and the `automerge.wasm` export (a valid Wasm module with no exports).
 
-The exported API surface is exactly the modern package's surface — a breaking change from earlier revisions of this package. Everything that was not a feature of `../automerge` has been removed: the v1 classic entry point (`Text`/`Table` value classes, `Observable`, the split `Frontend`/`Backend` API, `setDefaultBackend`, `getObjectById`, `setActorId`, `uuid`, `releaseInfo`) and the sedimentree fragment-metadata surface that classic grew while it was also standing in for `@automerge/automerge-subduction` (`getFragmentMetadata`, `getFragmentMeta`, `bundleFragmentMetadata`, `getCommits`, `getFragments`, `addCommits`, `addFragments`, `diffPath`). `saveBundle`/`readBundle` remain (they are modern exports). Documents containing v1 tables still load, materializing each table as a plain map of rows, and re-save byte-identically. The live interop suite asserts exact export equality with the modern package in both directions.
+The exported API surface is exactly the modern package's surface — a breaking change from earlier revisions of this package. Everything that was not a feature of `../automerge` has been removed: the v1 classic entry point (`Text`/`Table` value classes, `Observable`, the split `Frontend`/`Backend` API, `setDefaultBackend`, `getObjectById`, `setActorId`, `uuid`, `releaseInfo`). `saveBundle`/`readBundle` and the fragment API (`getFragmentMetadata`, `getFragmentMeta`, `bundleFragmentMetadata`, `getCommits`, `getFragments`, `addCommits`, `addFragments`, `diffPath`) remain (they are modern exports as of 3.5). Documents containing v1 tables still load, materializing each table as a plain map of rows, and re-save byte-identically. The live interop suite asserts exact export equality with the modern package in both directions.
 
 The performance target is practical parity for normal document workloads. Exact Rust throughput is not required. Pathological quadratic behavior is not acceptable.
 
@@ -22,7 +22,7 @@ The performance target is practical parity for normal document workloads. Exact 
 - Current change and document containers load in both implementations.
 - Bundle encoding and decoding are implemented.
 - Bundle operation IDs use the normal counter column accepted by Rust 3.2.
-- Bundling is implemented (`saveBundle`/`readBundle`); the fragment-metadata surface was removed when the API was narrowed to the modern package surface.
+- Bundling is implemented (`saveBundle`/`readBundle`), and so is the fragment API that `@automerge/automerge` 3.5 exports.
 - Incremental save, incremental load, and save-since are implemented.
 - Empty map keys encode and decode correctly.
 - Bytes use `Uint8Array` at the public API.

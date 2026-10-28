@@ -1,6 +1,6 @@
 import * as Frontend from '../frontend/index.js'
 import { CHANGE, CONFLICTS, OBJECT_ID, OPTIONS, STATE } from '../frontend/constants.js'
-import { decodeChange, decodeChangeMeta, decodeChanges, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
+import { decodeChange, decodeChangeColumns, decodeChangeMeta, decodeChanges, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
 import { compareUtf8, isObject, parseOpId, wellFormedString } from './common.js'
 import { ImmutableString, isImmutableString } from './immutable_string.js'
 import { graphemes, myersDiff, replaceHook } from './text_diff.js'
@@ -237,6 +237,187 @@ export function saveBundle(doc, hashes) {
 export function readBundle(bundle) {
   const {changes, deps} = backend.readBundle(bundle)
   return {changes, deps}
+}
+
+function readProperty(value, name, prefix) {
+  try {
+    return Reflect.get(value, name)
+  } catch (error) {
+    const detail = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack}` : String(error)
+    throw new RangeError(`${prefix}unable to get property JsValue("${name}"): JsValue(${detail})`)
+  }
+}
+
+function rustChar(byte) {
+  const escapes = {0: '\\0', 9: '\\t', 10: '\\n', 13: '\\r', 39: "\\'", 92: '\\\\'}
+  if (escapes[byte]) return `'${escapes[byte]}'`
+  if (byte < 0x20 || (byte >= 0x7f && byte <= 0xa0) || byte === 0xad) return `'\\u{${byte.toString(16)}}'`
+  return `'${String.fromCharCode(byte)}'`
+}
+
+function hashError(hash) {
+  if (typeof hash !== 'string') return 'change hash was not a string'
+  const bytes = new TextEncoder().encode(hash)
+  if (bytes.length % 2 !== 0) return 'Odd number of digits'
+  const bad = bytes.findIndex(byte => !/[0-9a-fA-F]/.test(String.fromCharCode(byte)))
+  if (bad >= 0) return `Invalid character ${rustChar(bytes[bad])} at position ${bad}`
+  if (bytes.length !== 64) return `incorrect length, change hash should be 32 bytes, got ${bytes.length / 2}`
+  return null
+}
+
+function hashesError(hashes) {
+  if (!Array.isArray(hashes)) return 'the change hashes were not an array of strings'
+  for (let i = 0; i < hashes.length; i++) {
+    const error = hashError(hashes[i])
+    if (error) return `could not decode hash ${i}: ${error}`
+  }
+  return null
+}
+
+function isLevel(value) {
+  return Number.isInteger(value) && value >= 0
+}
+
+function fragmentLevels(levels) {
+  if (levels === undefined || levels === null) return [0, Infinity]
+  if (typeof levels === 'number') {
+    if (!isLevel(levels)) throw new RangeError('fragment level must be a non-negative integer')
+    return [levels, levels + 1]
+  }
+  const prefix = 'bad fragment level range property: '
+  const start = readProperty(levels, 'start', prefix)
+  if (typeof start === 'number' && !isLevel(start)) throw new RangeError('fragment level range start must be a non-negative integer')
+  const end = readProperty(levels, 'end', prefix)
+  if (typeof end === 'number' && !isLevel(end)) throw new RangeError('fragment level range end must be a non-negative integer')
+  return [typeof start === 'number' ? start : 0, typeof end === 'number' ? end : Infinity]
+}
+
+function readInputs(inputs, notArray, readInput) {
+  if (!Array.isArray(inputs)) throw new RangeError(notArray)
+  const result = []
+  for (let i = 0; i < inputs.length; i++) result.push(readInput(inputs[i], i))
+  return result
+}
+
+function readFragment(value, prefix, withBytes) {
+  function read(name) {
+    return readProperty(value, name, `${prefix}bad fragment input property: `)
+  }
+  const head = read('head'), headError = hashError(head)
+  if (headError) throw new RangeError(`${prefix}bad fragment head: ${headError}`)
+  const fragment = {head: head.toLowerCase()}
+  if (!isLevel(read('level'))) throw new RangeError(`${prefix}bad fragment level`)
+  for (const name of ['boundary', 'checkpoints', 'members']) {
+    const hashes = read(name), error = hashesError(hashes)
+    if (error) throw new RangeError(`${prefix}bad fragment ${name}: ${error}`)
+    fragment[name] = hashes.map(hash => hash.toLowerCase())
+  }
+  if (withBytes) {
+    fragment.bytes = read('bytes')
+    if (!(fragment.bytes instanceof Uint8Array)) throw new RangeError(`${prefix}bad fragment bytes: not a Uint8Array`)
+  }
+  return fragment
+}
+
+function readCommit(value, prefix) {
+  function read(name) {
+    return readProperty(value, name, `${prefix}bad commit input property: `)
+  }
+  const head = read('head'), headError = hashError(head)
+  if (headError) throw new RangeError(`${prefix}bad commit head: ${headError}`)
+  const parents = read('parents'), parentsError = hashesError(parents)
+  if (parentsError) throw new RangeError(`${prefix}bad commit parents: ${parentsError}`)
+  const bytes = read('bytes')
+  if (!(bytes instanceof Uint8Array)) throw new RangeError(`${prefix}bad commit bytes: not a Uint8Array`)
+  return {head: head.toLowerCase(), parents: parents.map(parent => parent.toLowerCase()), bytes}
+}
+
+function parseErrorMessage(bytes, error, unit) {
+  const message = error.message
+  if (message.startsWith('Data does not begin with magic bytes')) return `unable to parse ${unit}: failed to parse header: Invalid magic bytes`
+  if (unit === 'change' && bytes[8] > 3) return `unable to parse change: failed to parse header: unknown chunk type: ${bytes[8]}`
+  if (['subarray exceeds buffer size', 'buffer ended with incomplete number'].includes(message)) return `unable to parse ${unit}: not enough data`
+  if (message === 'checksum does not match data' && unit === 'chunk') return 'bad checksum'
+  if (message === 'Encoded change has trailing data') return 'leftover data after parsing'
+  if (message.startsWith('Unexpected chunk type')) return 'wrong chunk type'
+  return unit === 'change' ? `unable to parse change: ${message}` : message
+}
+
+export function getFragmentMetadata(doc, levels) {
+  const [start, end] = fragmentLevels(levels)
+  return backend.getFragments(Frontend.getBackendState(doc, 'getFragmentMetadata'), start, end)
+}
+
+export function getFragmentMeta(doc, head) {
+  const state = Frontend.getBackendState(doc, 'getFragmentMeta')
+  const error = hashError(head)
+  if (error) throw error
+  return backend.getFragment(state, head.toLowerCase())
+}
+
+export function bundleFragmentMetadata(doc, fragments) {
+  const state = Frontend.getBackendState(doc, 'bundleFragmentMetadata')
+  const inputs = readInputs(fragments, 'fragments must be an array', (fragment, i) => readFragment(fragment, `bad fragment at index ${i}: `, false))
+  return backend.bundleFragments(state, inputs)
+}
+
+export function getCommits(doc) {
+  const state = Frontend.getBackendState(doc, 'getCommits')
+  const commits = backend.getFragments(state, 0, 1)
+  const bytes = backend.bundleFragments(state, commits)
+  return commits.map((fragment, index) => ({head: fragment.head, parents: fragment.boundary, bytes: bytes[index]}))
+}
+
+export function getFragments(doc, levels) {
+  const state = Frontend.getBackendState(doc, 'getFragments')
+  const [start, end] = fragmentLevels(levels === undefined || levels === null ? {start: 1} : levels)
+  const fragments = backend.getFragments(state, start, end)
+  const bytes = backend.bundleFragments(state, fragments)
+  return fragments.map((fragment, index) => Object.assign(fragment, {bytes: bytes[index]}))
+}
+
+export function addCommits(doc, commits, options) {
+  assertWritable(doc)
+  const state = Frontend.getBackendState(doc, 'addCommits')
+  const inputs = readInputs(commits, 'commit inputs must be an array', (commit, i) => readCommit(commit, `bad commit input at index ${i}: `))
+  for (const commit of inputs) {
+    let change
+    try {
+      change = decodeChangeColumns(commit.bytes)
+    } catch (error) {
+      throw new RangeError(`bad commit bytes: ${parseErrorMessage(commit.bytes, error, 'change')}`)
+    }
+    if (change.hash !== commit.head) {
+      throw new RangeError(`commit input head mismatch: expected ${commit.head}, actual ${change.hash}`)
+    }
+    if (change.deps.length !== commit.parents.length || change.deps.some((dep, i) => dep !== commit.parents[i])) {
+      throw new RangeError('commit input parents do not match encoded change dependencies')
+    }
+  }
+  const changes = inputs.map(commit => commit.bytes)
+  const [newState, patch] = backend.applyChanges(state, changes)
+  return applyBackendPatch(doc, patch, newState, changes, options || {}, 'addCommits')
+}
+
+export function addFragments(doc, fragments, options) {
+  assertWritable(doc)
+  const state = Frontend.getBackendState(doc, 'addFragments')
+  const inputs = readInputs(fragments, 'fragment inputs must be an array', (fragment, i) => readFragment(fragment, `bad fragment input at index ${i}: `, true))
+  const data = new Uint8Array(inputs.reduce((length, input) => length + input.bytes.byteLength, 0))
+  let offset = 0
+  for (const input of inputs) {
+    data.set(input.bytes, offset)
+    offset += input.bytes.byteLength
+  }
+  let newState, patch
+  try {
+    [newState, patch] = backend.loadIncremental(state, data)
+  } catch (error) {
+    if (state.frozen) throw error
+    throw new RangeError(`error loading fragment bundles: ${parseErrorMessage(data, error, 'chunk')}`)
+  }
+  if (!patch) return doc
+  return applyBackendPatch(doc, patch, newState, [data], options || {}, 'addFragments')
 }
 
 export function equals(val1, val2) {
@@ -845,6 +1026,67 @@ export function diff(doc, beforeHeads, afterHeads) {
   const before = diffView(doc, beforeHeads, currentKey, marked)
   const after = diffView(doc, afterHeads, currentKey, marked)
   return patchesBetween(before, after, marked && objectsBetweenHeads(doc, beforeHeads, afterHeads))
+}
+
+function resolveObjectPath(doc, pathString) {
+  let value = doc, objectId = '_root'
+  for (const [i, prop] of pathString.split('/').slice(1).entries()) {
+    if (prop === '') break
+    let key = prop
+    if (Array.isArray(value) || value instanceof Frontend.Text) {
+      if (!/^\+?[0-9]+$/.test(prop) || Number(prop) > 0xffffffff) {
+        throw new RangeError(`invalid path ${pathString}: path component ${i} (${prop}) should be an integer to index a sequence`)
+      }
+      key = Number(prop)
+    }
+    const present = value instanceof Frontend.Text ? key < value.length : Object.prototype.hasOwnProperty.call(value, key)
+    if (!present) throw new RangeError(`invalid path ${pathString}: path component ${i} (${prop}) referenced a nonexistent object`)
+    objectId = Frontend.getObjectId(value, key)
+    if (!objectId) throw new RangeError(`invalid path ${pathString}: path did not refer to an object`)
+    value = value instanceof Frontend.Text ? value.get(key) : Frontend.getText(value, key) || value[key]
+  }
+  return objectId
+}
+
+function pathToObject(object, objectId, path) {
+  if (Frontend.getObjectId(object) === objectId) return path
+  const keys = Array.isArray(object) ? object.map((_, index) => index) : Object.keys(object)
+  for (const key of keys) {
+    const child = Frontend.getText(object, key) || object[key]
+    if (!Frontend.getObjectId(object, key) || child instanceof Frontend.Text && Frontend.getObjectId(object, key) !== objectId) continue
+    const found = pathToObject(child, objectId, path.concat(key))
+    if (found) return found
+  }
+  return null
+}
+
+function knownHeads(doc, heads) {
+  const error = hashesError(heads)
+  if (error) throw new RangeError(`invalid before heads: ${error}`)
+  return heads.map(head => head.toLowerCase()).filter(head => hasHeads(doc, [head]))
+}
+
+export function diffPath(doc, path, before, after, options) {
+  if (!Array.isArray(before)) throw new Error('invalid before: must be an array')
+  if (!Array.isArray(after)) throw new Error('invalid after: must be an array')
+  Frontend.getBackendState(doc, 'diffPath')
+  path = path.slice()
+  path.unshift('_root')
+  const objectId = resolveObjectPath(doc, path.join('/'))
+  let recursive
+  try {
+    recursive = Reflect.get(options, 'recursive') !== false
+  } catch (error) {
+    recursive = true
+  }
+  const beforeHeads = knownHeads(doc, before), afterHeads = knownHeads(doc, after)
+  const patches = diff(doc, beforeHeads, afterHeads)
+  const prefix = pathToObject(diffView(doc, afterHeads, headsKey(getHeads(doc)), false), objectId, [])
+  if (!prefix) return []
+  return patches.filter(patch => {
+    const depth = patch.path.length - prefix.length - (patch.action === 'mark' ? 0 : 1)
+    return depth >= 0 && (recursive || depth === 0) && prefix.every((key, i) => patch.path[i] === key)
+  })
 }
 
 function patchesBetween(before, after, touched, excluded) {

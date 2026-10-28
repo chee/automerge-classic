@@ -1974,6 +1974,33 @@ function setupPatches(patches, objectIds, docState) {
   return patches
 }
 
+function topologicalOrder(changes, changeIndexByHash) {
+  const pending = [], position = new Map()
+  for (const change of changes) {
+    if (changeIndexByHash[change.hash] !== undefined || position.has(change.hash)) continue
+    position.set(change.hash, pending.length)
+    pending.push(change)
+  }
+  const unsatisfied = new Array(pending.length).fill(0), waiting = new Map()
+  for (let i = 0; i < pending.length; i++) {
+    for (const dep of pending[i].deps) {
+      if (changeIndexByHash[dep] !== undefined) continue
+      unsatisfied[i]++
+      if (!waiting.has(dep)) waiting.set(dep, [])
+      waiting.get(dep).push(i)
+    }
+  }
+  const order = []
+  for (let i = 0; i < pending.length; i++) if (unsatisfied[i] === 0) order.push(i)
+  for (let k = 0; k < order.length; k++) {
+    for (const i of waiting.get(pending[order[k]].hash) || []) {
+      if (--unsatisfied[i] === 0) order.push(i)
+    }
+  }
+  const ready = new Set(order)
+  return order.map(i => pending[i]).concat(pending.filter((change, i) => !ready.has(i)))
+}
+
 /**
  * Takes an array of decoded changes and applies them to a document. `docState` contains a bunch of
  * fields describing the document state. This function mutates `docState` to contain the updated
@@ -2402,6 +2429,16 @@ class BackendDoc {
       return decoded
     })
 
+    let queue = this.queue.concat(decodedChanges)
+    if (!this.haveHashGraph) {
+      const hashes = new Set(queue.map(change => change.hash))
+      if (queue.some(change => change.seq <= (this.clock[change.actor] || 0) ||
+          change.deps.some(dep => !(this.changeIndexByHash[dep] >= 0) && !hashes.has(dep)))) {
+        this.computeHashGraph()
+      }
+    }
+    if (queue.length > 1) queue = topologicalOrder(queue, this.changeIndexByHash)
+
     let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
     let docState = {
       maxOp: this.maxOp,
@@ -2415,7 +2452,6 @@ class BackendDoc {
       objectMeta: Object.assign({}, this.objectMeta),
       objectsWithMarks: new Set(this.objectsWithMarks)
     }
-    let queue = (this.queue.length === 0) ? decodedChanges : decodedChanges.concat(this.queue)
     let allApplied = [], objectIds = new Set()
 
     while (true) {
@@ -2593,7 +2629,7 @@ class BackendDoc {
     // If the traversal above has encountered all the heads, and was not aborted early due to
     // a missing dependency, then the set of changes it has found is complete, so we can return it
     if (!aborted && stack.length === 0 && this.heads.every(head => seenHashes[head])) {
-      return toReturn.map(hash => this.changes[this.changeIndexByHash[hash]])
+      return toReturn.map(hash => this.changeIndexByHash[hash]).sort((a, b) => a - b).map(index => this.changes[index])
     }
 
     // If we haven't encountered all of the heads, we have to search harder. This will happen if

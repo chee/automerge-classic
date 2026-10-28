@@ -79,4 +79,22 @@ describe('modern API compatibility types', () => {
     assert.strictEqual(view.text.toString(), 'world')
     assert.strictEqual(decodedBundle.changes.length, 1)
   })
+
+  it('types the fragment API', () => {
+    const doc = Automerge.from<{title: string}>({title: 'hello'}, {actor: 'aabb'})
+    const levels: Automerge.FragmentLevelRange = {start: 1}
+    const metas: Automerge.FragmentMeta[] = Automerge.getFragmentMetadata(doc, 0)
+    const meta: Automerge.FragmentMeta | null = Automerge.getFragmentMeta(doc, metas[0].head)
+    const bytes: Uint8Array[] = A.bundleFragmentMetadata(doc, metas)
+    const commits: Automerge.Commit[] = Automerge.getCommits(doc)
+    const fragments: Automerge.Fragment[] = Slim.getFragments(doc, levels)
+    const options: Automerge.DiffOptions = {recursive: false}
+    let copy: Automerge.Doc<{title: string}> = Automerge.addCommits(Automerge.init<{title: string}>(), commits)
+    copy = Automerge.addFragments(copy, fragments)
+    const patches: Automerge.Patch[] = Automerge.diffPath(copy, [], [], Automerge.getHeads(copy), options)
+    assert.strictEqual(meta && meta.head, metas[0].head)
+    assert.strictEqual(bytes.length, 1)
+    assert.strictEqual(copy.title, 'hello')
+    assert.strictEqual(patches.length, 1)
+  })
 })

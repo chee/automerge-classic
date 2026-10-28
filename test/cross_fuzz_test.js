@@ -1,6 +1,8 @@
 import assert from 'node:assert'
 import Classic from './subject.js'
 import Modern, { describeLive } from './modern.js'
+import { CHANGE_COLUMNS, decodeChangeColumns, decodeChangeMeta, decodeColumnInfo, decodeColumns, decodeContainerHeader, decodeOps, encodeChange, inflateColumn } from '../backend/columnar.js'
+import { Decoder } from '../backend/encoding.js'
 
 const SEEDS = Number(process.env.CROSS_FUZZ_SEEDS || 40)
 const STEPS = Number(process.env.CROSS_FUZZ_STEPS || 60)
@@ -110,7 +112,19 @@ function generator(rand) {
     return (A, draft) => { A.splice(draft, path, offset, width, text) }
   }
 
-  return {value, edit}
+  return {value, edit, objects}
+}
+
+function levelOneTime(doc, fn) {
+  const trial = Classic.change(Classic.clone(doc, Classic.getActorId(doc)), {time: 0}, draft => fn(Classic, draft))
+  if (Classic.getHeads(trial).join() === Classic.getHeads(doc).join()) return 0
+  const {columns, actorIds, ...change} = decodeChangeColumns(Classic.getLastLocalChange(trial))
+  change.ops = decodeOps(decodeColumns(columns, actorIds, CHANGE_COLUMNS), false)
+  delete change.hash
+  for (let time = 1; ; time++) {
+    change.time = time
+    if (decodeChangeMeta(encodeChange(change), true).hash.startsWith('00')) return time
+  }
 }
 
 function syncAll(docA, implA, docB, implB) {
@@ -131,21 +145,98 @@ function assertPair(peer, context) {
   assert.deepStrictEqual(plain(Classic.toJS(peer.classic)), plain(Modern.toJS(peer.modern)), `value ${context}`)
 }
 
+function history(A, doc) {
+  return A.getChangesMetaSince(doc, []).map(meta => meta.hash)
+}
+
+function deletesOrderUnstable(bundle) {
+  const targets = Classic.readBundle(bundle).changes.flatMap(change => change.ops)
+    .filter(op => op.action === 'del').map(op => `${op.obj} ${op.key || op.elemId}`)
+  return new Set(targets).size < targets.length
+}
+
+function inflated(bundle) {
+  const decoder = new Decoder(decodeContainerHeader(new Decoder(bundle), false).chunkData), parts = []
+  for (let i = decoder.readUint53(); i > 0; i--) parts.push(decoder.readRawBytes(32))
+  for (let i = decoder.readUint53(); i > 0; i--) parts.push(decoder.readHexString())
+  for (let section = 0; section < 2; section++) {
+    for (const column of decodeColumnInfo(decoder)) {
+      column.buffer = decoder.readRawBytes(column.bufferLen)
+      inflateColumn(column)
+      parts.push(column.columnId, column.buffer)
+    }
+  }
+  return parts
+}
+
+function assertBundles(metas, classic, modern, context) {
+  assert.strictEqual(classic.length, modern.length, `bundle count ${context}`)
+  for (let i = 0; i < classic.length; i++) {
+    if (Buffer.compare(classic[i], modern[i]) === 0) continue
+    if (metas[i].level === 0) {
+      assert.strictEqual(modern[i][8], 2, `change bytes ${context}`)
+      assert.deepStrictEqual(Classic.decodeChange(classic[i]), Classic.decodeChange(modern[i]), `change ${context}`)
+    } else if (deletesOrderUnstable(modern[i])) {
+      assert.deepStrictEqual(Classic.readBundle(classic[i]), Classic.readBundle(modern[i]), `bundle changes ${context}`)
+    } else {
+      assert.deepStrictEqual(inflated(classic[i]), inflated(modern[i]), `bundle bytes ${context}`)
+    }
+  }
+}
+
+function assertFragments(peer, context) {
+  let {classic, modern} = peer, checked = peer.checked || new Set()
+  if (history(Classic, classic).join() !== history(Modern, modern).join()) {
+    const changes = Classic.getAllChanges(classic)
+    ;[classic] = Classic.applyChanges(Classic.init(), changes)
+    ;[modern] = Modern.applyChanges(Modern.init(), changes)
+    checked = new Set()
+  }
+  for (const levels of [0, {start: 1}]) {
+    const metas = Classic.getFragmentMetadata(classic, levels)
+    assert.deepStrictEqual(metas, Modern.getFragmentMetadata(modern, levels), `fragments ${JSON.stringify(levels)} ${context}`)
+    const fresh = metas.filter(meta => !checked.has(meta.head))
+    assertBundles(fresh, Classic.bundleFragmentMetadata(classic, fresh), Modern.bundleFragmentMetadata(modern, fresh), `${JSON.stringify(levels)} ${context}`)
+    for (const meta of fresh) checked.add(meta.head)
+  }
+}
+
+function assertAddedAcross(peer, context) {
+  const fromClassic = Modern.addCommits(Modern.addFragments(Modern.init(), Classic.getFragments(peer.classic)), Classic.getCommits(peer.classic))
+  const fromModern = Classic.addCommits(Classic.addFragments(Classic.init(), Modern.getFragments(peer.modern)), Modern.getCommits(peer.modern))
+  assertPair({classic: fromModern, modern: fromClassic}, `added ${context}`)
+  assertPair({classic: peer.classic, modern: fromClassic}, `added from classic ${context}`)
+}
+
+function assertDiffPath(peer, objects, before, after, context) {
+  const modern = Modern.load(Modern.save(peer.modern))
+  if (JSON.stringify(plain(Classic.diff(peer.classic, before, after))) !== JSON.stringify(plain(Modern.diff(modern, before, after)))) return
+  for (const {path} of objects(peer.classic, [], [])) {
+    for (const opts of [undefined, {recursive: false}]) {
+      assert.deepStrictEqual(plain(Classic.diffPath(peer.classic, path, before, after, opts)),
+        plain(Modern.diffPath(modern, path, before, after, opts)), `diffPath ${JSON.stringify(path)} ${context}`)
+    }
+  }
+}
+
 function run(seed) {
-  const rand = random(seed)
-  const {edit} = generator(rand)
-  const peers = ACTORS.map(actor => ({classic: Classic.init(actor), modern: Modern.init(actor)}))
+  const rand = random(seed), mining = random(-seed)
+  const {edit, objects} = generator(rand)
+  const peers = ACTORS.map(actor => ({classic: Classic.init(actor), modern: Modern.init(actor), checked: new Set()}))
 
   for (let step = 0; step < STEPS; step++) {
     const index = Math.floor(rand() * peers.length)
     const peer = peers[index], other = peers[(index + 1 + Math.floor(rand() * (peers.length - 1))) % peers.length]
     const action = rand()
     const context = `seed ${seed} step ${step}`
+    const touched = action >= 0.8 && action < 0.9 ? [peer, other] : [peer]
 
     if (action < 0.7) {
-      const fn = edit(peer.classic)
-      peer.classic = Classic.change(peer.classic, {time: 0}, draft => fn(Classic, draft))
-      peer.modern = Modern.change(peer.modern, {time: 0}, draft => fn(Modern, draft))
+      const fn = edit(peer.classic), before = Classic.getHeads(peer.classic)
+      const time = mining() < 0.1 ? levelOneTime(peer.classic, fn) : 0
+      peer.classic = Classic.change(peer.classic, {time}, draft => fn(Classic, draft))
+      peer.modern = Modern.change(peer.modern, {time}, draft => fn(Modern, draft))
+      if (mining() < 0.1) assertDiffPath(peer, objects, before, Classic.getHeads(peer.classic), context)
     } else if (action < 0.8) {
       peer.classic = Classic.merge(peer.classic, other.classic)
       peer.modern = Modern.merge(peer.modern, other.modern)
@@ -160,8 +251,12 @@ function run(seed) {
       const changes = Modern.getAllChanges(peer.modern)
       const [applied] = Classic.applyChanges(Classic.init(), changes)
       assert.deepStrictEqual(plain(Classic.toJS(applied)), plain(Classic.toJS(peer.classic)), `applyChanges ${context}`)
+      if (mining() < 0.3) assertAddedAcross(peer, context)
     }
-    for (const [index, p] of peers.entries()) assertPair(p, `${context} peer ${index}`)
+    for (const [index, p] of peers.entries()) {
+      assertPair(p, `${context} peer ${index}`)
+      if (touched.includes(p)) assertFragments(p, `${context} peer ${index}`)
+    }
   }
 
   let [a, b] = [peers[0].classic, peers[1].modern]
@@ -170,6 +265,8 @@ function run(seed) {
   assert.deepStrictEqual(Classic.getHeads(a), Modern.getHeads(b), `final heads seed ${seed}`)
   assert.deepStrictEqual(plain(Classic.toJS(a)), plain(Modern.toJS(b)), `final value seed ${seed}`)
   assertPair({classic: Classic.load(Modern.save(b)), modern: Modern.load(Classic.save(a))}, `final load seed ${seed}`)
+  assertFragments({classic: a, modern: b}, `final seed ${seed}`)
+  assertAddedAcross({classic: a, modern: Modern.applyChanges(Modern.init(), Classic.getAllChanges(a))[0]}, `final seed ${seed}`)
 }
 
 describeLive('cross-implementation fuzz', () => {

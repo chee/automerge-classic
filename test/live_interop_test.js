@@ -354,9 +354,7 @@ describeLive('live Rust/WASM interoperability', () => {
 
   it('exposes exactly the exports of the modern package', () => {
     const unimplemented = new Set([
-      'addCommits', 'addFragments', 'bundleFragmentMetadata', 'diffPath', 'getCommits', 'getFragmentMeta',
-      'getFragmentMetadata', 'getFragments', 'anonymize', 'getActorsForAuthor', 'getAuthor', 'getAuthorForActor',
-      'getAuthors', 'releaseInfo'
+      'anonymize', 'getActorsForAuthor', 'getAuthor', 'getAuthorForActor', 'getAuthors', 'releaseInfo'
     ])
     for (const key of Object.keys(Modern)) {
       if (key === 'default' || unimplemented.has(key)) continue
