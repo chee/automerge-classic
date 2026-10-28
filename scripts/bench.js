@@ -21,6 +21,28 @@ function bigDoc(A) {
   return doc
 }
 
+function largeDoc(A) {
+  let doc = A.from({text: '', list: [], map: {}})
+  for (let i = 0; i < 5000; i++) {
+    doc = A.change(doc, d => {
+      A.splice(d, ['text'], (i * 7919) % (d.text.length + 1), 0, 'lorem ipsum dolor ')
+      d.list.push({n: i, s: 'item' + i})
+      d.map['key' + (i % 500)] = i
+    })
+  }
+  return doc
+}
+
+let large
+
+function largeContext(A) {
+  if (!large) {
+    const doc = largeDoc(A)
+    large = {doc, bytes: A.save(doc)}
+  }
+  return {...large, unsaved: A.change(large.doc, d => { d.map.key0 = -1 })}
+}
+
 const WORKLOADS = {
   'map: 6000 writes to one key': A => {
     let doc = A.from({counter: 0})
@@ -37,6 +59,12 @@ const WORKLOADS = {
   'list: 3000 appends': A => {
     let doc = A.from({list: []})
     for (let i = 0; i < 3000; i++) doc = A.change(doc, d => { d.list.push(i) })
+    return doc
+  },
+
+  'list: 3000 object appends': A => {
+    let doc = A.from({list: []})
+    for (let i = 0; i < 3000; i++) doc = A.change(doc, d => { d.list.push({n: i}) })
     return doc
   },
 
@@ -65,6 +93,12 @@ const WORKLOADS = {
   'save: 6000-op doc': (A, ctx) => A.save(ctx.unsaved),
 
   'load: 6000-op doc': (A, ctx) => A.load(ctx.bytes),
+
+  'save: 5000-change doc': [largeContext, (A, ctx) => A.save(ctx.unsaved)],
+
+  'load: 5000-change doc': [largeContext, (A, ctx) => A.load(ctx.bytes)],
+
+  'load + getAllChanges: 5000-change doc': [largeContext, (A, ctx) => A.getAllChanges(A.load(ctx.bytes))],
 
   'clone+change x1000': (A, ctx) => {
     let doc = ctx.doc
@@ -160,9 +194,10 @@ async function run() {
   const only = process.argv[3]
   const A = await IMPLS[impl]()
   const results = {}
-  for (const [name, fn] of Object.entries(WORKLOADS)) {
+  for (const [name, workload] of Object.entries(WORKLOADS)) {
     if (only && name !== only) continue
-    const ctx = context(A)
+    const [setup, fn] = Array.isArray(workload) ? workload : [context, workload]
+    const ctx = setup(A)
     if (global.gc) global.gc()
     const start = process.hrtime.bigint()
     fn(A, ctx)
