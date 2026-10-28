@@ -778,7 +778,7 @@ function encodeChangeColumns(changeObj, actorOrder) {
   return encodeChangeContainer(change, actorIds, extraBytes)
 }
 
-function encodeChangeContainer(change, actorIds, extraBytes) {
+function encodeChangeContainer(change, actorIds, extraBytes, opColumns) {
   if (!Array.isArray(change.deps)) throw new TypeError('deps is not an array')
   const deps = change.deps.slice().sort(), message = change.message || ''
   let columns
@@ -796,7 +796,7 @@ function encodeChangeContainer(change, actorIds, extraBytes) {
     for (let actor of actorIds.slice(1)) encoder.appendHexString(actor)
 
     columns = []
-    for (const column of encodeOps(change.ops)) {
+    for (const column of opColumns || encodeOps(change.ops)) {
       const buffer = column.encoder.buffer
       if (buffer.byteLength > 0) columns.push({columnId: column.columnId, bufferLen: buffer.byteLength, buffer})
     }
@@ -1149,7 +1149,6 @@ function documentChanges(buffer) {
     }))
   }
 
-  const numActors = actorIds.length
   function readActor(decoder) {
     const actorNum = decoder.readValue()
     if (actorNum !== null && !actorIds[actorNum]) throw new RangeError(`No actor index ${actorNum}`)
@@ -1171,31 +1170,43 @@ function documentChanges(buffer) {
       throw new RangeError(`Expected seq = ${actorChanges.length + 1}, got ${seq}`)
     }
     if (seq > 1 && actorChanges[seq - 2].maxOp > maxOp) throw new RangeError('maxOp must increase monotonically per actor')
-    const change = {actorNum, seq, maxOp, time, message, depsIndex, extraBytes, ops: []}
+    const change = {actorNum, seq, maxOp, time, message, depsIndex, extraBytes, ops: [], succs: []}
     actorChanges.push(change)
     changes.push(change)
+  }
+
+  function changeOf(actorNum, counter) {
+    const actorChanges = changesByActor[actorNum] || []
+    let left = 0, right = actorChanges.length
+    while (left < right) {
+      const index = (left + right) >> 1
+      if (actorChanges[index].maxOp < counter) left = index + 1
+      else right = index
+    }
+    if (left >= actorChanges.length) {
+      throw new RangeError(`Operation ID ${counter}@${actorIds[actorNum]} outside of allowed range`)
+    }
+    return actorChanges[left]
   }
 
   const [objActorD, objCtrD, keyActorD, keyCtrD, keyStrD, idActorD, idCtrD, insertD, actionD, valLenD, valRawD,
     chldActorD, chldCtrD, succNumD, succActorD, succCtrD, expandD, markNameD] =
     makeDecoders(opsColumns, DOC_OPS_COLUMNS).map(column => column.decoder)
-  const ops = [], opsById = new Map()
   while (!idCtrD.done) {
     const objActor = readActor(objActorD), objCtr = objCtrD.readValue()
     const keyActor = readActor(keyActorD), keyCtr = keyCtrD.readValue(), keyStr = keyStrD.readValue()
     const idActor = readActor(idActorD), idCtr = idCtrD.readValue()
     const insert = !!insertD.readValue(), action = actionD.readValue()
-    const sizeTag = valLenD.readValue(), rawValue = valRawD.readRawBytes(sizeTag >> 4)
+    const sizeTag = valLenD.readValue(), rawValue = sizeTag >> 4 ? valRawD.readRawBytes(sizeTag >> 4) : null
     const chldActor = readActor(chldActorD), chldCtr = chldCtrD.readValue()
     const succNum = succNumD.readValue() || 0
     if (action === 3) throw new RangeError('document should not contain del operations')
     if (!!chldCtr !== (chldActor !== null)) throw new RangeError(`Mismatched child columns: ${chldCtr} and ${chldActor}`)
-    const id = idCtr * numActors + idActor
     const op = {
-      idActor, idCtr, objActor, objCtr, keyActor, keyCtr, keyStr, insert, action, raw: {sizeTag, rawValue},
-      chldActor, chldCtr, expand: false, markName: null, pred: opsById.has(id) ? opsById.get(id).pred : []
+      idCtr, objActor, objCtr, keyActor, keyCtr, keyStr, insert, action, sizeTag, rawValue,
+      chldActor, chldCtr, expand: false, markName: null, pred: null
     }
-    opsById.set(id, op)
+    changeOf(idActor, idCtr).ops.push(op)
     let lastActor = null, lastCtr = null
     for (let i = 0; i < succNum; i++) {
       const succActor = readActor(succActorD), succCtr = succCtrD.readValue()
@@ -1204,85 +1215,99 @@ function documentChanges(buffer) {
       }
       lastActor = succActor
       lastCtr = succCtr
-      const succId = succCtr * numActors + succActor
-      if (!opsById.has(succId)) {
-        const elem = keyStr === null && insert
-        opsById.set(succId, {
-          idActor: succActor, idCtr: succCtr, objActor, objCtr, keyActor: elem ? idActor : keyActor,
-          keyCtr: elem ? idCtr : keyCtr, keyStr, insert: false, action: 3, raw: null,
-          chldActor: null, chldCtr: null, expand: false, markName: null, pred: []
-        })
-      }
-      opsById.get(succId).pred.push({actorNum: idActor, counter: idCtr})
+      changeOf(succActor, succCtr).succs.push({counter: succCtr, pred: {actorNum: idActor, counter: idCtr}, op})
     }
     const expand = expandD.readValue(), markName = markNameD.readValue()
     if (action === 7) {
       op.expand = !!expand
       op.markName = markName
     }
-    ops.push(op)
-  }
-  for (const op of opsById.values()) {
-    if (op.action === 3) ops.push(op)
   }
 
-  for (const op of ops) {
-    const actorChanges = changesByActor[op.idActor]
-    if (!actorChanges) throw new RangeError(`Operation ID ${op.idCtr}@${actorIds[op.idActor]} outside of allowed range`)
-    let left = 0, right = actorChanges.length
-    while (left < right) {
-      const index = Math.floor((left + right) / 2)
-      if (actorChanges[index].maxOp < op.idCtr) left = index + 1
-      else right = index
-    }
-    if (left >= actorChanges.length) {
-      throw new RangeError(`Operation ID ${op.idCtr}@${actorIds[op.idActor]} outside of allowed range`)
-    }
-    actorChanges[left].ops.push(op)
-  }
-
+  const opColumnSpecs = CHANGE_COLUMNS.filter(({columnName}) => columnName !== 'idActor' && columnName !== 'idCtr')
   const hashes = [], headSet = new Set(), result = []
   for (let i = 0; i < changes.length; i++) {
-    const change = changes[i], actor = actorIds[change.actorNum]
-    change.ops.sort((op1, op2) => op1.idCtr - op2.idCtr)
-    const startOp = change.maxOp - change.ops.length + 1
-    const used = new Set([change.actorNum])
-    for (let j = 0; j < change.ops.length; j++) {
-      const op = change.ops[j]
-      if (op.idCtr !== startOp + j) throw new RangeError(`Expected opId ${startOp + j}@${actor}, got ${op.idCtr}@${actor}`)
+    const change = changes[i], actor = actorIds[change.actorNum], slots = []
+    for (const op of change.ops) {
+      if (slots[change.maxOp - op.idCtr]) throw new RangeError(`Duplicate opId ${op.idCtr}@${actor}`)
+      slots[change.maxOp - op.idCtr] = op
+    }
+    for (const {counter, pred, op} of change.succs) {
+      const index = change.maxOp - counter
+      if (!slots[index]) {
+        const elem = op.keyStr === null && op.insert
+        slots[index] = {
+          idCtr: counter, objActor: op.objActor, objCtr: op.objCtr, keyActor: elem ? pred.actorNum : op.keyActor,
+          keyCtr: elem ? op.idCtr : op.keyCtr, keyStr: op.keyStr, insert: false, action: 3, sizeTag: VALUE_TYPE.NULL,
+          rawValue: null, chldActor: null, chldCtr: null, expand: false, markName: null, pred: null
+        }
+      }
+      if (slots[index].pred) slots[index].pred.push(pred)
+      else slots[index].pred = [pred]
+    }
+    const numOps = slots.length, startOp = change.maxOp - numOps + 1, used = new Set([change.actorNum])
+    let expand = false
+    for (let j = numOps - 1; j >= 0; j--) {
+      const op = slots[j]
+      if (!op) throw new RangeError(`Expected opId ${change.maxOp - j}@${actor}`)
       if (op.objCtr !== null) used.add(op.objActor)
       if (op.keyStr === null && op.keyCtr !== 0) used.add(op.keyActor)
       if (op.chldCtr) used.add(op.chldActor)
-      for (const pred of op.pred) used.add(pred.actorNum)
+      if (op.pred) for (const pred of op.pred) used.add(pred.actorNum)
+      if (op.expand) expand = true
     }
     used.delete(change.actorNum)
     const changeActors = [change.actorNum].concat([...used].sort((a, b) => (actorIds[a] < actorIds[b] ? -1 : 1)))
     const actorIndex = new Map(changeActors.map((actorNum, index) => [actorNum, index]))
-    const changeOps = change.ops.map(op => ({
-      obj: op.objCtr === null ? '_root' : {counter: op.objCtr, actorNum: actorIndex.get(op.objActor)},
-      key: op.keyStr === null ? undefined : op.keyStr,
-      elemId: op.keyStr !== null ? undefined : op.keyCtr === 0 ? '_head'
-        : {counter: op.keyCtr, actorNum: actorIndex.get(op.keyActor)},
-      insert: op.insert,
-      action: op.action,
-      [RAW_VALUE]: op.raw,
-      expand: op.expand,
-      markName: op.markName,
-      child: op.chldCtr ? {counter: op.chldCtr, actorNum: actorIndex.get(op.chldActor)} : null,
-      pred: op.pred.map(pred => ({counter: pred.counter, actorNum: actorIndex.get(pred.actorNum), actorId: actorIds[pred.actorNum]}))
-    }))
+    const encoders = opColumnSpecs.map(({columnId}) => encoderByColumnId(columnId))
+    const [objActorE, objCtrE, keyActorE, keyCtrE, keyStrE, insertE, actionE, valLenE, valRawE,
+      chldActorE, chldCtrE, predNumE, predActorE, predCtrE, expandE, markNameE] = encoders
+    for (let j = numOps - 1; j >= 0; j--) {
+      const op = slots[j]
+      objActorE.appendValue(op.objCtr === null ? null : actorIndex.get(op.objActor))
+      objCtrE.appendValue(op.objCtr)
+      if (op.keyStr !== null) {
+        keyActorE.appendValue(null)
+        keyCtrE.appendValue(null)
+      } else if (op.keyCtr === 0 && op.insert) {
+        keyActorE.appendValue(null)
+        keyCtrE.appendValue(0)
+      } else if (op.keyCtr > 0) {
+        keyActorE.appendValue(actorIndex.get(op.keyActor))
+        keyCtrE.appendValue(op.keyCtr)
+      } else {
+        throw new RangeError(`Unexpected operation key: ${op.keyCtr}@${actorIds[op.keyActor]}`)
+      }
+      keyStrE.appendValue(op.keyStr)
+      insertE.appendValue(op.insert)
+      actionE.appendValue(op.action)
+      valLenE.appendValue(op.sizeTag)
+      if (op.rawValue) valRawE.appendRawBytes(op.rawValue)
+      if (expand) expandE.appendValue(op.expand)
+      markNameE.appendValue(op.markName)
+      chldActorE.appendValue(op.chldCtr ? actorIndex.get(op.chldActor) : null)
+      chldCtrE.appendValue(op.chldCtr || null)
+      const pred = op.pred || []
+      predNumE.appendValue(pred.length)
+      if (pred.length > 1) pred.sort((a, b) => a.counter - b.counter || (actorIds[a.actorNum] < actorIds[b.actorNum] ? -1 : 1))
+      for (const {actorNum, counter} of pred) {
+        predActorE.appendValue(actorIndex.get(actorNum))
+        predCtrE.appendValue(counter)
+      }
+    }
+    const opColumns = opColumnSpecs.map(({columnId}, index) => ({columnId, encoder: encoders[index]}))
     const deps = change.depsIndex.map(index => {
       if (!(index >= 0 && index < i)) throw new RangeError(`No hash for index ${index} while processing index ${i}`)
       headSet.delete(hashes[index])
       return hashes[index]
     }).sort()
     const { hash, buffer } = encodeChangeContainer(
-      {actor, seq: change.seq, startOp, time: change.time, message: change.message, deps, ops: changeOps},
-      changeActors.map(actorNum => actorIds[actorNum]), change.extraBytes
+      {actor, seq: change.seq, startOp, time: change.time, message: change.message, deps},
+      changeActors.map(actorNum => actorIds[actorNum]), change.extraBytes, opColumns
     )
     hashes.push(hash)
     headSet.add(hash)
-    result.push({actor, seq: change.seq, deps, hash, numOps: change.ops.length, bytes: buffer})
+    result.push({actor, seq: change.seq, deps, hash, numOps, bytes: buffer})
   }
 
   const actualHeads = [...headSet].sort()

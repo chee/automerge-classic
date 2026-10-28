@@ -2768,7 +2768,7 @@ class BackendDoc {
   }
 
   hasHeads(heads) {
-    if (!this.haveHashGraph) this.computeHashGraph()
+    if (!this.haveHashGraph && !heads.every(hash => this.changeIndexByHash[hash] !== undefined)) this.computeHashGraph()
     return heads.every(hash => this.changeIndexByHash[hash] !== undefined)
   }
 
