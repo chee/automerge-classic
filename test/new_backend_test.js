@@ -2256,6 +2256,51 @@ describe('BackendDoc applying changes', () => {
     }])
   })
 
+  it('should skip greater concurrent insertions across a block boundary', () => {
+    const actor1 = '01234567', actor2 = '89abcdef'
+    const change1 = {actor: actor1, seq: 1, startOp: 1, time: 0, deps: [], ops: [
+      {action: 'makeText', obj: '_root', key: 'text', insert: false, pred: []}
+    ]}
+    const change2 = {actor: actor2, seq: 1, startOp: 2, time: 0, deps: [hash(change1)], ops: [
+      {action: 'set', obj: `1@${actor1}`, elemId: '_head', insert: true, value: 'b', pred: []}
+    ]}
+    for (let i = 3; i <= MAX_BLOCK_SIZE + 1; i++) {
+      change2.ops.push({action: 'set', obj: `1@${actor1}`, elemId: `${i - 1}@${actor2}`, insert: true, value: 'b', pred: []})
+    }
+    const change3 = {actor: actor1, seq: 2, startOp: 2, time: 0, deps: [hash(change1)], ops: [
+      {action: 'set', obj: `1@${actor1}`, elemId: '_head', insert: true, value: 'a', pred: []}
+    ]}
+    const backend = new BackendDoc()
+    backend.applyChanges([encodeChange(change1), encodeChange(change2)])
+    assert.strictEqual(backend.blocks.length, 2)
+    assert.deepStrictEqual(backend.applyChanges([encodeChange(change3)]).diffs.props.text[`1@${actor1}`].edits, [
+      {action: 'insert', index: MAX_BLOCK_SIZE, elemId: `2@${actor1}`, opId: `2@${actor1}`, value: {type: 'value', value: 'a'}}
+    ])
+  })
+
+  it('should keep list elements apart when a batch adds an actor mid-pass', () => {
+    const actor1 = '01234567', actor2 = '89abcdef', actor3 = 'fedcba98'
+    const change1 = {actor: actor1, seq: 1, startOp: 1, time: 0, deps: [], ops: [
+      {action: 'makeList', obj: '_root',       key: 'list',           insert: false,             pred: []},
+      {action: 'set',      obj: `1@${actor1}`, elemId: '_head',       insert: true,  value: 'a', pred: []},
+      {action: 'set',      obj: `1@${actor1}`, elemId: `2@${actor1}`, insert: true,  value: 'b', pred: []}
+    ]}
+    const change2 = {actor: actor2, seq: 1, startOp: 4, time: 0, deps: [hash(change1)], ops: [
+      {action: 'set',      obj: `1@${actor1}`, elemId: `2@${actor1}`, insert: true,  value: 'x', pred: []},
+      {action: 'del',      obj: `1@${actor1}`, elemId: `4@${actor2}`, insert: false, pred: [`4@${actor2}`]},
+      {action: 'del',      obj: `1@${actor1}`, elemId: `3@${actor1}`, insert: false, pred: [`3@${actor1}`]}
+    ]}
+    const change3 = {actor: actor3, seq: 1, startOp: 4, time: 0, deps: [hash(change1)], ops: [
+      {action: 'set',      obj: '_root',       key: 'z',              insert: false, value: 1,   pred: []}
+    ]}
+    const backend = new BackendDoc()
+    backend.applyChanges([encodeChange(change1)])
+    assert.deepStrictEqual(backend.applyChanges([encodeChange(change2), encodeChange(change3)]).diffs.props.list[`1@${actor1}`].edits, [
+      {action: 'insert', index: 1, elemId: `4@${actor2}`, opId: `4@${actor2}`, value: {type: 'value', value: 'x'}},
+      {action: 'remove', index: 1, count: 2}
+    ])
+  })
+
   it('should delete many consecutive characters', () => {
     const actor = uuid()
     const change1 = {actor, seq: 1, startOp: 1, time: 0, deps: [], ops: [

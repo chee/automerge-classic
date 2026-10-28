@@ -353,7 +353,6 @@ function seekWithinOperations(target, cache, actorIds, resumeInsertion) {
 function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
   const cached = COLUMN_OPERATIONS.get(docCols)
   if (cached) return seekWithinOperations(ops, cached, actorIds, resumeInsertion)
-  if (resumeInsertion) return {found: true, skipCount: 0, visibleCount: 0}
   for (let col of docCols) col.decoder.reset()
   const { objActor, objActorNum, objCtr, keyActor, keyCtr, keyStr, idActor, idCtr, insert } = ops
   const [objActorD, objCtrD, /* keyActorD */, /* keyCtrD */, keyStrD, idActorD, idCtrD, insertD, actionD,
@@ -361,7 +360,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
   let skipCount = 0, nextObjActor = null, nextObjCtr = null, nextKeyStr = null
 
   // Seek to the beginning of the object being updated
-  if (objCtr !== null) {
+  if (objCtr !== null && !resumeInsertion) {
     while (!objCtrD.done || !objActorD.done || !actionD.done) {
       nextObjCtr = objCtrD.readValue()
       nextObjActor = actorIds[objActorD.readValue()]
@@ -374,7 +373,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
       }
     }
   }
-  if (nextObjCtr !== objCtr || nextObjActor !== objActor) {
+  if ((nextObjCtr !== objCtr || nextObjActor !== objActor) && !resumeInsertion) {
     return {found: true, skipCount, visibleCount: 0}
   }
 
@@ -424,7 +423,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
     decoder.reset()
     decoder.skipValues(skipCount)
   }
-  let found = insert && !hasRef, visibleCount = 0, elemVisible = false
+  let found = insert && (resumeInsertion || !hasRef), visibleCount = 0, elemVisible = false
   while (!idCtrD.done) {
     const rowObjActor = objActorD.readValue(), rowObjCtr = objCtrD.readValue()
     const rowIdActor = actorIds[idActorD.readValue()], rowIdCtr = idCtrD.readValue()
@@ -439,7 +438,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
     if (rowInsert) elemVisible = false
     if (!elemVisible) {
       const action = ACTIONS[rowAction]
-      if (action === 'inc') return seekWithinOperations(ops, columnOperationCache(docCols), actorIds, false)
+      if (action === 'inc') return seekWithinOperations(ops, columnOperationCache(docCols), actorIds, resumeInsertion)
       if (rowSuccNum === 0 && action !== 'mark') {
         visibleCount++
         elemVisible = true
@@ -1290,14 +1289,10 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
     setMeta(docState, parent.children, elemId, Object.assign({}, parent.children[elemId], {[opId]: {objectId: opId, type, props: {}}}))
   }
 
-  const propKey = op[keyStrIdx] !== null ? op[keyStrIdx] : op[insertIdx]
-    ? op[idCtrIdx] * docState.actorIds.length + op[idActorIdx]
-    : op[keyCtrIdx] * docState.actorIds.length + op[keyActorIdx]
-
   // firstOp is true if the current operation is the first of a sequence of ops for the same key
-  let prop = propState.get(propKey)
+  let prop = propState.get(elemId)
   const firstOp = !prop
-  if (!prop) propState.set(propKey, prop = {visibleOps: [], hasChild: false})
+  if (!prop) propState.set(elemId, prop = {visibleOps: [], hasChild: false})
 
   // An operation is overwritten if it is a document operation that has at least one successor
   const isOverwritten = (oldSuccNum !== undefined && op[succNumIdx] > 0)

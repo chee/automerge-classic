@@ -795,7 +795,10 @@ class RLEDecoder extends Decoder {
       }
 
       const consume = Math.min(numSkip, this.count)
-      if (this.state === 'literal') this.skipRawValues(consume)
+      if (this.state === 'literal') {
+        this.skipRawValues(consume - 1)
+        this.lastValue = this.readRawValue()
+      }
       numSkip -= consume
       this.count -= consume
     }

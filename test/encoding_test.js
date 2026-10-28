@@ -636,6 +636,20 @@ describe('Binary encoding', () => {
       }
     })
 
+    it('should allow skipping part of a literal after reading values', () => {
+      const example = ['a', 'a', 'b', 'a', 'b', 'a']
+      const encoded = encodeRLE('utf8', example)
+      for (let readNum = 0; readNum < example.length; readNum++) {
+        for (let skipNum = 1; readNum + skipNum < example.length; skipNum++) {
+          const decoder = new RLEDecoder('utf8', encoded), values = []
+          for (let i = 0; i < readNum; i++) decoder.readValue()
+          decoder.skipValues(skipNum)
+          while (!decoder.done) values.push(decoder.readValue())
+          assert.deepStrictEqual(values, example.slice(readNum + skipNum), `reading ${readNum} then skipping ${skipNum} failed`)
+        }
+      }
+    })
+
     it('should allow skipping integer values', () => {
       const example = [null, null, null, 1, 1, 1, 2, 3, 4, 5]
       const encoded = encodeRLE('uint', example)
