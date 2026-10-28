@@ -1,6 +1,6 @@
 import { CACHE, CONFLICTS, ELEM_IDS, OBJECT_ID, OPTIONS, STATE } from './constants.js'
 import { interpretPatch, lamportCompare } from './apply_patch.js'
-import { Text } from './text.js'
+import { Text, elemAt } from './text.js'
 import { Counter, getWriteableCounter } from './counter.js'
 import { Float64, Int, Uint } from './numbers.js'
 import { compareUtf8, createArrayOfNulls, equalBytes, isObject, parseOpId, wellFormedString } from '../src/common.js'
@@ -510,7 +510,7 @@ function sameValue(a, b) {
 
 function getPred(object, key) {
   if (object instanceof Text) {
-    return object.elems[key].pred
+    return elemAt(object.chunks, key).pred
   } else if (object[CONFLICTS]) {
     return object[CONFLICTS][key] ? Object.keys(object[CONFLICTS][key]) : []
   } else {

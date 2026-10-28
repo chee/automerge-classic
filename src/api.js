@@ -80,12 +80,12 @@ function changeWithSource(doc, options, callback, source) {
     callback = options
     options = undefined
   }
-  return Frontend.change(doc, patchOptions(doc, options, source), callback)[0]
+  return superseded(doc, Frontend.change(doc, patchOptions(doc, options, source), callback)[0])
 }
 
 export function emptyChange(doc, options) {
   assertWritable(doc)
-  return Frontend.emptyChange(doc, patchOptions(doc, options, 'emptyChange'))[0]
+  return superseded(doc, Frontend.emptyChange(doc, patchOptions(doc, options, 'emptyChange'))[0])
 }
 
 export function clone(doc, options = {}) {
@@ -198,7 +198,7 @@ function applyBackendPatch(doc, patch, backendState, changes, options, source) {
   const newDoc = Frontend.applyPatch(doc, patch, backendState)
   const patchCallback = options.patchCallback || doc[OPTIONS].patchCallback
   if (patchCallback) callPatchCallback(patchCallback, doc, newDoc, changes, source)
-  return newDoc
+  return superseded(doc, newDoc)
 }
 
 export function applyChanges(doc, changes, options = {}) {
@@ -560,9 +560,7 @@ function textElementWidth(value) {
 }
 
 function textLength(text) {
-  let length = 0
-  for (const value of text) length += textElementWidth(value)
-  return length
+  return text.toJSON().length
 }
 
 function textOffsets(text) {
@@ -573,21 +571,25 @@ function textOffsets(text) {
 
 function textElementIndex(text, offset) {
   if (offset <= 0) return 0
-  let current = 0
-  for (let index = 0; index < text.length; index++) {
-    current += textElementWidth(text.get(index))
-    if (offset <= current) return index + 1
+  if (textLength(text) === text.length) return Math.min(offset, text.length)
+  let current = 0, index = 0
+  for (const value of text) {
+    current += textElementWidth(value)
+    index++
+    if (offset <= current) return index
   }
-  return text.length
+  return index
 }
 
 function textCursorIndex(text, offset) {
-  let current = 0
-  for (let index = 0; index < text.length; index++) {
-    current += textElementWidth(text.get(index))
+  if (textLength(text) === text.length) return Math.max(0, Math.min(offset, text.length))
+  let current = 0, index = 0
+  for (const value of text) {
+    current += textElementWidth(value)
     if (offset < current) return index
+    index++
   }
-  return text.length
+  return index
 }
 
 export function splice(doc, path, index, del, newText = '') {
@@ -684,7 +686,11 @@ function copyPatchValue(value) {
 
 function sameValue(left, right) {
   if (Object.is(left, right)) return true
-  if (left instanceof Frontend.Text && right instanceof Frontend.Text) return sameValue([...left], [...right])
+  if (left instanceof Frontend.Text && right instanceof Frontend.Text) {
+    if (left.length !== right.length) return false
+    const rightElems = right.elems
+    return left.elems.every((elem, index) => sameValue(elem.value, rightElems[index].value))
+  }
   if (left instanceof Frontend.Counter && right instanceof Frontend.Counter) {
     return left.value === right.value
   }
@@ -716,9 +722,7 @@ function isRecord(value) {
 // marker that keeps its identity is updated in place, like the Rust
 // implementation, rather than deleted and reinserted.
 function textElements(value) {
-  if (value instanceof Frontend.Text) {
-    return value.elems.map(elem => ({value: elem.value, elemId: elem.elemId}))
-  }
+  if (value instanceof Frontend.Text) return value.elems
   return [...value].map(item => ({value: item}))
 }
 
@@ -1003,6 +1007,11 @@ function cacheView(key, entry) {
   if (viewCache.size > VIEW_CACHE_SIZE) viewCache.delete(viewCache.keys().next().value)
 }
 
+function superseded(doc, newDoc) {
+  if (newDoc !== doc && doc[STATE].requests.length === 0) cacheView(headsKey(getHeads(doc)), {value: doc, live: true})
+  return newDoc
+}
+
 function diffView(doc, heads, currentKey, marked) {
   const key = headsKey(heads)
   if (key === currentKey) {
@@ -1120,7 +1129,10 @@ function commonKeys(before, after) {
 }
 
 function appendConflictPatches(patches, before, after, path) {
+  if (before === after) return
   for (const key of commonKeys(before, after)) {
+    const beforeValue = valueAt(before, key), afterValue = valueAt(after, key)
+    if (beforeValue === afterValue && before[CONFLICTS]?.[key] === after[CONFLICTS]?.[key]) continue
     const beforeConflicts = Frontend.getConflicts(before, key) || {}
     const afterConflicts = Frontend.getConflicts(after, key) || {}
     if (!sameValue(beforeConflicts, afterConflicts) && Object.keys(afterConflicts).length > 1) {
@@ -1129,7 +1141,7 @@ function appendConflictPatches(patches, before, after, path) {
       if (put) put.conflict = true
       else if (sameValue(before[key], after[key])) patches.push({action: 'conflict', path: patchPath})
     }
-    appendConflictPatches(patches, valueAt(before, key), valueAt(after, key), path.concat(key))
+    appendConflictPatches(patches, beforeValue, afterValue, path.concat(key))
   }
 }
 
@@ -1176,13 +1188,13 @@ function appendTextMarkPatches(patches, beforeDoc, afterDoc, before, after, path
   const added = []
   for (const name of [...names].sort(compareUtf8)) {
     let index = 0
-    while (index < after.elems.length) {
+    while (index < after.length) {
       if (sameValue(markValue(expected[index], name), markValue(afterValues[index], name))) {
         index++
         continue
       }
       const start = index, value = markValue(afterValues[index], name)
-      while (index < after.elems.length && sameValue(markValue(afterValues[index], name), value) &&
+      while (index < after.length && sameValue(markValue(afterValues[index], name), value) &&
              !sameValue(markValue(expected[index], name), value)) index++
       // A removed mark is reported the way the Rust implementation reports
       // it: a mark patch whose value is null
@@ -1378,7 +1390,7 @@ export function mark(doc, path, range, name, value) {
   // difference and drop their patches.
   if (!text.context.updated[objectId]) {
     const current = text.context.getObject(objectId)
-    text.context.updated[objectId] = instantiateText(objectId, current.elems.slice())
+    text.context.updated[objectId] = instantiateText(objectId, current.chunks.slice())
   }
 }
 
@@ -1394,26 +1406,13 @@ function markRanges(doc, path) {
 
 const NO_MARKS = Object.freeze({})
 
-// Whether a change contains a mark boundary operation. The backend hands out
-// the same byte arrays for a change across document versions, so a change is
-// decoded for this at most once.
-const changeMarksCache = new WeakMap()
-
 function hasMarkOps(ops) {
   return ops.some(op => op.action === 'markBegin' || op.action === 'markEnd')
 }
 
 function documentHasMarkOps(doc, text) {
   if (text && text.context && hasMarkOps(text.context.ops)) return true
-  for (const bytes of getAllChanges(doc)) {
-    let marked = changeMarksCache.get(bytes)
-    if (marked === undefined) {
-      marked = hasMarkOps(decodeChange(bytes, true).ops)
-      changeMarksCache.set(bytes, marked)
-    }
-    if (marked) return true
-  }
-  return false
+  return Frontend.getBackendState(doc).state.objectsWithMarks.size > 0
 }
 
 function markRangesForText(doc, text, excluded) {

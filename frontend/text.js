@@ -1,5 +1,7 @@
 import { OBJECT_ID } from './constants.js'
 import { isObject } from '../src/common.js'
+const strings = new WeakMap(), offsets = new WeakMap()
+const CHUNK_SIZE = 256
 class Text {
   constructor (text) {
     if (typeof text === 'string') text = [...text]
@@ -7,15 +9,20 @@ class Text {
     if (!Array.isArray(text)) {
       throw new TypeError(`Unsupported initial value for Text: ${text}`)
     }
-    return instantiateText(undefined, text.map(value => ({value}))) // eslint-disable-line
+    return instantiateText(undefined, [text.map(value => ({value}))]) // eslint-disable-line
   }
 
   get length () {
-    return this.elems.length
+    if (this.chunks.length === 1) return this.chunks[0].length
+    return chunkStarts(this.chunks)[this.chunks.length]
+  }
+
+  get elems () {
+    return this.chunks.length === 1 ? this.chunks[0] : [].concat(...this.chunks)
   }
 
   get (index) {
-    const value = this.elems[index].value
+    const value = elemAt(this.chunks, index).value
     if (this.context && isObject(value)) {
       const objectId = value[OBJECT_ID]
       const path = this.path.concat([{key: index, objectId}])
@@ -26,7 +33,7 @@ class Text {
   }
 
   getElemId (index) {
-    return this.elems[index].elemId
+    return elemAt(this.chunks, index).elemId
   }
 
   /**
@@ -34,12 +41,16 @@ class Text {
    * inline objects.
    */
   [Symbol.iterator] () {
-    let elems = this.elems, index = -1
+    let chunks = this.chunks, chunk = 0, index = -1
     return {
       next () {
         index += 1
-        if (index < elems.length) {
-          return {done: false, value: elems[index].value}
+        while (chunk < chunks.length && index >= chunks[chunk].length) {
+          chunk += 1
+          index = 0
+        }
+        if (chunk < chunks.length) {
+          return {done: false, value: chunks[chunk][index].value}
         } else {
           return {done: true}
         }
@@ -56,8 +67,8 @@ class Text {
     // .join()ing for small (<100KB) arrays.
     // https://jsperf.com/join-vs-loop-w-type-test
     let str = ''
-    for (const elem of this.elems) {
-      if (typeof elem.value === 'string') str += elem.value
+    for (const value of this) {
+      if (typeof value === 'string') str += value
     }
     return str
   }
@@ -72,15 +83,15 @@ class Text {
   toSpans() {
     let spans = []
     let chars = ''
-    for (const elem of this.elems) {
-      if (typeof elem.value === 'string') {
-        chars += elem.value
+    for (const value of this) {
+      if (typeof value === 'string') {
+        chars += value
       } else {
         if (chars.length > 0) {
           spans.push(chars)
           chars = ''
         }
-        spans.push(elem.value)
+        spans.push(value)
       }
     }
     if (chars.length > 0) {
@@ -94,8 +105,11 @@ class Text {
    * JSON serialization of an Automerge document represents text nicely.
    */
   toJSON() {
-    let str = ''
-    for (const elem of this.elems) str += typeof elem.value === 'string' ? elem.value : '\ufffc'
+    let str = strings.get(this.chunks)
+    if (str !== undefined) return str
+    str = ''
+    for (const value of this) str += typeof value === 'string' ? value : '\ufffc'
+    strings.set(this.chunks, str)
     return str
   }
 
@@ -109,7 +123,7 @@ class Text {
       throw new RangeError('getWriteable() requires the objectId to be set')
     }
 
-    const instance = instantiateText(this[OBJECT_ID], this.elems)
+    const instance = instantiateText(this[OBJECT_ID], this.chunks)
     instance.context = context
     instance.path = path
     return instance
@@ -166,14 +180,56 @@ function localElems(text) {
   if (text[OBJECT_ID]) {
     throw new TypeError('Automerge.Text object cannot be modified outside of a change block')
   }
-  return text.elems
+  strings.delete(text.chunks)
+  return text.chunks[0]
 }
 
-function instantiateText(objectId, elems) {
+function chunkStarts(chunks) {
+  let starts = offsets.get(chunks)
+  if (starts) return starts
+  starts = [0]
+  for (const chunk of chunks) starts.push(starts[starts.length - 1] + chunk.length)
+  offsets.set(chunks, starts)
+  return starts
+}
+
+function elemAt(chunks, index) {
+  if (chunks.length === 1) return chunks[0][index]
+  const starts = chunkStarts(chunks)
+  let low = 0, high = chunks.length - 1
+  while (low < high) {
+    const mid = (low + high + 1) >> 1
+    if (starts[mid] <= index) low = mid
+    else high = mid - 1
+  }
+  return chunks[low] && chunks[low][index - starts[low]]
+}
+
+function spliceChunks(chunks, index, deleteCount, elems) {
+  let first = 0
+  while (first < chunks.length - 1 && index > chunks[first].length) {
+    index -= chunks[first].length
+    first++
+  }
+  let last = first, covered = chunks.length > 0 ? chunks[first].length : 0
+  while (last < chunks.length - 1 && covered < index + deleteCount) covered += chunks[++last].length
+  let merged = [].concat(...chunks.slice(first, last + 1))
+  merged = merged.slice(0, index).concat(elems, merged.slice(index + deleteCount))
+  if (merged.length < CHUNK_SIZE / 2 && last < chunks.length - 1) merged = merged.concat(chunks[++last])
+  const pieces = []
+  if (merged.length <= 2 * CHUNK_SIZE) {
+    if (merged.length > 0) pieces.push(merged)
+  } else {
+    for (let i = 0; i < merged.length; i += CHUNK_SIZE) pieces.push(merged.slice(i, i + CHUNK_SIZE))
+  }
+  return chunks.slice(0, first).concat(pieces, chunks.slice(last + 1))
+}
+
+function instantiateText(objectId, chunks) {
   const instance = Object.create(Text.prototype)
   instance[OBJECT_ID] = objectId
-  instance.elems = elems
+  instance.chunks = chunks
   return instance
 }
 
-export { Text, instantiateText }
+export { Text, instantiateText, elemAt, spliceChunks, strings }

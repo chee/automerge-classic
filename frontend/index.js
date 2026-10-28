@@ -45,7 +45,8 @@ function updateRootObject(doc, updated, state) {
   if (doc[OPTIONS].freeze) {
     for (let objectId of Object.keys(updated)) {
       const object = updated[objectId]
-      Object.freeze(object instanceof Text ? object.elems : object[CONFLICTS])
+      if (object instanceof Text) object.chunks.forEach(chunk => Object.freeze(chunk))
+      Object.freeze(object instanceof Text ? object.chunks : object[CONFLICTS])
       Object.freeze(object)
     }
   }

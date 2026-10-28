@@ -1,5 +1,5 @@
 import { compareUtf8, copyObject, parseOpId } from '../src/common.js'
-import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, decodeChangeColumns, decodeChanges, decodeDocumentHeader, decodeValue, decoderByColumnId, encodeChange, encodeDocumentHeader, encoderByColumnId, makeDecoders } from './columnar.js'
+import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, decodeChangeColumns, decodeDocumentHeader, decodeValue, decoderByColumnId, documentChanges, encodeDocumentHeader, encoderByColumnId, makeDecoders } from './columnar.js'
 import * as ColumnData from './column_data.js'
 const MAX_BLOCK_SIZE = 600 // operations
 const MAX_MAP_BLOCK_SIZE = 100
@@ -1104,8 +1104,8 @@ function emptyObjectPatch(objectId, type) {
  * exactly `delta` greater than the counter of `id1`.
  */
 function opIdDelta(id1, id2, delta = 1) {
-  const parsed1 = parseOpId(id1), parsed2 = parseOpId(id2)
-  return parsed1.actorId === parsed2.actorId && parsed1.counter + delta === parsed2.counter
+  const at1 = id1.indexOf('@'), at2 = id2.indexOf('@')
+  return id1.slice(at1) === id2.slice(at2) && Number(id1.slice(0, at1)) + delta === Number(id2.slice(0, at2))
 }
 
 /**
@@ -1254,9 +1254,8 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   const isWholeDoc = !newBlock
   const type = op[actionIdx] < ACTIONS.length ? OBJECT_TYPE[ACTIONS[op[actionIdx]]] : null
   const opId = `${op[idCtrIdx]}@${docState.actorIds[op[idActorIdx]]}`
-  const elemIdActor = op[insertIdx] ? op[idActorIdx] : op[keyActorIdx]
-  const elemIdCtr = op[insertIdx] ? op[idCtrIdx] : op[keyCtrIdx]
-  const elemId = op[keyStrIdx] !== null ? op[keyStrIdx] : `${elemIdCtr}@${docState.actorIds[elemIdActor]}`
+  const elemId = op[keyStrIdx] !== null ? op[keyStrIdx]
+    : op[insertIdx] ? opId : `${op[keyCtrIdx]}@${docState.actorIds[op[keyActorIdx]]}`
 
   // When the change contains a new make* operation (i.e. with an even-numbered action), record the
   // new parent-child relationship in objectMeta. TODO: also handle link/move operations.
@@ -1266,16 +1265,17 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   }
 
   // firstOp is true if the current operation is the first of a sequence of ops for the same key
-  const firstOp = !propState[elemId]
-  if (!propState[elemId]) propState[elemId] = {visibleOps: [], hasChild: false}
+  let prop = propState.get(elemId)
+  const firstOp = !prop
+  if (!prop) propState.set(elemId, prop = {visibleOps: [], hasChild: false})
 
   // An operation is overwritten if it is a document operation that has at least one successor
   const isOverwritten = (oldSuccNum !== undefined && op[succNumIdx] > 0)
 
   // Record all visible values for the property, and whether it has any child object
   if (!isOverwritten) {
-    propState[elemId].visibleOps.push(op)
-    propState[elemId].hasChild = propState[elemId].hasChild || (op[actionIdx] % 2) === 0 // even-numbered action == make* operation
+    prop.visibleOps.push(op)
+    prop.hasChild = prop.hasChild || (op[actionIdx] % 2) === 0 // even-numbered action == make* operation
   }
 
   const emissions = []
@@ -1285,7 +1285,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   // earlier operation for this property is waiting to find out whether this
   // successor is an increment (which does not overwrite it) or a real
   // overwrite. A non-increment successor kills those candidates for good.
-  const pendingBySucc = propState[elemId] && propState[elemId].counterStates
+  const pendingBySucc = prop.counterStates
   if (pendingBySucc && pendingBySucc[opId] && ACTIONS[op[actionIdx]] !== 'inc') {
     for (const state of pendingBySucc[opId]) {
       state.dead = true
@@ -1300,8 +1300,8 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   // have been seen; successors that never appear as rows (deletions) leave
   // the operation hidden.
   if (isOverwritten && ACTIONS[op[actionIdx]] === 'set' && (op[valLenIdx] & 0x0f) === VALUE_TYPE.COUNTER) {
-    if (!propState[elemId].counterStates) propState[elemId].counterStates = {}
-    const counterStates = propState[elemId].counterStates
+    if (!prop.counterStates) prop.counterStates = {}
+    const counterStates = prop.counterStates
     const state = {op, opId, dead: false, value: decodeValue(op[valLenIdx], op[valRawIdx]).value, succs: {}, oldSuccNum, oldIncs: 0}
     for (let i = 0; i < op[succNumIdx]; i++) {
       const succOp = `${op[succCtrIdx][i]}@${docState.actorIds[op[succActorIdx][i]]}`
@@ -1327,8 +1327,8 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
       // Every successor was an increment: the operation is visible after all
       const counter = {type: 'value', datatype: 'counter', value: state.value}
       emissions.push([state.opId, counter])
-      propState[elemId].visibleOps.push(state.op)
-      propState[elemId].counters = Object.assign({}, propState[elemId].counters, {[state.opId]: counter})
+      prop.visibleOps.push(state.op)
+      prop.counters = Object.assign({}, prop.counters, {[state.opId]: counter})
     }
 
   } else if (!isOverwritten) {
@@ -1346,12 +1346,12 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   // subsequently process an update within that child object, we can construct the patch to
   // contain the conflicting values.
   const prevChildren = docState.objectMeta[objectId].children[elemId]
-  if (propState[elemId].hasChild || (prevChildren && Object.keys(prevChildren).length > 0)) {
+  if (prop.hasChild || (prevChildren && Object.keys(prevChildren).length > 0)) {
     let values = {}
-    for (let visible of propState[elemId].visibleOps) {
+    for (let visible of prop.visibleOps) {
       const opId = `${visible[idCtrIdx]}@${docState.actorIds[visible[idActorIdx]]}`
-      if (propState[elemId].counters && propState[elemId].counters[opId]) {
-        values[opId] = propState[elemId].counters[opId]
+      if (prop.counters && prop.counters[opId]) {
+        values[opId] = prop.counters[opId]
       } else if (ACTIONS[visible[actionIdx]] === 'set') {
         values[opId] = Object.assign({type: 'value'}, decodeValue(visible[valLenIdx], visible[valRawIdx]))
       } else if (visible[actionIdx] % 2 === 0) {
@@ -1377,8 +1377,8 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
     // means the current list element already had a value before this change was applied, and
     // therefore the current element cannot be an insert. If we already registered an insert, we
     // have to convert it into an update.
-    if (wasVisible && !isWholeDoc && propState[elemId].action === 'insert') {
-      propState[elemId].action = 'update'
+    if (wasVisible && !isWholeDoc && prop.action === 'insert') {
+      prop.action = 'update'
       convertInsertToUpdate(patch.edits, listIndex, elemId)
       if (countsVisible) newBlock.numVisible -= 1
     }
@@ -1388,25 +1388,25 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
       // (It's not necessarily the case that op[insertIdx] is true: if a list element is concurrently
       // deleted and updated, the node that first processes the deletion and then the update will
       // observe the update as a re-insertion of the deleted list element.)
-      if (!propState[elemId].action && (oldSuccNum === undefined || isWholeDoc)) {
-        propState[elemId].action = 'insert'
+      if (!prop.action && (oldSuccNum === undefined || isWholeDoc)) {
+        prop.action = 'insert'
         appendEdit(patch.edits, {action: 'insert', index: listIndex, elemId, opId: patchKey, value: patchValue})
         if (countsVisible) newBlock.numVisible += 1
 
       // If the property has a value and it's not an insert, then it must be an update.
       // We might have previously registered it as a remove, in which case we convert it to update.
-      } else if (propState[elemId].action === 'remove') {
+      } else if (prop.action === 'remove') {
         let lastEdit = patch.edits[patch.edits.length - 1]
         if (lastEdit.action !== 'remove') throw new RangeError('last edit has unexpected type')
         if (lastEdit.count > 1) lastEdit.count -= 1; else patch.edits.pop()
-        propState[elemId].action = 'update'
+        prop.action = 'update'
         appendUpdate(patch.edits, listIndex, elemId, patchKey, patchValue, true)
         if (countsVisible) newBlock.numVisible += 1
 
       } else {
         // A 'normal' update
-        appendUpdate(patch.edits, listIndex, elemId, patchKey, patchValue, !propState[elemId].action)
-        if (!propState[elemId].action) propState[elemId].action = 'update'
+        appendUpdate(patch.edits, listIndex, elemId, patchKey, patchValue, !prop.action)
+        if (!prop.action) prop.action = 'update'
       }
 
       // Any further values that became visible at the same time (multiple
@@ -1415,9 +1415,9 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
         appendUpdate(patch.edits, listIndex, elemId, emissions[i][0], emissions[i][1], false)
       }
 
-    } else if (wasVisible && !propState[elemId].action) {
+    } else if (wasVisible && !prop.action) {
       // If the property used to have a non-overwritten/non-deleted value, but no longer, it's a remove
-      propState[elemId].action = 'remove'
+      prop.action = 'remove'
       appendEdit(patch.edits, {action: 'remove', index: listIndex, count: 1})
       if (countsVisible) newBlock.numVisible -= 1
     }
@@ -1444,7 +1444,7 @@ function mergeDocChangeOps(patches, newBlock, outCols, outOps, changeState, docS
   const objActor = firstOp[objActorIdx], objCtr = firstOp[objCtrIdx]
   const objectId = objActor === null ? '_root' : `${objCtr}@${docState.actorIds[objActor]}`
   const idActorIndex = changeState.actorIndex, idActor = docState.actorIds[idActorIndex]
-  let foundListElem = false, elemVisible = false, propState = {}, docOp
+  let foundListElem = false, elemVisible = false, propState = new Map(), docOp
   const counters = []
   ;({ docOp, blockIndex } = readNextDocOp(docState, blockIndex))
   let docOpsConsumed = (docOp === null ? 0 : 1)
@@ -1527,6 +1527,7 @@ function mergeDocChangeOps(patches, newBlock, outCols, outOps, changeState, docS
 
         lastChangeKey = (nextOp !== null) ? nextOp[keyStrIdx] : null
         updateVisibleMapOps(docState.visibleMapOps, changeState.nextOp)
+        if (ACTIONS[nextOp[actionIdx]] === 'mark' && docState.objectsWithMarks) docState.objectsWithMarks.add(objectId)
         changeOps.push(changeState.nextOp)
         changeCols.push(changeState.columns)
         predSeen.push(new Array(changeState.nextOp[predNumIdx]))
@@ -1714,9 +1715,6 @@ function applyOps(patches, changeState, docState) {
     objActor, objActorNum, objCtr, keyActor, keyActorNum, keyCtr, keyStr,
     idActor: docState.actorIds[idActorNum], idCtr, insert,
     objId: objActor === null ? '_root' : `${objCtr}@${objActor}`
-  }
-  if (ACTIONS[changeState.nextOp[actionIdx]] === 'mark' && docState.objectsWithMarks) {
-    docState.objectsWithMarks.add(ops.objId)
   }
 
   let startBlockIndex, predIds, predRows
@@ -2085,7 +2083,7 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
 function documentPatch(docState) {
   docState.readFromColumns = true
   for (let col of docState.blocks[0].columns) col.decoder.reset()
-  let propState = {}, docOp = null, blockIndex = 0
+  let propState = new Map(), docOp = null, blockIndex = 0
   let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
   let lastObjActor = null, lastObjCtr = null, objectId = '_root', elemVisible = false, listIndex = 0
   const counters = []
@@ -2097,7 +2095,7 @@ function documentPatch(docState) {
       objectId = `${docOp[objCtrIdx]}@${docState.actorIds[docOp[objActorIdx]]}`
       lastObjActor = docOp[objActorIdx]
       lastObjCtr = docOp[objCtrIdx]
-      propState = {}
+      propState = new Map()
       listIndex = 0
       elemVisible = false
     }
@@ -2553,9 +2551,8 @@ class BackendDoc {
     const clock = {}
     let numChangeOps = 0
 
-    for (let change of decodeChanges([binaryDoc])) {
-      const binaryChange = encodeChange(change) // TODO: avoid decoding and re-encoding again
-      changes.push(binaryChange)
+    for (let change of documentChanges(binaryDoc)) {
+      changes.push(change.bytes)
       historyHashes.push(change.hash)
       changeIndexByHash[change.hash] = changes.length - 1
       dependenciesByHash[change.hash] = change.deps
@@ -2568,7 +2565,7 @@ class BackendDoc {
         throw new RangeError(`Expected seq ${expectedSeq}, got seq ${change.seq} from actor ${change.actor}`)
       }
       clock[change.actor] = change.seq
-      numChangeOps += change.ops.length
+      numChangeOps += change.numOps
     }
     this.haveHashGraph = true
     this.changes = changes

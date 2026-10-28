@@ -3,7 +3,7 @@ import { CONFLICTS, ELEM_IDS, NEW_KEYS, OBJECT_ID } from './constants.js'
 // Set of patch objects already applied in the current patch application (a
 // non-enumerable property of the `updated` map)
 const APPLIED_PATCHES = Symbol('_appliedPatches')
-import { Text, instantiateText } from './text.js'
+import { Text, instantiateText, elemAt, spliceChunks, strings } from './text.js'
 import { Counter } from './counter.js'
 import { ImmutableString } from '../src/immutable_string.js'
 /**
@@ -206,20 +206,18 @@ function updateListObject(patch, obj, updated, textV2) {
  */
 function updateTextObject(patch, obj, updated, textV2) {
   const objectId = patch.objectId
-  let elems
-  if (updated[objectId]) {
-    elems = updated[objectId].elems
-  } else if (obj) {
-    elems = obj.elems.slice()
-  } else {
-    elems = []
-  }
+  const base = updated[objectId] || obj
+  let chunks = base ? base.chunks : [], length = base ? base.length : 0
+  let str = base ? base.toJSON() : ''
+  if (str.length !== length) str = undefined
+  const char = value => typeof value === 'string' ? value : '\ufffc'
 
   for (const edit of patch.edits) {
     if (edit.action === 'insert') {
       const value = getValue(edit.value, undefined, updated, textV2)
-      const elem = {elemId: edit.elemId, pred: [edit.opId], value}
-      elems.splice(edit.index, 0, elem)
+      chunks = spliceChunks(chunks, edit.index, 0, [{elemId: edit.elemId, pred: [edit.opId], value}])
+      length += 1
+      if (str !== undefined) str = str.slice(0, edit.index) + char(value) + str.slice(edit.index)
 
     } else if (edit.action === 'multi-insert') {
       const startElemId = parseOpId(edit.elemId)
@@ -229,19 +227,26 @@ function updateTextObject(patch, obj, updated, textV2) {
         const elemId = `${startElemId.counter + index}@${startElemId.actorId}`
         return {elemId, pred: [elemId], value}
       })
-      elems.splice(edit.index, 0, ...newElems)
+      chunks = spliceChunks(chunks, edit.index, 0, newElems)
+      length += newElems.length
+      if (str !== undefined) str = str.slice(0, edit.index) + newElems.map(elem => char(elem.value)).join('') + str.slice(edit.index)
 
     } else if (edit.action === 'update') {
-      const elemId = elems[edit.index].elemId
-      const value = getValue(edit.value, elems[edit.index].value, updated, textV2)
-      elems[edit.index] = {elemId, pred: [edit.opId], value}
+      const elem = elemAt(chunks, edit.index)
+      const value = getValue(edit.value, elem.value, updated, textV2)
+      chunks = spliceChunks(chunks, edit.index, 1, [{elemId: elem.elemId, pred: [edit.opId], value}])
+      if (str !== undefined) str = str.slice(0, edit.index) + char(value) + str.slice(edit.index + 1)
 
     } else if (edit.action === 'remove') {
-      elems.splice(edit.index, edit.count)
+      chunks = spliceChunks(chunks, edit.index, edit.count, [])
+      length -= edit.count
+      if (str !== undefined) str = str.slice(0, edit.index) + str.slice(edit.index + edit.count)
     }
+    if (str !== undefined && str.length !== length) str = undefined
   }
 
-  updated[objectId] = instantiateText(objectId, elems)
+  if (str !== undefined) strings.set(chunks, str)
+  updated[objectId] = instantiateText(objectId, chunks)
   return updated[objectId]
 }
 

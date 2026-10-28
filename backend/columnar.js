@@ -767,8 +767,11 @@ function encodeChange(changeObj, actorOrder) {
     }
     extraBytes = new Uint8Array(change.extra_bytes)
   }
+  return encodeChangeContainer(change, actorIds, extraBytes).bytes
+}
 
-  const { bytes } = encodeContainer(CHUNK_TYPE_CHANGE, encoder => {
+function encodeChangeContainer(change, actorIds, extraBytes) {
+  const { hash, bytes } = encodeContainer(CHUNK_TYPE_CHANGE, encoder => {
     if (!Array.isArray(change.deps)) throw new TypeError('deps is not an array')
     encoder.appendUint53(change.deps.length)
     for (let hash of change.deps.slice().sort()) {
@@ -788,7 +791,7 @@ function encodeChange(changeObj, actorOrder) {
     if (extraBytes) encoder.appendRawBytes(extraBytes)
   })
 
-  return (bytes.byteLength >= DEFLATE_MIN_SIZE) ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, deflateRaw) : bytes
+  return {hash, bytes: (bytes.byteLength >= DEFLATE_MIN_SIZE) ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, deflateRaw) : bytes}
 }
 
 function decodeChangeColumns(buffer) {
@@ -1111,6 +1114,160 @@ function decodeDocument(buffer) {
   return changes
 }
 
+function documentChanges(buffer) {
+  const { changesColumns, opsColumns, actorIds, heads } = decodeDocumentHeader(buffer)
+  if (!changesColumns.every(column => DOCUMENT_COLUMNS.some(spec => spec.columnId === column.columnId)) ||
+      !opsColumns.every(column => DOC_OPS_COLUMNS.some(spec => spec.columnId === column.columnId))) {
+    return decodeDocument(buffer).map(change => ({
+      actor: change.actor, seq: change.seq, deps: change.deps, hash: change.hash,
+      numOps: change.ops.length, bytes: encodeChange(change)
+    }))
+  }
+
+  const numActors = actorIds.length
+  const readActor = decoder => {
+    const actorNum = decoder.readValue()
+    if (actorNum !== null && !actorIds[actorNum]) throw new RangeError(`No actor index ${actorNum}`)
+    return actorNum
+  }
+
+  const [actorD, seqD, maxOpD, timeD, messageD, depsNumD, depsIndexD, extraLenD, extraRawD] =
+    makeDecoders(changesColumns, DOCUMENT_COLUMNS).map(column => column.decoder)
+  const changes = [], changesByActor = []
+  while (!actorD.done) {
+    const actorNum = readActor(actorD), seq = seqD.readValue(), maxOp = maxOpD.readValue()
+    const time = timeD.readValue(), message = messageD.readValue(), depsIndex = []
+    for (let i = depsNumD.readValue() || 0; i > 0; i--) depsIndex.push(depsIndexD.readValue())
+    const sizeTag = extraLenD.readValue()
+    const { value: extraBytes, datatype } = decodeValue(sizeTag, extraRawD.readRawBytes(sizeTag >> 4))
+    if (datatype !== VALUE_TYPE.BYTES) throw new RangeError(`Bad datatype for extra bytes: ${VALUE_TYPE.BYTES}`)
+    const actorChanges = changesByActor[actorNum] || (changesByActor[actorNum] = [])
+    if (seq !== actorChanges.length + 1) {
+      throw new RangeError(`Expected seq = ${actorChanges.length + 1}, got ${seq}`)
+    }
+    if (seq > 1 && actorChanges[seq - 2].maxOp > maxOp) throw new RangeError('maxOp must increase monotonically per actor')
+    const change = {actorNum, seq, maxOp, time, message, depsIndex, extraBytes, ops: []}
+    actorChanges.push(change)
+    changes.push(change)
+  }
+
+  const [objActorD, objCtrD, keyActorD, keyCtrD, keyStrD, idActorD, idCtrD, insertD, actionD, valLenD, valRawD,
+    chldActorD, chldCtrD, succNumD, succActorD, succCtrD, expandD, markNameD] =
+    makeDecoders(opsColumns, DOC_OPS_COLUMNS).map(column => column.decoder)
+  const ops = [], opsById = new Map()
+  while (!idCtrD.done) {
+    const objActor = readActor(objActorD), objCtr = objCtrD.readValue()
+    const keyActor = readActor(keyActorD), keyCtr = keyCtrD.readValue(), keyStr = keyStrD.readValue()
+    const idActor = readActor(idActorD), idCtr = idCtrD.readValue()
+    const insert = !!insertD.readValue(), action = actionD.readValue()
+    const sizeTag = valLenD.readValue(), rawValue = valRawD.readRawBytes(sizeTag >> 4)
+    const chldActor = readActor(chldActorD), chldCtr = chldCtrD.readValue()
+    const succNum = succNumD.readValue() || 0
+    if (action === 3) throw new RangeError('document should not contain del operations')
+    if (!!chldCtr !== (chldActor !== null)) throw new RangeError(`Mismatched child columns: ${chldCtr} and ${chldActor}`)
+    const id = idCtr * numActors + idActor
+    const op = {
+      idActor, idCtr, objActor, objCtr, keyActor, keyCtr, keyStr, insert, action, raw: {sizeTag, rawValue},
+      chldActor, chldCtr, expand: false, markName: null, pred: opsById.has(id) ? opsById.get(id).pred : []
+    }
+    opsById.set(id, op)
+    let lastActor = null, lastCtr = null
+    for (let i = 0; i < succNum; i++) {
+      const succActor = readActor(succActorD), succCtr = succCtrD.readValue()
+      if (lastCtr !== null && (lastCtr > succCtr || lastCtr === succCtr && actorIds[lastActor] >= actorIds[succActor])) {
+        throw new RangeError('operation IDs are not in ascending order')
+      }
+      lastActor = succActor
+      lastCtr = succCtr
+      const succId = succCtr * numActors + succActor
+      if (!opsById.has(succId)) {
+        const elem = keyStr === null && insert
+        opsById.set(succId, {
+          idActor: succActor, idCtr: succCtr, objActor, objCtr, keyActor: elem ? idActor : keyActor,
+          keyCtr: elem ? idCtr : keyCtr, keyStr, insert: false, action: 3, raw: null,
+          chldActor: null, chldCtr: null, expand: false, markName: null, pred: []
+        })
+      }
+      opsById.get(succId).pred.push({actorNum: idActor, counter: idCtr})
+    }
+    const expand = expandD.readValue(), markName = markNameD.readValue()
+    if (action === 7) {
+      op.expand = !!expand
+      op.markName = markName
+    }
+    ops.push(op)
+  }
+  for (const op of opsById.values()) {
+    if (op.action === 3) ops.push(op)
+  }
+
+  for (const op of ops) {
+    const actorChanges = changesByActor[op.idActor]
+    if (!actorChanges) throw new RangeError(`Operation ID ${op.idCtr}@${actorIds[op.idActor]} outside of allowed range`)
+    let left = 0, right = actorChanges.length
+    while (left < right) {
+      const index = Math.floor((left + right) / 2)
+      if (actorChanges[index].maxOp < op.idCtr) left = index + 1
+      else right = index
+    }
+    if (left >= actorChanges.length) {
+      throw new RangeError(`Operation ID ${op.idCtr}@${actorIds[op.idActor]} outside of allowed range`)
+    }
+    actorChanges[left].ops.push(op)
+  }
+
+  const hashes = [], headSet = new Set(), result = []
+  for (let i = 0; i < changes.length; i++) {
+    const change = changes[i], actor = actorIds[change.actorNum]
+    change.ops.sort((op1, op2) => op1.idCtr - op2.idCtr)
+    const startOp = change.maxOp - change.ops.length + 1
+    const used = new Set([change.actorNum])
+    for (let j = 0; j < change.ops.length; j++) {
+      const op = change.ops[j]
+      if (op.idCtr !== startOp + j) throw new RangeError(`Expected opId ${startOp + j}@${actor}, got ${op.idCtr}@${actor}`)
+      if (op.objCtr !== null) used.add(op.objActor)
+      if (op.keyStr === null && op.keyCtr !== 0) used.add(op.keyActor)
+      if (op.chldCtr) used.add(op.chldActor)
+      for (const pred of op.pred) used.add(pred.actorNum)
+    }
+    used.delete(change.actorNum)
+    const changeActors = [change.actorNum].concat([...used].sort((a, b) => actorIds[a] < actorIds[b] ? -1 : 1))
+    const actorIndex = new Map(changeActors.map((actorNum, index) => [actorNum, index]))
+    const changeOps = change.ops.map(op => ({
+      obj: op.objCtr === null ? '_root' : {counter: op.objCtr, actorNum: actorIndex.get(op.objActor)},
+      key: op.keyStr === null ? undefined : op.keyStr,
+      elemId: op.keyStr !== null ? undefined : op.keyCtr === 0 ? '_head'
+        : {counter: op.keyCtr, actorNum: actorIndex.get(op.keyActor)},
+      insert: op.insert,
+      action: op.action,
+      [RAW_VALUE]: op.raw,
+      expand: op.expand,
+      markName: op.markName,
+      child: op.chldCtr ? {counter: op.chldCtr, actorNum: actorIndex.get(op.chldActor)} : null,
+      pred: op.pred.map(pred => ({counter: pred.counter, actorNum: actorIndex.get(pred.actorNum), actorId: actorIds[pred.actorNum]}))
+    }))
+    const deps = change.depsIndex.map(index => {
+      if (!(index >= 0 && index < i)) throw new RangeError(`No hash for index ${index} while processing index ${i}`)
+      headSet.delete(hashes[index])
+      return hashes[index]
+    }).sort()
+    const { hash, bytes } = encodeChangeContainer(
+      {actor, seq: change.seq, startOp, time: change.time, message: change.message, deps, ops: changeOps},
+      changeActors.map(actorNum => actorIds[actorNum]), change.extraBytes
+    )
+    const hexHash = bytesToHexString(hash)
+    hashes.push(hexHash)
+    headSet.add(hexHash)
+    result.push({actor, seq: change.seq, deps, hash: hexHash, numOps: change.ops.length, bytes})
+  }
+
+  const actualHeads = [...headSet].sort()
+  if (actualHeads.length !== heads.length || actualHeads.some((head, i) => head !== heads[i])) {
+    throw new RangeError(`Mismatched heads hashes: expected ${heads.join(', ')}, got ${actualHeads.join(', ')}`)
+  }
+  return result
+}
+
 /**
  * DEFLATE-compresses the given column if it is large enough to make the compression worthwhile.
  */
@@ -1136,5 +1293,5 @@ export {
   encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue, decodeColumns, decodeOps, encodeOp,
   encodeColumnInfo, decodeColumnInfo, encodeContainer, decodeContainerHeader, deflateColumn, inflateColumn,
   splitContainers, encodeChange, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
-  encodeDocumentHeader, decodeDocumentHeader
+  encodeDocumentHeader, decodeDocumentHeader, documentChanges
 }
