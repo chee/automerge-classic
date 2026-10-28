@@ -1,6 +1,6 @@
 import * as Frontend from '../frontend/index.js'
 import { CHANGE, CONFLICTS, OBJECT_ID, OPTIONS, STATE } from '../frontend/constants.js'
-import { decodeChange, decodeChangeColumns, decodeChangeMeta, decodeChanges, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
+import { decodeChange, decodeChangeColumns, decodeChanges, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
 import { compareUtf8, isObject, parseOpId, wellFormedString } from './common.js'
 import { ImmutableString, isImmutableString } from './immutable_string.js'
 import { graphemes, myersDiff, replaceHook } from './text_diff.js'
@@ -189,8 +189,8 @@ function patchOptions(doc, options, source) {
 }
 
 function callPatchCallback(callback, before, after, changes, source) {
-  const scope = documentHasMarkOps(after) ? changeScope(changes, before) : {}
-  const patches = patchesBetween(before, after, scope.objects, scope.excluded)
+  const scope = documentHasMarkOps(after) ? changeScope(changes, before, after) : {}
+  const patches = patchesBetween(before, after, scope.objects, scope.clock)
   if (patches.length > 0) callback(patches, {before, after, source})
 }
 
@@ -441,30 +441,10 @@ export function getHistory(doc) {
   )
 }
 
-function changesAtHeads(doc, heads) {
-  if (!Array.isArray(heads)) throw new TypeError('Pass an array of hashes to view()')
-  const changes = getAllChanges(doc)
-  const decoded = changes.map(change => decodeChangeMeta(change, true))
-  const byHash = {}
-  for (const change of decoded) byHash[change.hash] = change
-  const selected = {}
-  const pending = heads.slice()
-
-  while (pending.length > 0) {
-    const hash = pending.pop()
-    if (selected[hash]) continue
-    const change = byHash[hash]
-    if (!change) throw new RangeError(`Unknown change hash: ${hash}`)
-    selected[hash] = true
-    pending.push(...change.deps)
-  }
-
-  return changes.filter((change, index) => selected[decoded[index].hash])
-}
-
 export function view(doc, heads) {
-  const state = backend.loadChanges(backend.init(), changesAtHeads(doc, heads))
-  const snapshot = fromState(state, {freeze: doc[OPTIONS].freeze})
+  if (!Array.isArray(heads)) throw new TypeError('Pass an array of hashes to view()')
+  const [state, patch] = backend.view(Frontend.getBackendState(doc, 'view'), heads)
+  const snapshot = Frontend.applyPatch(init({freeze: doc[OPTIONS].freeze}), patch, state)
   viewDocs.add(snapshot)
   return snapshot
 }
@@ -1012,6 +992,12 @@ function superseded(doc, newDoc) {
   return newDoc
 }
 
+function viewOfDoc(doc) {
+  const state = doc[STATE]
+  const patch = {clock: state.clock, deps: state.deps, maxOp: state.maxOp, diffs: {objectId: '_root', type: 'map', props: {}}}
+  return Frontend.applyPatch(doc, patch, backend.viewOf(state.backendState, state.clock))
+}
+
 function diffView(doc, heads, currentKey, marked) {
   const key = headsKey(heads)
   if (key === currentKey) {
@@ -1020,7 +1006,7 @@ function diffView(doc, heads, currentKey, marked) {
   }
   const cached = viewCache.get(key)
   if (cached && !(cached.live && marked)) return cached.value
-  const snapshot = view(doc, heads)
+  const snapshot = cached ? viewOfDoc(cached.value) : view(doc, heads)
   cacheView(key, {value: snapshot, live: false})
   return snapshot
 }
@@ -1098,11 +1084,11 @@ export function diffPath(doc, path, before, after, options) {
   })
 }
 
-function patchesBetween(before, after, touched, excluded) {
+function patchesBetween(before, after, touched, clock) {
   const patches = []
   appendRecordDiff(patches, before, after, [], after)
   appendConflictPatches(patches, before, after, [])
-  if (touched) appendMarkPatches(patches, before, after, before, after, [], touched, excluded)
+  if (touched) appendMarkPatches(patches, before, after, before, after, [], touched, clock)
   return patches
 }
 
@@ -1154,18 +1140,17 @@ function markEqual(left, right) {
 // backend, so the earlier one answers history queries with the later changes
 // as well. Mark state before the change is therefore computed from the new
 // document with this batch of changes left out.
-function changeScope(changes, before) {
-  const objects = new Set(), excluded = new Set()
-  if (!Array.isArray(changes)) return {objects, excluded}
+function changeScope(changes, before, after) {
+  const objects = new Set()
+  if (!Array.isArray(changes)) return {objects}
   const clock = before && before[STATE] && before[STATE].clock || {}
   for (const change of decodeChanges(changes)) {
     // a batch can contain changes the previous state already had, and those
     // are part of it rather than left out of it
     if ((clock[change.actor] || 0) >= change.seq) continue
-    excluded.add(`${change.actor}@${change.startOp}`)
     for (const op of change.ops) objects.add(op.obj)
   }
-  return {objects, excluded}
+  return {objects, clock: Frontend.getBackendState(after).state.opClock(clock)}
 }
 
 function markValue(values, name) {
@@ -1177,8 +1162,8 @@ function markValue(values, name) {
 // the ones a consumer would already have: its own marks in the previous state
 // if it survived the change, and the marks of the splice that inserted it
 // otherwise.
-function appendTextMarkPatches(patches, beforeDoc, afterDoc, before, after, path, excluded) {
-  const beforeValues = markRangesForText(excluded ? afterDoc : beforeDoc, before, excluded).values
+function appendTextMarkPatches(patches, beforeDoc, afterDoc, before, after, path, clock) {
+  const beforeValues = markRangesForText(clock ? afterDoc : beforeDoc, before, clock).values
   const afterValues = markRangesForText(afterDoc, after).values
   const previous = new Map(before.elems.map((elem, index) => [elem.elemId, beforeValues[index]]))
   const expected = after.elems.map((elem, index) =>
@@ -1205,17 +1190,17 @@ function appendTextMarkPatches(patches, beforeDoc, afterDoc, before, after, path
   if (added.length > 0) patches.push({action: 'mark', path, marks: added})
 }
 
-function appendMarkPatches(patches, beforeDoc, afterDoc, before, after, path, touched, excluded) {
+function appendMarkPatches(patches, beforeDoc, afterDoc, before, after, path, touched, clock) {
   if (before instanceof Frontend.Text && after instanceof Frontend.Text) {
     if (touched.has(Frontend.getObjectId(before)) || touched.has(Frontend.getObjectId(after))) {
-      appendTextMarkPatches(patches, beforeDoc, afterDoc, before, after, path, excluded)
+      appendTextMarkPatches(patches, beforeDoc, afterDoc, before, after, path, clock)
     }
     return
   }
   if (Array.isArray(before) && Array.isArray(after) && before.length !== after.length) return
   for (const key of commonKeys(before, after)) {
     appendMarkPatches(patches, beforeDoc, afterDoc, valueAt(before, key), valueAt(after, key), path.concat(key),
-      touched, excluded)
+      touched, clock)
   }
 }
 
@@ -1412,10 +1397,11 @@ function hasMarkOps(ops) {
 
 function documentHasMarkOps(doc, text) {
   if (text && text.context && hasMarkOps(text.context.ops)) return true
-  return Frontend.getBackendState(doc).state.objectsWithMarks.size > 0
+  const state = Frontend.getBackendState(doc)
+  return (state.source || state.state).objectsWithMarks.size > 0
 }
 
-function markRangesForText(doc, text, excluded) {
+function markRangesForText(doc, text, clock) {
   if (!documentHasMarkOps(doc, text)) {
     return {text, values: new Array(text.length).fill(NO_MARKS), ranges: []}
   }
@@ -1454,11 +1440,12 @@ function markRangesForText(doc, text, excluded) {
       }
     }
   }
-  for (const bytes of getAllChanges(doc)) {
-    const change = decodeChange(bytes, true)
-    if (excluded && excluded.has(`${change.actor}@${change.startOp}`)) continue
-    scanOps(change.ops, change.actor, change.startOp)
+  const state = Frontend.getBackendState(doc)
+  for (const {id, ref, mark} of (state.source || state.state).sequenceInserts(objectId, clock || state.clock)) {
+    inserts.set(id, ref)
+    if (mark) markers.set(id, mark)
   }
+  const scanned = inserts.size
   if (text.context) {
     const size = text.context.ops.reduce((total, op) =>
       total + (op.values ? op.values.length : (op.multiOp || 1)), 0)
@@ -1476,17 +1463,28 @@ function markRangesForText(doc, text, excluded) {
   // and instead makes locally-authored insertions anchor on an adjacent
   // sticky mark boundary at authoring time (see adjustInsertAnchors in the
   // backend), so the wire format alone determines the placement.
-  const childrenOf = new Map()
-  for (const [elemId, ref] of inserts) {
-    if (!childrenOf.has(ref)) childrenOf.set(ref, [])
-    childrenOf.get(ref).push(elemId)
-  }
-  for (const children of childrenOf.values()) {
-    children.sort((a, b) => {
-      const left = parseOpId(a), right = parseOpId(b)
-      return right.counter - left.counter ||
-        (right.actorId < left.actorId ? -1 : right.actorId > left.actorId ? 1 : 0)
-    })
+  let order = inserts.keys()
+  if (inserts.size !== scanned) {
+    const childrenOf = new Map()
+    for (const [elemId, ref] of inserts) {
+      if (!childrenOf.has(ref)) childrenOf.set(ref, [])
+      childrenOf.get(ref).push(elemId)
+    }
+    for (const children of childrenOf.values()) {
+      children.sort((a, b) => {
+        const left = parseOpId(a), right = parseOpId(b)
+        return right.counter - left.counter ||
+          (right.actorId < left.actorId ? -1 : right.actorId > left.actorId ? 1 : 0)
+      })
+    }
+    order = []
+    const stack = (childrenOf.get('_head') || []).slice().reverse()
+    while (stack.length > 0) {
+      const elemId = stack.pop()
+      order.push(elemId)
+      const children = childrenOf.get(elemId)
+      if (children) for (let i = children.length - 1; i >= 0; i--) stack.push(children[i])
+    }
   }
 
   // Walk the sequence, tracking the active marks. A markEnd closes the
@@ -1497,30 +1495,24 @@ function markRangesForText(doc, text, excluded) {
   const boundaries = new Map()   // markBegin opId -> {name, value, start, end}
   const active = new Map()       // markBegin opId -> same object
   let visibleCount = 0
-  {
-    const stack = (childrenOf.get('_head') || []).slice().reverse()
-    while (stack.length > 0) {
-      const elemId = stack.pop()
-      const marker = markers.get(elemId)
-      if (marker) {
-        if (marker.begin) {
-          const boundary = {name: marker.name, value: marker.value, start: visibleCount, end: undefined, id: elemId}
-          boundaries.set(elemId, boundary)
-          active.set(elemId, boundary)
-        } else {
-          const parsed = parseOpId(elemId)
-          const beginId = `${parsed.counter - 1}@${parsed.actorId}`
-          const boundary = active.get(beginId)
-          if (boundary) {
-            boundary.end = visibleCount
-            active.delete(beginId)
-          }
+  for (const elemId of order) {
+    const marker = markers.get(elemId)
+    if (marker) {
+      if (marker.begin) {
+        const boundary = {name: marker.name, value: marker.value, start: visibleCount, end: undefined, id: elemId}
+        boundaries.set(elemId, boundary)
+        active.set(elemId, boundary)
+      } else {
+        const parsed = parseOpId(elemId)
+        const beginId = `${parsed.counter - 1}@${parsed.actorId}`
+        const boundary = active.get(beginId)
+        if (boundary) {
+          boundary.end = visibleCount
+          active.delete(beginId)
         }
-      } else if (visibleIds.has(elemId)) {
-        visibleCount++
       }
-      const children = childrenOf.get(elemId)
-      if (children) for (let i = children.length - 1; i >= 0; i--) stack.push(children[i])
+    } else if (visibleIds.has(elemId)) {
+      visibleCount++
     }
   }
   for (const boundary of boundaries.values()) {

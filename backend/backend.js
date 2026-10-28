@@ -167,6 +167,31 @@ function getPatch(backend) {
   return backendState(backend, true).getPatch()
 }
 
+function viewState(source, heads, clock) {
+  let state
+  return {
+    heads, source, clock,
+    get state() {
+      if (state === undefined) state = loadChanges(init(), source.getChangesByHash(source.clockAt(heads).hashes)).state
+      return state
+    },
+    set state(value) {
+      state = value
+    }
+  }
+}
+
+function view(backend, heads) {
+  const source = backendState(backend, true)
+  const {patch, clock} = source.viewAt(heads)
+  return [viewState(source, patch.deps, clock), patch]
+}
+
+function viewOf(backend, clock) {
+  const source = backendState(backend, true)
+  return viewState(source, backend.heads, source.opClock(clock))
+}
+
 /**
  * Returns an array of hashes of the current "head" changes (i.e. those changes
  * that no other change depends on).
@@ -259,7 +284,7 @@ function saveBundleByHash(backend, hashes) {
 
 export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
-  load, loadChanges, loadIncremental, getPatch, getHeads, getAllChanges, getChanges,
+  load, loadChanges, loadIncremental, getPatch, view, viewOf, getHeads, getAllChanges, getChanges,
   getChangesAdded, getChangeByHash, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta,
   getChangesByHash, topoHistoryTraversal, stats, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
 }

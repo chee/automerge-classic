@@ -2079,7 +2079,7 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
  * instantiate the current state of the document. `objectMeta` is mutated to contain information
  * about the parent and children of each object in the document.
  */
-function documentPatch(docState) {
+function documentPatch(docState, clock) {
   docState.readFromColumns = true
   for (let col of docState.blocks[0].columns) col.decoder.reset()
   let propState = new Map(), docOp = null, blockIndex = 0
@@ -2090,6 +2090,19 @@ function documentPatch(docState) {
   while (true) {
     ({ docOp, blockIndex } = readNextDocOp(docState, blockIndex))
     if (docOp === null) break
+    if (clock) {
+      if (!(docOp[idCtrIdx] <= clock[docOp[idActorIdx]])) continue
+      const succCtr = [], succActor = []
+      for (let i = 0; i < docOp[succNumIdx]; i++) {
+        if (docOp[succCtrIdx][i] <= clock[docOp[succActorIdx][i]]) {
+          succCtr.push(docOp[succCtrIdx][i])
+          succActor.push(docOp[succActorIdx][i])
+        }
+      }
+      docOp[succNumIdx] = succCtr.length
+      docOp[succCtrIdx] = succCtr
+      docOp[succActorIdx] = succActor
+    }
     if (docOp[objActorIdx] !== lastObjActor || docOp[objCtrIdx] !== lastObjCtr) {
       objectId = `${docOp[objCtrIdx]}@${docState.actorIds[docOp[objActorIdx]]}`
       lastObjActor = docOp[objActorIdx]
@@ -2180,6 +2193,28 @@ function appendChange(columns, change, actorIndexById, changeIndexByHash) {
     change.extraBytes ? (change.extraBytes.byteLength << 4 | VALUE_TYPE.BYTES) : VALUE_TYPE.BYTES, // extraLen
     change.extraBytes // extraRaw
   ])
+}
+
+function changeMeta(buffer) {
+  const change = decodeChangeColumns(buffer)
+  const actionColumn = change.columns.find(column => column.columnId === CHANGE_COLUMNS[actionIdx].columnId)
+  if (!actionColumn) throw new RangeError('change is missing action column')
+  const actions = decoderByColumnId(actionColumn.columnId, actionColumn.buffer)
+  let numOps = 0
+  while (!actions.done) {
+    actions.readValue()
+    numOps++
+  }
+  return {
+    actor: change.actor,
+    seq: change.seq,
+    startOp: change.startOp,
+    maxOp: change.startOp + numOps - 1,
+    time: change.time,
+    message: change.message,
+    deps: change.deps,
+    hash: change.hash
+  }
 }
 
 function buildCursorIndex(blocks, actorIds, objectId) {
@@ -2763,27 +2798,66 @@ class BackendDoc {
   }
 
   getChangesMeta(heads) {
-    return this.getChanges(heads).map(buffer => {
-      const change = decodeChangeColumns(buffer)
-      const actionColumn = change.columns.find(column => column.columnId === CHANGE_COLUMNS[actionIdx].columnId)
-      if (!actionColumn) throw new RangeError('change is missing action column')
-      const actions = decoderByColumnId(actionColumn.columnId, actionColumn.buffer)
-      let numOps = 0
-      while (!actions.done) {
-        actions.readValue()
-        numOps++
+    return this.getChanges(heads).map(changeMeta)
+  }
+
+  clockAt(heads) {
+    if (!this.haveHashGraph) this.computeHashGraph()
+    const changeOf = new Map()
+    for (const [actor, hashes] of Object.entries(this.hashesByActor)) {
+      for (let i = 0; i < hashes.length; i++) changeOf.set(hashes[i], {actor, seq: i + 1})
+    }
+    const clock = {}, ancestors = new Set(), covered = new Set(), stack = heads.slice()
+    while (stack.length > 0) {
+      const hash = stack.pop()
+      if (ancestors.has(hash)) continue
+      const change = changeOf.get(hash)
+      if (!change) throw new RangeError(`Unknown change hash: ${hash}`)
+      ancestors.add(hash)
+      if (!(clock[change.actor] >= change.seq)) clock[change.actor] = change.seq
+      for (const dep of this.dependenciesByHash[hash]) {
+        covered.add(dep)
+        stack.push(dep)
       }
-      return {
-        actor: change.actor,
-        seq: change.seq,
-        startOp: change.startOp,
-        maxOp: change.startOp + numOps - 1,
-        time: change.time,
-        message: change.message,
-        deps: change.deps,
-        hash: change.hash
+    }
+    return {clock, heads: [...new Set(heads)].filter(hash => !covered.has(hash)).sort(), hashes: [...ancestors]}
+  }
+
+  opClock(clock) {
+    if (!this.haveHashGraph) this.computeHashGraph()
+    return this.actorIds.map(actor => (clock[actor] > 0
+      ? changeMeta(this.changes[this.changeIndexByHash[this.hashesByActor[actor][clock[actor] - 1]]]).maxOp : 0))
+  }
+
+  viewAt(heads) {
+    const {clock, heads: deps} = this.clockAt(heads)
+    const opClock = this.opClock(clock)
+    const objectMeta = {_root: {parentObj: null, parentKey: null, opId: null, type: 'map', children: {}}}
+    const docState = {blocks: this.blocks, actorIds: this.actorIds, objectMeta, maxOp: 0}
+    const diffs = documentPatch(docState, opClock)
+    return {patch: {maxOp: docState.maxOp, clock, deps, pendingChanges: 0, diffs}, clock: opClock}
+  }
+
+  sequenceInserts(objectId, clock) {
+    const {counter, actorId} = objectId === '_root' ? {counter: null, actorId: null} : parseOpId(objectId)
+    const actor = actorId === null ? null : this.actorIndexById.get(actorId)
+    const inserts = []
+    if (actor === undefined) return inserts
+    for (let index = findBlock(this.blocks, this.actorIds, actorId, counter, null); index < this.blocks.length; index++) {
+      const block = this.blocks[index]
+      for (const op of columnOperationCache(block.columns).operations) {
+        if (op[objCtrIdx] !== counter || op[objActorIdx] !== actor || !op[insertIdx]) continue
+        if (clock && !(op[idCtrIdx] <= clock[op[idActorIdx]])) continue
+        const id = `${op[idCtrIdx]}@${this.actorIds[op[idActorIdx]]}`
+        const ref = op[keyCtrIdx] === 0 ? '_head' : `${op[keyCtrIdx]}@${this.actorIds[op[keyActorIdx]]}`
+        const mark = ACTIONS[op[actionIdx]] !== 'mark' ? null : op[markNameIdx] === null
+          ? {begin: false, expand: !!op[expandIdx]}
+          : {begin: true, name: op[markNameIdx], value: decodeValue(op[valLenIdx], op[valRawIdx]).value, expand: !!op[expandIdx]}
+        inserts.push({id, ref, mark})
       }
-    })
+      if (compareBlockObject(block, this.actorIds, actorId, counter) > 0) break
+    }
+    return inserts
   }
 
   topoHistoryTraversal() {
