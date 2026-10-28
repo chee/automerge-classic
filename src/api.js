@@ -80,12 +80,12 @@ function changeWithSource(doc, options, callback, source) {
     callback = options
     options = undefined
   }
-  return superseded(doc, Frontend.change(doc, patchOptions(doc, options, source), callback)[0])
+  return Frontend.change(doc, patchOptions(doc, options, source), callback)[0]
 }
 
 export function emptyChange(doc, options) {
   assertWritable(doc)
-  return superseded(doc, Frontend.emptyChange(doc, patchOptions(doc, options, 'emptyChange'))[0])
+  return Frontend.emptyChange(doc, patchOptions(doc, options, 'emptyChange'))[0]
 }
 
 export function clone(doc, options = {}) {
@@ -198,7 +198,7 @@ function applyBackendPatch(doc, patch, backendState, changes, options, source) {
   const newDoc = Frontend.applyPatch(doc, patch, backendState)
   const patchCallback = options.patchCallback || doc[OPTIONS].patchCallback
   if (patchCallback) callPatchCallback(patchCallback, doc, newDoc, changes, source)
-  return superseded(doc, newDoc)
+  return newDoc
 }
 
 export function applyChanges(doc, changes, options = {}) {
@@ -964,63 +964,21 @@ function appendRecordDiff(patches, before, after, path, afterDoc, orderedKeys) {
   emitUnits(patches, units)
 }
 
-// A set of heads determines the document state, because change hashes cover
-// their transitive dependencies, so a view is reusable across documents and
-// across successive versions of one document.
-//
-// An earlier version of a document is a sound stand-in for a view of its own
-// heads as far as values go, but not as far as history goes: it shares one
-// mutable backend with the versions that follow it, so history queries on it
-// report later changes as well. It is therefore only cached as `live`, and
-// only reused for a diff that reads no history — that is, when the document
-// contains no mark operations.
-const viewCache = new Map()
-const VIEW_CACHE_SIZE = 2
-
-function headsKey(heads) {
-  return heads.slice().sort().join(',')
-}
-
-function cacheView(key, entry) {
-  viewCache.delete(key)
-  viewCache.set(key, entry)
-  if (viewCache.size > VIEW_CACHE_SIZE) viewCache.delete(viewCache.keys().next().value)
-}
-
-function superseded(doc, newDoc) {
-  if (newDoc !== doc && doc[STATE].requests.length === 0) cacheView(headsKey(getHeads(doc)), {value: doc, live: true})
-  return newDoc
-}
-
-function viewOfDoc(doc) {
-  const state = doc[STATE]
-  const patch = {clock: state.clock, deps: state.deps, maxOp: state.maxOp, diffs: {objectId: '_root', type: 'map', props: {}}}
-  return Frontend.applyPatch(doc, patch, backend.viewOf(state.backendState, state.clock))
-}
-
-function diffView(doc, heads, currentKey, marked) {
-  const key = headsKey(heads)
-  if (key === currentKey) {
-    cacheView(key, {value: doc, live: true})
-    return doc
-  }
-  const cached = viewCache.get(key)
-  if (cached && !(cached.live && marked)) return cached.value
-  const snapshot = cached ? viewOfDoc(cached.value) : view(doc, heads)
-  cacheView(key, {value: snapshot, live: false})
-  return snapshot
-}
-
 export function diff(doc, beforeHeads, afterHeads) {
   if (!Array.isArray(beforeHeads)) throw new TypeError('diff() before must be an array of heads')
   if (!Array.isArray(afterHeads)) throw new TypeError('diff() after must be an array of heads')
   if (!hasHeads(doc, beforeHeads) || !hasHeads(doc, afterHeads)) return []
-  const marked = documentHasMarkOps(doc)
-  const pending = doc[STATE] && doc[STATE].requests && doc[STATE].requests.length > 0
-  const currentKey = pending ? null : headsKey(getHeads(doc))
-  const before = diffView(doc, beforeHeads, currentKey, marked)
-  const after = diffView(doc, afterHeads, currentKey, marked)
-  return patchesBetween(before, after, marked && objectsBetweenHeads(doc, beforeHeads, afterHeads))
+  return backend.diff(Frontend.getBackendState(doc, 'diff'), beforeHeads, afterHeads, diffValue)
+}
+
+function diffValue(value, inMark) {
+  if (value.objectType) return value.objectType === 'text' ? '' : value.objectType === 'list' ? [] : {}
+  if (value.datatype === 'counter') return new Frontend.Counter(value.value)
+  if (value.datatype === 'timestamp') return new Date(value.value)
+  if (value.datatype === 'uint') return BigInt(value.value)
+  if (typeof value.value === 'string' && !inMark) return new ImmutableString(value.value)
+  if (value.value instanceof Uint8Array) return value.value.slice()
+  return value.value
 }
 
 function resolveObjectPath(doc, pathString) {
@@ -1043,18 +1001,6 @@ function resolveObjectPath(doc, pathString) {
   return objectId
 }
 
-function pathToObject(object, objectId, path) {
-  if (Frontend.getObjectId(object) === objectId) return path
-  const keys = Array.isArray(object) ? object.map((_, index) => index) : Object.keys(object)
-  for (const key of keys) {
-    const child = Frontend.getText(object, key) || object[key]
-    if (!Frontend.getObjectId(object, key) || child instanceof Frontend.Text && Frontend.getObjectId(object, key) !== objectId) continue
-    const found = pathToObject(child, objectId, path.concat(key))
-    if (found) return found
-  }
-  return null
-}
-
 function knownHeads(doc, heads) {
   const error = hashesError(heads)
   if (error) throw new RangeError(`invalid before heads: ${error}`)
@@ -1075,13 +1021,7 @@ export function diffPath(doc, path, before, after, options) {
     recursive = true
   }
   const beforeHeads = knownHeads(doc, before), afterHeads = knownHeads(doc, after)
-  const patches = diff(doc, beforeHeads, afterHeads)
-  const prefix = pathToObject(diffView(doc, afterHeads, headsKey(getHeads(doc)), false), objectId, [])
-  if (!prefix) return []
-  return patches.filter(patch => {
-    const depth = patch.path.length - prefix.length - (patch.action === 'mark' ? 0 : 1)
-    return depth >= 0 && (recursive || depth === 0) && prefix.every((key, i) => patch.path[i] === key)
-  })
+  return backend.diff(Frontend.getBackendState(doc, 'diffPath'), beforeHeads, afterHeads, diffValue, objectId, recursive)
 }
 
 function patchesBetween(before, after, touched, clock) {
@@ -1090,20 +1030,6 @@ function patchesBetween(before, after, touched, clock) {
   appendConflictPatches(patches, before, after, [])
   if (touched) appendMarkPatches(patches, before, after, before, after, [], touched, clock)
   return patches
-}
-
-// The object IDs that any operation in the symmetric difference of the two
-// head sets writes to. An object outside this set has the same operations in
-// both views, so its marks cannot differ.
-function objectsBetweenHeads(doc, beforeHeads, afterHeads) {
-  const state = Frontend.getBackendState(doc, 'diff')
-  const objects = new Set()
-  for (const bytes of backend.getChanges(state, beforeHeads).concat(backend.getChanges(state, afterHeads))) {
-    for (const op of decodeChange(bytes, true).ops) {
-      if (op.action === 'markBegin' || op.action === 'markEnd') objects.add(op.obj)
-    }
-  }
-  return objects
 }
 
 function commonKeys(before, after) {

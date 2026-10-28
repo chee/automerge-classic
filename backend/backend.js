@@ -277,6 +277,10 @@ function stats(backend) {
   return backendState(backend, true).stats()
 }
 
+function diff(backend, beforeHeads, afterHeads, valueOf, objectId, recursive) {
+  return (backend.source || backendState(backend, true)).diff(beforeHeads, afterHeads, valueOf, objectId, recursive)
+}
+
 function saveBundleByHash(backend, hashes) {
   const state = backendState(backend, true)
   return encodeDocumentBundle(state.getChangesByHash(hashes), documentOps(state))
@@ -286,5 +290,5 @@ export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
   load, loadChanges, loadIncremental, getPatch, view, viewOf, getHeads, getAllChanges, getChanges,
   getChangesAdded, getChangeByHash, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta,
-  getChangesByHash, topoHistoryTraversal, stats, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
+  getChangesByHash, topoHistoryTraversal, stats, diff, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
 }

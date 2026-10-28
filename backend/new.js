@@ -19,6 +19,10 @@ const COLUMN_OPERATIONS = new WeakMap()
 const COLUMN_DATA = new WeakMap()
 const COLUMN_SPLICES = new WeakMap()
 const SEQUENCE_INSERTS = new WeakMap()
+const BLOCK_OBJECTS = new WeakMap()
+const HEADS_CLOCKS = new Map()
+const CHANGE_TARGETS = new WeakMap()
+const MAX_TOUCHED_ELEMENTS = 16
 const CHANGE_MAX_OPS = new WeakMap()
 const COLUMN_SLAB_OPTIONS = {slabRows: 24}
 
@@ -31,12 +35,38 @@ function columnOperationCache(columns) {
   let cache = COLUMN_OPERATIONS.get(columns)
   if (cache) return cache
   for (const column of columns) column.decoder.reset()
-  const operations = []
+  const operations = columns.length === DOC_OPS_COLUMNS.length &&
+    columns.every((column, index) => column.columnId === DOC_OPS_COLUMNS[index].columnId)
+    ? readDocumentRows(columns.map(column => column.decoder)) : []
   while (!columns[actionIdx].decoder.done) operations.push(readOperation(columns))
   for (const column of columns) column.decoder.reset()
   cache = {operations}
   COLUMN_OPERATIONS.set(columns, cache)
   return cache
+}
+
+function readDocumentRows(decoders) {
+  const rows = []
+  while (!decoders[actionIdx].done) {
+    const row = new Array(DOC_OPS_COLUMNS.length)
+    for (let i = 0; i < valLenIdx; i++) row[i] = decoders[i].readValue()
+    row[valLenIdx] = decoders[valLenIdx].readValue()
+    row[valRawIdx] = decoders[valRawIdx].readRawBytes(row[valLenIdx] >>> 4)
+    row[11] = decoders[11].readValue()
+    row[12] = decoders[12].readValue()
+    const count = decoders[succNumIdx].readValue() || 0, actors = [], counters = []
+    for (let i = 0; i < count; i++) {
+      actors.push(decoders[succActorIdx].readValue())
+      counters.push(decoders[succCtrIdx].readValue())
+    }
+    row[succNumIdx] = count
+    row[succActorIdx] = actors
+    row[succCtrIdx] = counters
+    row[expandIdx] = decoders[expandIdx].readValue()
+    row[markNameIdx] = decoders[markNameIdx].readValue()
+    rows.push(row)
+  }
+  return rows
 }
 
 function columnDataType(columnId) {
@@ -2292,6 +2322,799 @@ function insertAnchor(elems, ref) {
   return candidates[candidates.length - 1].ref
 }
 
+const SAME = 0, ADD = 1, DEL = 2
+const NO_MARKS = new Map(), NULL_VALUE = {value: null}, NO_MARK_DIFF = {before: null, after: null}
+const SET_ACTION = ACTIONS.indexOf('set'), DEL_ACTION = ACTIONS.indexOf('del'), INC_ACTION = ACTIONS.indexOf('inc'),
+  MARK_ACTION = ACTIONS.indexOf('mark'), MAKE_MAP_ACTION = ACTIONS.indexOf('makeMap')
+
+function changeTargets(buffer) {
+  let targets = CHANGE_TARGETS.get(buffer)
+  if (targets) return targets
+  targets = []
+  const change = decodeChangeColumns(buffer)
+  const columns = makeDecoders(change.columns, CHANGE_COLUMNS).map(column => column.decoder)
+  function read(index) {
+    return columns[index].done ? null : columns[index].readValue()
+  }
+  for (let counter = change.startOp; !columns[actionIdx].done; counter++) {
+    const action = read(actionIdx), objActor = read(objActorIdx), objCtr = read(objCtrIdx), keyActor = read(keyActorIdx)
+    const keyCtr = read(keyCtrIdx), keyStr = read(keyStrIdx), insert = read(insertIdx)
+    const element = insert ? [change.actorIds[0], counter] : keyStr === null && keyCtr ? [change.actorIds[keyActor], keyCtr] : null
+    targets.push({objectId: objCtr === null ? '_root' : `${objCtr}@${change.actorIds[objActor]}`, mark: action === MARK_ACTION, element})
+  }
+  CHANGE_TARGETS.set(buffer, targets)
+  return targets
+}
+
+function changeObjects(buffer, objects, actorIndexById) {
+  for (const {objectId, mark, element} of changeTargets(buffer)) {
+    let touched = objects.get(objectId)
+    if (!touched) objects.set(objectId, touched = {elements: [], marks: false})
+    if (mark) touched.marks = true
+    if (element && touched.elements.length <= MAX_TOUCHED_ELEMENTS) touched.elements.push([actorIndexById.get(element[0]), element[1]])
+  }
+}
+
+function blockObjects(block) {
+  let objects = BLOCK_OBJECTS.get(block.columns)
+  if (objects) return objects
+  objects = new Map()
+  const rows = columnOperationCache(block.columns).operations
+  let start = 0
+  for (let i = 1; i <= rows.length; i++) {
+    if (i < rows.length && rows[i][objCtrIdx] === rows[start][objCtrIdx] && rows[i][objActorIdx] === rows[start][objActorIdx]) continue
+    objects.set(rows[start][objCtrIdx] === null ? '_root' : `${rows[start][objCtrIdx]}@${rows[start][objActorIdx]}`, {start, end: i})
+    start = i
+  }
+  BLOCK_OBJECTS.set(block.columns, objects)
+  return objects
+}
+
+function groupEnd(rows, start, end, type) {
+  let next = start + 1
+  if (type === 'map') {
+    while (next < end && rows[next][keyStrIdx] === rows[start][keyStrIdx]) next++
+  } else {
+    while (next < end && !rows[next][insertIdx]) next++
+  }
+  return next
+}
+
+function groupIncrements(rows, start, end) {
+  let incs = null
+  for (let i = start; i < end; i++) {
+    if (rows[i][actionIdx] !== INC_ACTION) continue
+    if (!incs) incs = new Map()
+    incs.set(`${rows[i][idCtrIdx]}@${rows[i][idActorIdx]}`, decodeValue(rows[i][valLenIdx], rows[i][valRawIdx]).value)
+  }
+  return incs
+}
+
+function textWidth(row) {
+  if (row[actionIdx] !== SET_ACTION) return 1
+  const decoded = decodeValue(row[valLenIdx], row[valRawIdx])
+  return typeof decoded.value === 'string' && !decoded.datatype ? decoded.value.length : 1
+}
+
+function segmentSummary(segment, rows, type) {
+  if (segment.summary) return segment.summary
+  const maxCounters = new Map(), children = [], marks = []
+  let visible = 0
+  for (let start = segment.start; start < segment.end;) {
+    const end = groupEnd(rows, start, segment.end, type), incs = type === 'text' ? null : groupIncrements(rows, start, end)
+    let top = null
+    for (let i = start; i < end; i++) {
+      const row = rows[i]
+      if (!(row[idCtrIdx] <= maxCounters.get(row[idActorIdx]))) maxCounters.set(row[idActorIdx], row[idCtrIdx])
+      for (let j = 0; j < row[succNumIdx]; j++) {
+        if (!(row[succCtrIdx][j] <= maxCounters.get(row[succActorIdx][j]))) maxCounters.set(row[succActorIdx][j], row[succCtrIdx][j])
+      }
+      if (visibleNow(row, incs)) top = row
+    }
+    if (top && top[actionIdx] === MARK_ACTION) {
+      marks.push(top)
+    } else if (top) {
+      if (isMakeRow(top)) children.push({row: top, offset: type === 'map' ? top[keyStrIdx] : visible})
+      visible += type === 'text' ? textWidth(top) : 1
+    }
+    start = end
+  }
+  segment.summary = {maxCounters: [...maxCounters], children, marks, visible}
+  return segment.summary
+}
+
+function settledAt(summary, before, after) {
+  for (const [actor, counter] of summary.maxCounters) {
+    if (!(counter <= before[actor] && counter <= after[actor])) return false
+  }
+  return true
+}
+
+function startsGroup(part, type, previous) {
+  const first = part.operations[part.segment.start]
+  if (type !== 'map') return first[insertIdx]
+  return !previous || previous.operations[previous.segment.end - 1][keyStrIdx] !== first[keyStrIdx]
+}
+
+function touchesBlock(doc, block, key, touched) {
+  if (!touched.elements.some(([actor, counter]) => bloomFilterContains(block.bloom, actor, counter))) return false
+  const segment = blockObjects(block).get(key)
+  if (!segment) return false
+  const rows = columnOperationCache(block.columns).operations, ids = new Set(touched.elements.map(([actor, counter]) => `${counter}@${actor}`))
+  for (let i = segment.start; i < segment.end; i++) {
+    const row = rows[i]
+    if (ids.has(row[insertIdx] ? `${row[idCtrIdx]}@${row[idActorIdx]}` : `${row[keyCtrIdx]}@${row[keyActorIdx]}`)) return true
+  }
+  return false
+}
+
+function lastCandidateBlock(doc, first, key, touched, actorId, counter) {
+  let last = first
+  while (last < doc.blocks.length - 1 && compareBlockObject(doc.blocks[last], doc.actorIds, actorId, counter) <= 0) last++
+  while (last > first && !touchesBlock(doc, doc.blocks[last], key, touched)) last--
+  return last
+}
+
+function objectRows(doc, objectId, type, before, after, touched) {
+  const {counter, actorId} = objectId === '_root' ? {counter: null, actorId: null} : parseOpId(objectId)
+  const key = objectId === '_root' ? objectId : `${counter}@${doc.actorIndexById.get(actorId)}`
+  const first = findBlock(doc.blocks, doc.actorIds, actorId, counter, null), parts = []
+  const last = touched && type !== 'map' && !touched.marks && touched.elements.length <= MAX_TOUCHED_ELEMENTS
+    ? lastCandidateBlock(doc, first, key, touched, actorId, counter) : doc.blocks.length - 1
+  let truncated = false
+  for (let index = first; index < doc.blocks.length; index++) {
+    const block = doc.blocks[index]
+    if (index > last) {
+      truncated = compareBlockObject(doc.blocks[index - 1], doc.actorIds, actorId, counter) <= 0
+      break
+    }
+    const segment = blockObjects(block).get(key)
+    if (segment) parts.push({segment, operations: columnOperationCache(block.columns).operations})
+    if (compareBlockObject(block, doc.actorIds, actorId, counter) > 0) break
+  }
+  const rows = []
+  for (let k = 0; k < parts.length; k++) {
+    const {segment, operations} = parts[k]
+    if (before !== null && startsGroup(parts[k], type, parts[k - 1]) &&
+        (k === parts.length - 1 ? !truncated : startsGroup(parts[k + 1], type, parts[k]))) {
+      const summary = segmentSummary(segment, operations, type)
+      if (settledAt(summary, before, after)) {
+        rows.push({skip: true, summary, length: type === 'text' ? segment.end - segment.start : 0})
+        if (type !== 'text') continue
+      }
+    }
+    for (let i = segment.start; i < segment.end; i++) rows.push(operations[i])
+  }
+  rows.truncated = truncated
+  return rows
+}
+
+function covers(clock, row) {
+  return clock !== null && row[idCtrIdx] <= clock[row[idActorIdx]]
+}
+
+function isCounterRow(row) {
+  return row[actionIdx] === SET_ACTION && (row[valLenIdx] & 0x0f) === VALUE_TYPE.COUNTER
+}
+
+function visibleAt(row, clock, incs) {
+  const action = row[actionIdx]
+  if (action === INC_ACTION || action === DEL_ACTION || !covers(clock, row)) return false
+  if (!isCounterRow(row)) incs = null
+  for (let i = 0; i < row[succNumIdx]; i++) {
+    const counter = row[succCtrIdx][i], actor = row[succActorIdx][i]
+    if (counter <= clock[actor] && !(incs && incs.has(`${counter}@${actor}`))) return false
+  }
+  return true
+}
+
+function visibleNow(row, incs) {
+  if (row[actionIdx] === INC_ACTION || row[actionIdx] === DEL_ACTION) return false
+  if (!isCounterRow(row)) incs = null
+  for (let i = 0; i < row[succNumIdx]; i++) {
+    if (!(incs && incs.has(`${row[succCtrIdx][i]}@${row[succActorIdx][i]}`))) return false
+  }
+  return true
+}
+
+function incrementsAt(row, clock, incs) {
+  let total = 0
+  if (clock === null || incs === null || !isCounterRow(row)) return total
+  for (let i = 0; i < row[succNumIdx]; i++) {
+    const counter = row[succCtrIdx][i], actor = row[succActorIdx][i], key = `${counter}@${actor}`
+    if (counter <= clock[actor] && incs.has(key)) total += incs.get(key)
+  }
+  return total
+}
+
+function updateItem(item, expose) {
+  item.expose = item.expose || expose
+  if (item.expose && item.diff === SAME) item.diff = ADD
+  item.update = true
+}
+
+function groupItem(entries, before, after, incs, isList) {
+  let lastIsSame = false, numNew = 0, numOld = 0, expose = false, lastVisible = null
+  for (let i = 0; i < entries.length; i++) {
+    const {row, diff} = entries[i]
+    if (diff === DEL) {
+      expose = lastIsSame
+      numOld++
+    } else if (diff === SAME) {
+      lastIsSame = true
+      numNew++
+      numOld++
+      expose = false
+    } else {
+      lastIsSame = false
+      numNew++
+      expose = covers(before, row)
+    }
+    const incAfter = incrementsAt(row, after, incs)
+    const itemDiff = expose && diff === SAME ? ADD : diff
+    const item = {row, diff: itemDiff, inc: incAfter - incrementsAt(row, before, incs), incAfter,
+      conflict: numNew > 1 && !(diff === SAME && numOld > 1), expose, update: itemDiff === ADD && numOld > 0}
+    if (i < entries.length - 1) {
+      if (diff !== DEL && entries[i + 1].diff === DEL) lastVisible = item
+      continue
+    }
+    if (lastVisible && (isList || diff === DEL)) {
+      updateItem(lastVisible, expose || lastVisible.diff === SAME)
+      lastVisible.conflict = numNew > 1
+      return lastVisible
+    }
+    if (diff === SAME && numOld > 1 && numNew === 1) updateItem(item, true)
+    return item
+  }
+}
+
+function propertyItems(rows, type, before, after) {
+  const items = [], isList = type !== 'map'
+  let index = 0, start = 0
+  while (start < rows.length) {
+    if (rows[start].skip) {
+      items.push({skipped: rows[start].summary, prop: index})
+      index += rows[start].summary.visible
+      start++
+      continue
+    }
+    let end = start + 1
+    while (end < rows.length && !rows[end].skip && (isList ? !rows[end][insertIdx] : rows[end][keyStrIdx] === rows[start][keyStrIdx])) end++
+    const incs = groupIncrements(rows, start, end), entries = []
+    let top = null
+    for (let i = start; i < end; i++) {
+      const visibleBefore = visibleAt(rows[i], before, incs), visibleAfter = visibleAt(rows[i], after, incs)
+      if (visibleAfter) top = rows[i]
+      if (visibleBefore || visibleAfter) entries.push({row: rows[i], diff: visibleAfter ? (visibleBefore ? SAME : ADD) : DEL})
+    }
+    if (entries.length > 0) {
+      const item = groupItem(entries, before, after, incs, isList)
+      item.prop = isList ? index : rows[start][keyStrIdx]
+      item.top = top
+      items.push(item)
+      if (item.diff !== DEL) index++
+    }
+    start = end
+  }
+  return items
+}
+
+function compareMarkIds(left, right) {
+  return left[0] - right[0] || left[1] - right[1]
+}
+
+function findMark(state, id) {
+  let low = 0, high = state.length
+  while (low < high) {
+    const middle = (low + high) >>> 1
+    const comparison = compareMarkIds(state[middle].id, id)
+    if (comparison === 0) return {found: true, index: middle}
+    if (comparison < 0) low = middle + 1; else high = middle
+  }
+  return {found: false, index: low}
+}
+
+function sameScalar(left, right) {
+  return left.value === right.value && left.datatype === right.datatype
+}
+
+function markBelow(state, index, name) {
+  for (let i = index - 1; i >= 0; i--) if (state[i].name === name) return state[i]
+  return null
+}
+
+function markBegin(machine, id, name, value) {
+  const {found, index} = findMark(machine.state, id)
+  if (found) return
+  if (!machine.state.slice(index).some(mark => mark.name === name)) {
+    const below = markBelow(machine.state, index, name)
+    if (!below || !sameScalar(below.value, value)) machine.current = new Map(machine.current).set(name, value)
+  }
+  machine.state.splice(index, 0, {id, name, value})
+}
+
+function markEnd(machine, id) {
+  const {found, index} = findMark(machine.state, [id[0] - 1, id[1]])
+  if (!found) return
+  const [mark] = machine.state.splice(index, 1)
+  if (machine.state.slice(index).some(other => other.name === mark.name)) return
+  const below = markBelow(machine.state, index, mark.name)
+  if (below && sameScalar(below.value, mark.value)) return
+  machine.current = new Map(machine.current)
+  if (below) machine.current.set(mark.name, below.value); else machine.current.delete(mark.name)
+}
+
+function markChanges(marks) {
+  if (marks.changes) return marks.changes
+  const changes = []
+  marks.changes = changes
+  if (!marks.before && !marks.after) return changes
+  const names = new Set([...(marks.before || NO_MARKS).keys(), ...(marks.after || NO_MARKS).keys()])
+  for (const name of [...names].sort(compareUtf8)) {
+    const before = marks.before && marks.before.get(name), after = marks.after && marks.after.get(name)
+    if (before && !after) {
+      if (before.value !== null) changes.push([name, NULL_VALUE])
+    } else if (after && !before) {
+      if (after.value !== null) changes.push([name, after])
+    } else if (!sameScalar(before, after)) {
+      changes.push([name, after])
+    }
+  }
+  return changes
+}
+
+function sameMarkList(left, right) {
+  if (left === right) return true
+  if (!left || !right || left.length !== right.length) return false
+  return left.every(([name, value], i) => name === right[i][0] && sameScalar(value, right[i][1]))
+}
+
+function marksWithDiff(marks, diff) {
+  if (diff === SAME) return marks
+  if (diff === ADD && marks.after) return {before: null, after: marks.after}
+  return NO_MARK_DIFF
+}
+
+function textSpans(rows, before, after, actorRank) {
+  const spans = [], machines = {before: {state: [], current: NO_MARKS}, after: {state: [], current: NO_MARKS}}
+  let index = 0, next = null, marks = NO_MARK_DIFF
+  function flush() {
+    if (next && next.length > 0) {
+      spans.push({diff: next.diff, text: next.text, index, marks: next.marks})
+      if (next.diff !== DEL) index += next.length
+    }
+    next = null
+  }
+  function applyMark(row, diff) {
+    const id = [row[idCtrIdx], actorRank[row[idActorIdx]]], name = row[markNameIdx]
+    const value = name === null ? null : decodeValue(row[valLenIdx], row[valRawIdx])
+    for (const machine of diff === ADD ? [machines.after] : diff === DEL ? [machines.before] : [machines.before, machines.after]) {
+      if (name === null) markEnd(machine, id); else markBegin(machine, id, name, value)
+    }
+    const markBefore = machines.before.current.size > 0 ? machines.before.current : null
+    const markAfter = machines.after.current.size > 0 ? machines.after.current : null
+    marks = markBefore || markAfter ? {before: markBefore, after: markAfter} : NO_MARK_DIFF
+  }
+  let topBefore = null, topAfter = null
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]
+    if (row.skip) {
+      const states = [machines.before.state, machines.after.state]
+      if (states[0].length === states[1].length && states[0].every((mark, k) => compareMarkIds(mark.id, states[1][k].id) === 0)) {
+        flush()
+        spans.push({skipped: row.summary, index})
+        for (const mark of row.summary.marks) applyMark(mark, SAME)
+        index += row.summary.visible
+        i += row.length
+      }
+      continue
+    }
+    if (row[insertIdx]) {
+      topBefore = null
+      topAfter = null
+      for (let j = i; j < rows.length && (j === i || (!rows[j].skip && !rows[j][insertIdx])); j++) {
+        if (visibleAt(rows[j], before, null)) topBefore = rows[j]
+        if (visibleAt(rows[j], after, null)) topAfter = rows[j]
+      }
+    }
+    if (row !== topBefore && row !== topAfter) continue
+    const diff = row === topAfter ? (row === topBefore ? SAME : ADD) : DEL, action = row[actionIdx]
+    if (action === MARK_ACTION) {
+      applyMark(row, diff)
+      continue
+    }
+    if (action === MAKE_MAP_ACTION) {
+      flush()
+      spans.push({diff, row, index, expose: covers(before, row)})
+      if (diff !== DEL) index++
+      continue
+    }
+    let text = '\ufffc'
+    if (action === SET_ACTION) {
+      const decoded = decodeValue(row[valLenIdx], row[valRawIdx])
+      if (typeof decoded.value === 'string' && !decoded.datatype) text = decoded.value
+    } else if (action === DEL_ACTION || action === INC_ACTION) {
+      continue
+    }
+    if (next && (diff !== next.diff || (marks !== next.marks && !sameMarkList(markChanges(marks), markChanges(next.marks))))) flush()
+    if (!next) next = {diff, text: '', length: 0, marks: marksWithDiff(marks, diff)}
+    next.text += text
+    next.length += text.length
+  }
+  flush()
+  return spans
+}
+
+function exportMarks(marks) {
+  const changes = markChanges(marks)
+  return changes.length > 0 ? changes : null
+}
+
+function opIdString(row, actorIds) {
+  return `${row[idCtrIdx]}@${actorIds[row[idActorIdx]]}`
+}
+
+function isMakeRow(row) {
+  return row[actionIdx] < ACTIONS.length && row[actionIdx] % 2 === 0
+}
+
+function rowValue(ctx, row, incAfter) {
+  if (isMakeRow(row)) return ctx.valueOf({objectType: OBJECT_TYPE[ACTIONS[row[actionIdx]]]})
+  const decoded = decodeValue(row[valLenIdx], row[valRawIdx])
+  if (decoded.datatype === 'counter') decoded.value += incAfter
+  return ctx.valueOf(decoded)
+}
+
+function diffRows(ctx, objectId, diff) {
+  const key = diff ? `diff ${objectId}` : objectId
+  let rows = ctx.rows.get(key)
+  if (!rows) {
+    rows = objectRows(ctx.doc, objectId, objectType(ctx, objectId), diff ? ctx.before : null, ctx.after,
+      diff ? ctx.touched.get(objectId) : null)
+    ctx.rows.set(key, rows)
+  }
+  return rows
+}
+
+function objectType(ctx, objectId) {
+  const meta = ctx.doc.objectMeta[objectId]
+  return meta && meta.type
+}
+
+function updatePathMap(ctx, parent) {
+  const type = objectType(ctx, parent), rows = diffRows(ctx, parent, false)
+  if (type === 'text') {
+    for (const span of textSpans(rows, null, ctx.after, ctx.actorRank)) {
+      if (span.row) ctx.pathMap.set(opIdString(span.row, ctx.doc.actorIds), {prop: span.index, parent})
+    }
+  } else {
+    for (const item of propertyItems(rows, type, null, ctx.after)) {
+      if (isMakeRow(item.row)) ctx.pathMap.set(opIdString(item.row, ctx.doc.actorIds), {prop: item.prop, parent})
+    }
+  }
+}
+
+function parentEntry(ctx, objectId) {
+  const entry = ctx.pathMap.get(objectId)
+  if (entry) return entry
+  const meta = ctx.doc.objectMeta[objectId]
+  if (!meta || ctx.seen.has(objectId)) return null
+  const skipped = skippedEntry(ctx, meta.parentObj, objectId)
+  if (skipped) {
+    ctx.pathMap.set(objectId, skipped)
+    return skipped
+  }
+  ctx.seen.add(objectId)
+  updatePathMap(ctx, meta.parentObj)
+  return ctx.pathMap.get(objectId) || null
+}
+
+function patchPath(ctx, objectId) {
+  const path = []
+  while (objectId !== '_root') {
+    const entry = parentEntry(ctx, objectId)
+    if (!entry) return null
+    path.push(entry.prop)
+    objectId = entry.parent
+  }
+  return path.reverse()
+}
+
+function reachable(ctx, objectId) {
+  if (ctx.reachable.has(objectId)) return ctx.reachable.get(objectId)
+  const meta = ctx.doc.objectMeta[objectId]
+  let result = false
+  const unscanned = meta && ctx.truncated.has(meta.parentObj) && !ctx.truncated.get(meta.parentObj).has(objectId)
+  if (meta && ctx.children.has(meta.parentObj) && !unscanned) {
+    result = ctx.children.get(meta.parentObj).has(objectId) || skippedEntry(ctx, meta.parentObj, objectId) !== null
+  } else if (meta && (!ctx.touched.has(meta.parentObj) || unscanned)) {
+    result = parentEntry(ctx, objectId) !== null && reachable(ctx, meta.parentObj)
+  }
+  ctx.reachable.set(objectId, result)
+  return result
+}
+
+function lastPatch(ctx, objectId) {
+  const last = ctx.patches.length - 1
+  return last >= 0 && ctx.patchObjects[last] === objectId ? ctx.patches[last] : null
+}
+
+function pushPatch(ctx, objectId, patch) {
+  ctx.patches.push(patch)
+  ctx.patchObjects.push(objectId)
+  ctx.lastMarks = null
+}
+
+function popPatch(ctx) {
+  ctx.patches.pop()
+  ctx.patchObjects.pop()
+}
+
+function addPatch(ctx, objectId, prop, patch) {
+  const path = patchPath(ctx, objectId)
+  if (!path) return false
+  patch.path = prop === undefined ? path : path.concat(prop)
+  pushPatch(ctx, objectId, patch)
+  return true
+}
+
+function lastIndex(patch) {
+  return patch.path[patch.path.length - 1]
+}
+
+function insertPatch(ctx, objectId, index, value, conflict) {
+  const last = lastPatch(ctx, objectId)
+  if (last && last.action === 'insert' && index >= lastIndex(last) && index <= lastIndex(last) + last.values.length) {
+    last.values.splice(index - lastIndex(last), 0, value)
+    last.conflicts.splice(index - lastIndex(last), 0, conflict)
+    return
+  }
+  addPatch(ctx, objectId, index, {action: 'insert', path: null, values: [value], conflicts: [conflict]})
+}
+
+function splicePatch(ctx, objectId, index, text, marks) {
+  const last = lastPatch(ctx, objectId)
+  if (last && last.action === 'splice' && sameMarkList(marks, ctx.lastMarks) &&
+      index >= lastIndex(last) && index <= lastIndex(last) + last.value.length) {
+    const at = index - lastIndex(last)
+    last.value = last.value.slice(0, at) + text + last.value.slice(at)
+    return
+  }
+  if (addPatch(ctx, objectId, index, {action: 'splice', path: null, value: text, marks})) ctx.lastMarks = marks
+}
+
+function deletePatch(ctx, objectId, index, length) {
+  const last = lastPatch(ctx, objectId)
+  if (last && (last.action === 'splice' || last.action === 'insert')) {
+    const tail = lastIndex(last), size = last.action === 'splice' ? last.value.length : last.values.length
+    if (index >= tail && index + length - 1 < tail + size && index + length - 1 >= tail) {
+      const at = index - tail
+      if (last.action === 'splice') {
+        last.value = last.value.slice(0, at) + last.value.slice(at + length)
+        if (last.value.length === 0) popPatch(ctx)
+      } else {
+        last.values.splice(at, length)
+        last.conflicts.splice(at, length)
+        if (last.values.length === 0) popPatch(ctx)
+      }
+      return
+    }
+  } else if (last && last.action === 'del' && typeof lastIndex(last) === 'number' && lastIndex(last) === index) {
+    last.length += length
+    return
+  }
+  addPatch(ctx, objectId, index, {action: 'del', path: null, length})
+}
+
+function markPatch(ctx, objectId, marks) {
+  const last = lastPatch(ctx, objectId)
+  if (last && last.action === 'mark') {
+    last.marks.push(...marks)
+    return
+  }
+  if (marks.length > 0) addPatch(ctx, objectId, undefined, {action: 'mark', path: null, marks})
+}
+
+function conflictPatch(ctx, objectId, prop) {
+  const last = lastPatch(ctx, objectId)
+  if (last && last.action === 'put' && lastIndex(last) === prop) {
+    last.conflict = true
+    return
+  }
+  addPatch(ctx, objectId, prop, {action: 'conflict', path: null})
+}
+
+function exposeObject(ctx, objectId) {
+  if (!ctx.exposed.includes(objectId)) {
+    ctx.exposed.push(objectId)
+    ctx.exposed.sort(compareObjectIds)
+  }
+}
+
+function compareObjectIds(left, right) {
+  if (left === right) return 0
+  if (left === '_root') return -1
+  if (right === '_root') return 1
+  const l = parseOpId(left), r = parseOpId(right)
+  return l.counter - r.counter || (l.actorId < r.actorId ? -1 : l.actorId > r.actorId ? 1 : 0)
+}
+
+function flushExposed(ctx, objectId) {
+  ctx.exposed.splice(ctx.exposed.indexOf(objectId), 1)
+  const type = objectType(ctx, objectId), rows = diffRows(ctx, objectId, false)
+  if (type === 'text') {
+    for (const span of textSpans(rows, null, ctx.after, ctx.actorRank)) {
+      if (span.row) {
+        exposeObject(ctx, opIdString(span.row, ctx.doc.actorIds))
+        insertPatch(ctx, objectId, span.index, ctx.valueOf({objectType: 'map'}), false)
+      } else {
+        splicePatch(ctx, objectId, span.index, span.text, exportMarks(span.marks))
+      }
+    }
+    return
+  }
+  for (const item of propertyItems(rows, type, null, ctx.after)) {
+    if (isMakeRow(item.row)) exposeObject(ctx, opIdString(item.row, ctx.doc.actorIds))
+    const value = rowValue(ctx, item.row, item.incAfter)
+    if (type === 'list') insertPatch(ctx, objectId, item.prop, value, item.conflict)
+    else addPatch(ctx, objectId, item.prop, item.conflict ? {action: 'put', path: null, value, conflict: true} : {action: 'put', path: null, value})
+  }
+}
+
+function skippedEntry(ctx, parent, objectId) {
+  let entries = ctx.skippedEntries.get(parent)
+  if (!entries) {
+    entries = new Map()
+    for (const {summary, base} of ctx.skipped.get(parent) || []) {
+      for (const {row, offset} of summary.children) {
+        entries.set(opIdString(row, ctx.doc.actorIds), {prop: typeof offset === 'string' ? offset : base + offset, parent})
+      }
+    }
+    ctx.skippedEntries.set(parent, entries)
+  }
+  return entries.get(objectId) || null
+}
+
+function objectEvents(ctx, objectId, events) {
+  const type = objectType(ctx, objectId), rows = diffRows(ctx, objectId, true), children = new Set(), skipped = []
+  ctx.children.set(objectId, children)
+  ctx.skipped.set(objectId, skipped)
+  if (rows.truncated) {
+    ctx.truncated.set(objectId, new Set(rows.flatMap(row => (row.skip ? row.summary.children.map(child => child.row) : [row]))
+      .filter(isMakeRow).map(row => opIdString(row, ctx.doc.actorIds))))
+  }
+  if (type === 'text') {
+    for (const span of textSpans(rows, ctx.before, ctx.after, ctx.actorRank)) {
+      if (span.skipped) {
+        skipped.push({summary: span.skipped, base: span.index})
+      } else if (span.row) {
+        if (span.diff !== DEL) {
+          children.add(opIdString(span.row, ctx.doc.actorIds))
+          ctx.pathMap.set(opIdString(span.row, ctx.doc.actorIds), {prop: span.index, parent: objectId})
+        }
+        if (span.diff === ADD) {
+          events.push({objectId, kind: 'insert', prop: span.index, value: ctx.valueOf({objectType: 'map'}), conflict: false})
+          if (span.expose) exposeObject(ctx, opIdString(span.row, ctx.doc.actorIds))
+        } else if (span.diff === DEL) {
+          events.push({objectId, kind: 'del', prop: span.index, length: 1})
+        }
+      } else if (span.diff === ADD) {
+        events.push({objectId, kind: 'splice', prop: span.index, text: span.text, marks: exportMarks(span.marks)})
+      } else if (span.diff === DEL) {
+        events.push({objectId, kind: 'del', prop: span.index, length: span.text.length})
+      } else {
+        const marks = exportMarks(span.marks)
+        if (!marks) continue
+        let last = events[events.length - 1]
+        if (!last || last.kind !== 'mark') events.push(last = {objectId, kind: 'mark', marks: new Map()})
+        for (const [name, value] of marks) {
+          let ranges = last.marks.get(name)
+          if (!ranges) last.marks.set(name, ranges = [])
+          const tail = ranges[ranges.length - 1]
+          if (tail && sameScalar(tail.value, value) && tail.end === span.index) tail.end += span.text.length
+          else ranges.push({value, start: span.index, end: span.index + span.text.length})
+        }
+      }
+    }
+    return
+  }
+  const isList = type === 'list'
+  for (const item of propertyItems(rows, type, ctx.before, ctx.after)) {
+    if (item.skipped) {
+      skipped.push({summary: item.skipped, base: item.prop})
+      continue
+    }
+    if (item.diff !== DEL && isMakeRow(item.row)) children.add(opIdString(item.row, ctx.doc.actorIds))
+    if (item.top && isMakeRow(item.top)) ctx.pathMap.set(opIdString(item.top, ctx.doc.actorIds), {prop: item.prop, parent: objectId})
+    if (item.diff === ADD) {
+      const value = rowValue(ctx, item.row, item.incAfter)
+      if (item.expose && isMakeRow(item.row)) exposeObject(ctx, opIdString(item.row, ctx.doc.actorIds))
+      events.push({objectId, kind: isList && !item.update ? 'insert' : 'put', prop: item.prop, value, conflict: item.conflict})
+    } else if (item.diff === SAME) {
+      if (item.inc !== 0) events.push({objectId, kind: 'inc', prop: item.prop, value: item.inc})
+      else if (item.conflict) events.push({objectId, kind: 'conflict', prop: item.prop})
+    } else if (isList) {
+      events.push({objectId, kind: 'del', prop: item.prop, length: 1})
+    } else {
+      events.push({objectId, kind: 'delMap', prop: item.prop})
+    }
+  }
+}
+
+function applyEvent(ctx, event) {
+  const {objectId} = event
+  if (event.kind === 'put') {
+    addPatch(ctx, objectId, event.prop, event.conflict
+      ? {action: 'put', path: null, value: event.value, conflict: true} : {action: 'put', path: null, value: event.value})
+  } else if (event.kind === 'insert') {
+    insertPatch(ctx, objectId, event.prop, event.value, event.conflict)
+  } else if (event.kind === 'splice') {
+    splicePatch(ctx, objectId, event.prop, event.text, event.marks)
+  } else if (event.kind === 'del') {
+    deletePatch(ctx, objectId, event.prop, event.length)
+  } else if (event.kind === 'delMap') {
+    addPatch(ctx, objectId, event.prop, {action: 'del', path: null})
+  } else if (event.kind === 'inc') {
+    addPatch(ctx, objectId, event.prop, {action: 'inc', path: null, value: event.value})
+  } else if (event.kind === 'conflict') {
+    conflictPatch(ctx, objectId, event.prop)
+  } else if (event.kind === 'mark') {
+    const marks = []
+    for (const name of [...event.marks.keys()].sort(compareUtf8)) {
+      for (const {value, start, end} of event.marks.get(name)) marks.push({name, value: ctx.valueOf(value, true), start, end})
+    }
+    markPatch(ctx, objectId, marks)
+  }
+}
+
+function exportPatch(ctx, patch) {
+  if (patch.action === 'insert') {
+    const result = {action: 'insert', path: patch.path, values: patch.values}
+    if (patch.conflicts.some(Boolean)) result.conflicts = patch.conflicts
+    return result
+  }
+  if (patch.action === 'splice') {
+    const result = {action: 'splice', path: patch.path, value: patch.value}
+    if (patch.marks) result.marks = Object.fromEntries(patch.marks.map(([name, value]) => [name, ctx.valueOf(value, true)]))
+    return result
+  }
+  if (patch.action === 'del' && patch.length !== undefined) {
+    return patch.length > 1 ? {action: 'del', path: patch.path, length: patch.length} : {action: 'del', path: patch.path}
+  }
+  return patch
+}
+
+function descendsFrom(objectMeta, objectId, ancestor) {
+  while (objectId !== ancestor) {
+    if (!objectMeta[objectId]) return false
+    objectId = objectMeta[objectId].parentObj
+  }
+  return true
+}
+
+function documentDiff(doc, beforeClock, afterClock, objectIds, valueOf, start, recursive) {
+  const sortedActors = doc.actorIds.slice().sort()
+  const ctx = {
+    doc, valueOf, before: beforeClock, after: afterClock, rows: new Map(), pathMap: new Map(), seen: new Set(),
+    actorRank: doc.actorIds.map(actor => sortedActors.indexOf(actor)),
+    patches: [], patchObjects: [], lastMarks: null, exposed: [],
+    touched: objectIds, children: new Map(), skipped: new Map(), skippedEntries: new Map(), truncated: new Map(), reachable: new Map([[start, true]])
+  }
+  const events = []
+  for (const objectId of [...objectIds.keys()].sort(compareObjectIds)) {
+    if ((objectId === start || recursive && (start === '_root' || descendsFrom(doc.objectMeta, objectId, start))) && reachable(ctx, objectId)) {
+      objectEvents(ctx, objectId, events)
+    }
+  }
+  for (const event of events) {
+    while (ctx.exposed.length > 0 && compareObjectIds(ctx.exposed[0], event.objectId) < 0) flushExposed(ctx, ctx.exposed[0])
+    if (ctx.exposed[0] === event.objectId) continue
+    applyEvent(ctx, event)
+  }
+  while (ctx.exposed.length > 0) flushExposed(ctx, ctx.exposed[0])
+  return ctx.patches.map(patch => exportPatch(ctx, patch))
+}
+
 class BackendDoc {
   constructor(buffer) {
     this.maxOp = 0
@@ -2865,6 +3688,28 @@ class BackendDoc {
     const docState = {blocks: this.blocks, actorIds: this.actorIds, objectMeta, maxOp: 0}
     const diffs = documentPatch(docState, opClock)
     return {patch: {maxOp: docState.maxOp, clock, deps, pendingChanges: 0, diffs}, clock: opClock}
+  }
+
+  headsClock(heads) {
+    const key = heads.slice().sort().join(',')
+    let clock = HEADS_CLOCKS.get(key)
+    if (!clock) clock = key === this.heads.slice().sort().join(',') ? this.clock : this.clockAt(heads).clock
+    HEADS_CLOCKS.delete(key)
+    HEADS_CLOCKS.set(key, clock)
+    if (HEADS_CLOCKS.size > 16) HEADS_CLOCKS.delete(HEADS_CLOCKS.keys().next().value)
+    return clock
+  }
+
+  diff(beforeHeads, afterHeads, valueOf, objectId = '_root', recursive = true) {
+    if (!this.haveHashGraph) this.computeHashGraph()
+    const before = this.headsClock(beforeHeads), after = this.headsClock(afterHeads), objectIds = new Map()
+    for (const actor of new Set(Object.keys(before).concat(Object.keys(after)))) {
+      const low = Math.min(before[actor] || 0, after[actor] || 0), high = Math.max(before[actor] || 0, after[actor] || 0)
+      for (let seq = low + 1; seq <= high; seq++) {
+        changeObjects(this.changes[this.changeIndexByHash[this.hashesByActor[actor][seq - 1]]], objectIds, this.actorIndexById)
+      }
+    }
+    return documentDiff(this, this.opClock(before), this.opClock(after), objectIds, valueOf, objectId, recursive)
   }
 
   sequenceInserts(objectId, clock) {
