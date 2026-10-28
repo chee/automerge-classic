@@ -20,6 +20,7 @@ const COLUMN_DATA = new WeakMap()
 const COLUMN_SPLICES = new WeakMap()
 const SEQUENCE_INSERTS = new WeakMap()
 const BLOCK_OBJECTS = new WeakMap()
+const BLOCK_MARKS = new WeakMap()
 const HEADS_CLOCKS = new Map()
 const CHANGE_TARGETS = new WeakMap()
 const MAX_TOUCHED_ELEMENTS = 16
@@ -2370,6 +2371,24 @@ function blockObjects(block) {
   return objects
 }
 
+function blockMarks(block) {
+  let marks = BLOCK_MARKS.get(block.columns)
+  if (marks) return marks
+  marks = []
+  const decoders = block.columns.map(column => column.decoder)
+  for (const decoder of decoders) decoder.reset()
+  while (!decoders[actionIdx].done) {
+    const objActor = decoders[objActorIdx].readValue(), objCtr = decoders[objCtrIdx].readValue()
+    const idActor = decoders[idActorIdx].readValue(), idCtr = decoders[idCtrIdx].readValue()
+    const action = decoders[actionIdx].readValue(), markName = decoders[markNameIdx].readValue()
+    if (action !== MARK_ACTION) continue
+    marks.push({obj: `${objCtr}@${objActor}`, id: `${idCtr}@${idActor}`, begin: markName === null && `${idCtr - 1}@${idActor}`})
+  }
+  for (const decoder of decoders) decoder.reset()
+  BLOCK_MARKS.set(block.columns, marks)
+  return marks
+}
+
 function groupEnd(rows, start, end, type) {
   let next = start + 1
   if (type === 'map') {
@@ -3786,6 +3805,18 @@ class BackendDoc {
       extraBytes: this.extraBytes
     })
     return this.binaryDoc
+  }
+
+  marksInOrder() {
+    if (this.objectsWithMarks.size === 0) return true
+    const begins = new Map()
+    for (const block of this.blocks) {
+      for (const {obj, id, begin} of blockMarks(block)) {
+        if (!begin) begins.set(id, obj)
+        else if (begins.get(begin) !== obj) return false
+      }
+    }
+    return true
   }
 
   /**

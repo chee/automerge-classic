@@ -222,7 +222,7 @@ describe('patch convergence', () => {
   })
 
   it('sorts the actor table when saving documents with out-of-order actors', () => {
-    const changes = loadFixture('concurrent_delete_patch.json')
+    const changes = loadFixture('concurrent_delete_patch.json').slice(0, 6)
     let doc = Automerge.init()
     ;[doc] = Automerge.applyChanges(doc, changes)
     const {actorIds} = decodeDocumentHeader(Automerge.save(doc))

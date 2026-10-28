@@ -589,7 +589,8 @@ export function splice(doc, path, index, del, newText = '') {
     throw new RangeError('splice() path does not resolve to a string, Text, or list')
   }
   const length = text instanceof Frontend.Text ? textLength(text) : text.length
-  if (index < 0 || index > length) throw new RangeError('splice() index is out of bounds')
+  if (index < 0 || index > length && newText !== '') throw new RangeError('splice() index is out of bounds')
+  if (index > length) return
   del = Math.min(del, length - index)
   if (text instanceof Frontend.Text) {
     spliceText(text, index, del, newText)
@@ -1268,9 +1269,8 @@ export function mark(doc, path, range, name, value) {
   if (!(text instanceof Frontend.Text) || !text.context) {
     throw new RangeError('mark() path must resolve to Text inside a change block')
   }
-  const length = textLength(text)
   if (!range || !Number.isInteger(range.start) || !Number.isInteger(range.end) ||
-      range.start < 0 || range.end < range.start || range.end > length) {
+      range.start < 0 || range.end < 0) {
     throw new RangeError('mark() range is invalid')
   }
   if (typeof name !== 'string') throw new TypeError('mark() name must be a string')
@@ -1279,6 +1279,8 @@ export function mark(doc, path, range, name, value) {
   // A zero-width non-expanding mark can never cover anything; the Rust
   // implementation ignores it without emitting any operations
   if (range.start === range.end && expand === 'none') return
+  const length = textLength(text)
+  if (range.start > length || range.end > length) throw new RangeError('mark() range is invalid')
   const objectId = Frontend.getObjectId(text)
   const startIndex = textElementIndex(text, range.start)
   const endIndex = textElementIndex(text, range.end)
@@ -1293,7 +1295,7 @@ export function mark(doc, path, range, name, value) {
   // empty and the begin boundary is sticky (expanding), the end boundary is
   // inserted immediately after it, so its reference element is the begin
   // boundary itself — this is what the Rust implementation produces.
-  const end = range.start === range.end && expandBefore ? beginOpId
+  const end = endIndex <= startIndex ? beginOpId
     : endIndex === 0 ? '_head' : text.getElemId(endIndex - 1)
   text.context.addOp({
     action: 'markEnd', obj: objectId, elemId: end, insert: true,
@@ -1482,7 +1484,7 @@ function markValuesPerElement(operations, length) {
 function markRangesFromValues(values, text) {
   const offsets = textOffsets(text)
   const ranges = []
-  for (const name of new Set(values.flatMap(value => Object.keys(value)))) {
+  for (const name of [...new Set(values.flatMap(value => Object.keys(value)))].sort(compareUtf8)) {
     let start = 0
     while (start < values.length) {
       if (!Object.prototype.hasOwnProperty.call(values[start], name)) {
@@ -1496,7 +1498,6 @@ function markRangesFromValues(values, text) {
       start = end
     }
   }
-  ranges.sort((left, right) => left.start - right.start || left.end - right.end || left.name.localeCompare(right.name))
   return ranges
 }
 
@@ -1507,13 +1508,8 @@ export function marks(doc, path) {
 
 export function marksAt(doc, path, index) {
   const state = markRanges(doc, path)
-  const length = textLength(state.text)
-  if (!Number.isInteger(index) || index < 0 || index > length) {
-    throw new RangeError('marksAt() index is invalid')
-  }
-  if (index === length) return {}
-  const elementIndex = textElementIndex(state.text, index)
-  return elementIndex === state.text.length ? {} : Object.assign({}, state.values[elementIndex])
+  if (!Number.isInteger(index) || index < 0) throw new RangeError('marksAt() index is invalid')
+  return index < state.text.length ? Object.assign({}, state.values[index]) : {}
 }
 
 export function spans(doc, path) {

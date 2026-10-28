@@ -2,6 +2,7 @@ import assert from 'node:assert'
 import fixtures from './interop_fixtures.js'
 import Automerge from '../src/automerge.js'
 import { decodeChangeColumns } from '../backend/columnar.js'
+import Modern, { describeLive } from './modern.js'
 function markChange(doc, actor, begin, end) {
   const previous = Automerge.getAllChanges(doc).map(Automerge.decodeChange)
     .filter(change => change.actor === actor).sort((left, right) => left.seq - right.seq).pop()
@@ -130,5 +131,46 @@ describe('modern mark encoding', () => {
     assert.strictEqual(loaded.text.length, 602)
     assert.strictEqual(String(loaded.text).slice(298, 303), 'xxYxx')
     assert.strictEqual(Automerge.stats(loaded).numOps, 605)
+  })
+
+  it('saves an end anchored before its begin as changes, which reload with the same marks', () => {
+    const actor = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    let doc = Automerge.from({text: 'abc'}, {actor})
+    const objectId = Automerge.getObjectId(doc, 'text')
+    const elemId = Automerge.getCursor(doc, ['text'], 0)
+    ;[doc] = Automerge.applyChanges(doc, [markChange(doc, actor,
+      {action: 'markBegin', obj: objectId, elemId, insert: true, name: 'bold', value: true, expand: false, pred: []},
+      {action: 'markEnd', obj: objectId, elemId, insert: true, expand: false, pred: []})])
+    assert.deepStrictEqual(Automerge.marks(doc, ['text']), [{name: 'bold', value: true, start: 1, end: 3}])
+
+    const saved = Automerge.save(doc)
+    assert.deepStrictEqual(Buffer.from(saved), Buffer.concat(Automerge.getAllChanges(doc)))
+    const loaded = Automerge.load(saved)
+    assert.deepStrictEqual(Automerge.marks(loaded, ['text']), [{name: 'bold', value: true, start: 1, end: 3}])
+    assert.deepStrictEqual(Automerge.getHeads(loaded), Automerge.getHeads(doc))
+    assert.deepStrictEqual(Automerge.save(loaded), saved)
+  })
+})
+
+describeLive('mark order in saved documents', () => {
+  it('writes documents the Rust implementation loads when an end sorts before its begin', () => {
+    const actor = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    let doc = Automerge.from({text: 'a😀b'}, {actor})
+    doc = Automerge.change(doc, {time: 0}, draft => {
+      Automerge.mark(draft, ['text'], {start: 0, end: 1, expand: 'none'}, 'em', true)
+    })
+    const objectId = Automerge.getObjectId(doc, 'text')
+    const elemId = Automerge.getCursor(doc, ['text'], 1)
+    ;[doc] = Automerge.applyChanges(doc, [markChange(doc, actor,
+      {action: 'markBegin', obj: objectId, elemId, insert: true, name: 'link', value: true, expand: false, pred: []},
+      {action: 'markEnd', obj: objectId, elemId, insert: true, expand: false, pred: []})])
+    const [modern] = Modern.applyChanges(Modern.init(), Automerge.getAllChanges(doc))
+    assert.throws(() => Modern.load(Modern.save(modern)), /invalid mark operation order/)
+
+    const loaded = Modern.load(Automerge.save(doc))
+    assert.deepStrictEqual(Modern.marks(loaded, ['text']), Automerge.marks(doc, ['text']))
+    assert.deepStrictEqual(Modern.getHeads(loaded), Automerge.getHeads(doc))
+    const reloaded = Automerge.load(Modern.save(modern))
+    assert.deepStrictEqual(Modern.marks(Modern.load(Automerge.save(reloaded)), ['text']), Automerge.marks(doc, ['text']))
   })
 })

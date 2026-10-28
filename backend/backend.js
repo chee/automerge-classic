@@ -86,7 +86,9 @@ function applyLocalChange(backend, change) {
  * Returns the state of the document serialised to an Uint8Array.
  */
 function save(backend) {
-  return backendState(backend, true).save()
+  const state = backendState(backend, true)
+  const doc = state.save()
+  return state.marksInOrder() ? doc : state.saveSince([])
 }
 
 function saveIncremental(backend) {
