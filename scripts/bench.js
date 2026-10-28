@@ -22,25 +22,63 @@ function bigDoc(A) {
 }
 
 function largeDoc(A) {
-  let doc = A.from({text: '', list: [], map: {}})
+  let doc = A.from({text: '', list: [], map: {}}), mid, prev
   for (let i = 0; i < 5000; i++) {
+    if (i === 2500) mid = A.getHeads(doc)
+    if (i === 4999) prev = A.getHeads(doc)
     doc = A.change(doc, d => {
       A.splice(d, ['text'], (i * 7919) % (d.text.length + 1), 0, 'lorem ipsum dolor ')
       d.list.push({n: i, s: 'item' + i})
       d.map['key' + (i % 500)] = i
     })
   }
-  return doc
+  return {doc, mid, prev}
 }
 
 let large
 
 function largeContext(A) {
   if (!large) {
-    const doc = largeDoc(A)
-    large = {doc, bytes: A.save(doc)}
+    large = largeDoc(A)
+    large.bytes = A.save(large.doc)
   }
-  return {...large, unsaved: A.change(A.clone(large.doc), d => { d.map.key0 = -1 })}
+  return {...large, unsaved: A.change(A.clone(large.doc), d => { d.map.key0 = -1 }), fresh: A.clone(large.doc)}
+}
+
+function loadedContext(A) {
+  const ctx = largeContext(A)
+  return {...ctx, loaded: A.load(ctx.bytes)}
+}
+
+function markedContext(A) {
+  let doc = A.from({text: ''})
+  doc = A.change(doc, d => {
+    for (let i = 0; i < 500; i++) A.splice(d, ['text'], d.text.length, 0, 'lorem ipsum ')
+    for (let i = 0; i < 100; i++) A.mark(d, ['text'], {start: i * 50, end: i * 50 + 20, expand: 'both'}, 'bold', true)
+  })
+  return {doc}
+}
+
+function branchesContext(A) {
+  const base = bigDoc(A)
+  let left = A.clone(base), right = A.clone(base)
+  for (let i = 0; i < 200; i++) {
+    left = A.change(left, d => { d.list.push(i) })
+    right = A.change(right, d => { A.splice(d, ['text'], i, 0, 'z'); d.map['k' + i] = i })
+  }
+  return {left, right}
+}
+
+function sequentialDiffs(A, doc, edit) {
+  let heads = A.getHeads(doc)
+  const out = []
+  for (let i = 0; i < 20; i++) {
+    const before = heads
+    doc = A.change(doc, d => edit(d, i))
+    heads = A.getHeads(doc)
+    out.push(A.diff(doc, before, heads))
+  }
+  return out
 }
 
 const WORKLOADS = {
@@ -177,7 +215,31 @@ const WORKLOADS = {
     const before = A.getHeads(ctx.doc)
     let doc = A.change(ctx.doc, d => { for (let i = 0; i < 500; i++) d.list.push(i) })
     return A.diff(doc, before, A.getHeads(doc))
-  }
+  },
+
+  'diff: large doc, 20 sequential list edits': [largeContext, (A, ctx) =>
+    sequentialDiffs(A, ctx.fresh, (d, i) => { d.list.push({n: i}) })],
+
+  'diff: large doc, 20 sequential text edits': [largeContext, (A, ctx) =>
+    sequentialDiffs(A, ctx.fresh, d => { A.splice(d, ['text'], 100, 0, 'z') })],
+
+  'diff: large doc, midpoint to current': [largeContext, (A, ctx) =>
+    A.diff(ctx.doc, ctx.mid, A.getHeads(ctx.doc))],
+
+  'diff: large doc, current to midpoint': [largeContext, (A, ctx) =>
+    A.diff(ctx.doc, A.getHeads(ctx.doc), ctx.mid)],
+
+  'diff: loaded large doc, last change': [loadedContext, (A, ctx) =>
+    A.diff(ctx.loaded, ctx.prev, A.getHeads(ctx.loaded))],
+
+  'diff: marked text, 20 sequential edits': [markedContext, (A, ctx) =>
+    sequentialDiffs(A, ctx.doc, (d, i) => { A.splice(d, ['text'], i * 50 + 10, 0, 'z') })],
+
+  'diff: across merge of 200-change branches': [branchesContext, (A, ctx) => {
+    const before = A.getHeads(ctx.left)
+    const merged = A.merge(ctx.left, ctx.right)
+    return A.diff(merged, before, A.getHeads(merged))
+  }]
 
 }
 
