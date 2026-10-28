@@ -18,6 +18,8 @@ const PRED_COLUMN_IDS = CHANGE_COLUMNS
 const COLUMN_OPERATIONS = new WeakMap()
 const COLUMN_DATA = new WeakMap()
 const COLUMN_SPLICES = new WeakMap()
+const SEQUENCE_INSERTS = new WeakMap()
+const CHANGE_MAX_OPS = new WeakMap()
 const COLUMN_SLAB_OPTIONS = {slabRows: 24}
 
 function operationValueCount(column, value) {
@@ -2251,6 +2253,25 @@ function buildCursorIndex(blocks, actorIds, objectId) {
   return byId
 }
 
+function blockInserts(block, actorIds, objectId, counter, actor) {
+  let byObject = SEQUENCE_INSERTS.get(block.columns)
+  if (!byObject) SEQUENCE_INSERTS.set(block.columns, byObject = new Map())
+  let entries = byObject.get(objectId)
+  if (entries) return entries
+  entries = []
+  for (const op of columnOperationCache(block.columns).operations) {
+    if (op[objCtrIdx] !== counter || op[objActorIdx] !== actor || !op[insertIdx]) continue
+    const id = `${op[idCtrIdx]}@${actorIds[op[idActorIdx]]}`
+    const ref = op[keyCtrIdx] === 0 ? '_head' : `${op[keyCtrIdx]}@${actorIds[op[keyActorIdx]]}`
+    const mark = ACTIONS[op[actionIdx]] !== 'mark' ? null : op[markNameIdx] === null
+      ? {begin: false, expand: !!op[expandIdx]}
+      : {begin: true, name: op[markNameIdx], value: decodeValue(op[valLenIdx], op[valRawIdx]).value, expand: !!op[expandIdx]}
+    entries.push({id, ref, mark, counter: op[idCtrIdx], actor: op[idActorIdx]})
+  }
+  byObject.set(objectId, entries)
+  return entries
+}
+
 function insertAnchor(elems, ref) {
   const candidates = [{ref, id: null}]
   const start = ref === '_head' ? 0 : elems.findIndex(e => e.id === ref) + 1
@@ -2389,20 +2410,24 @@ class BackendDoc {
   }
 
   sequenceElements(objectId) {
-    const object = parseOpId(objectId), elems = [], counters = []
-    for (const block of this.blocks) {
-      for (const column of block.columns) column.decoder.reset()
-      while (!block.columns[actionIdx].decoder.done) {
-        const op = readOperation(block.columns, this.actorIds)
-        if (op[objCtrIdx] !== object.counter || op[objActorIdx] !== object.actorId || op[keyStrIdx] !== null) continue
+    const {counter, actorId} = parseOpId(objectId), elems = [], counters = []
+    const actor = this.actorIndexById.get(actorId)
+    if (actor === undefined) return elems
+    for (let index = findBlock(this.blocks, this.actorIds, actorId, counter, null); index < this.blocks.length; index++) {
+      const block = this.blocks[index]
+      const entries = blockInserts(block, this.actorIds, objectId, counter, actor)
+      let next = 0
+      for (const op of columnOperationCache(block.columns).operations) {
+        if (op[objCtrIdx] !== counter || op[objActorIdx] !== actor || op[keyStrIdx] !== null) continue
         const action = ACTIONS[op[actionIdx]], visible = visibleRow(op, op[succNumIdx], counters)
         if (op[insertIdx]) {
           const mark = action !== 'mark' ? null : op[markNameIdx] === null ? 'end' : 'begin'
-          elems.push({id: `${op[idCtrIdx]}@${op[idActorIdx]}`, mark, expand: !!op[expandIdx], visible})
+          elems.push({id: entries[next++].id, mark, expand: !!op[expandIdx], visible})
         } else if (visible) {
           elems[elems.length - 1].visible = true
         }
       }
+      if (compareBlockObject(block, this.actorIds, actorId, counter) > 0) break
     }
     return elems
   }
@@ -2531,6 +2556,7 @@ class BackendDoc {
     // Update the document state only if `applyChanges` does not throw an exception
     for (let change of allApplied) {
       this.changes.push(change.buffer)
+      CHANGE_MAX_OPS.set(change.buffer, change.maxOp)
       this.historyHashes.push(change.hash)
       if (!this.hashesByActor[change.actor]) this.hashesByActor[change.actor] = []
       this.hashesByActor[change.actor][change.seq - 1] = change.hash
@@ -2825,8 +2851,11 @@ class BackendDoc {
 
   opClock(clock) {
     if (!this.haveHashGraph) this.computeHashGraph()
-    return this.actorIds.map(actor => (clock[actor] > 0
-      ? changeMeta(this.changes[this.changeIndexByHash[this.hashesByActor[actor][clock[actor] - 1]]]).maxOp : 0))
+    return this.actorIds.map(actor => {
+      if (!(clock[actor] > 0)) return 0
+      const buffer = this.changes[this.changeIndexByHash[this.hashesByActor[actor][clock[actor] - 1]]]
+      return CHANGE_MAX_OPS.get(buffer) ?? changeMeta(buffer).maxOp
+    })
   }
 
   viewAt(heads) {
@@ -2845,16 +2874,8 @@ class BackendDoc {
     if (actor === undefined) return inserts
     for (let index = findBlock(this.blocks, this.actorIds, actorId, counter, null); index < this.blocks.length; index++) {
       const block = this.blocks[index]
-      for (const op of columnOperationCache(block.columns).operations) {
-        if (op[objCtrIdx] !== counter || op[objActorIdx] !== actor || !op[insertIdx]) continue
-        if (clock && !(op[idCtrIdx] <= clock[op[idActorIdx]])) continue
-        const id = `${op[idCtrIdx]}@${this.actorIds[op[idActorIdx]]}`
-        const ref = op[keyCtrIdx] === 0 ? '_head' : `${op[keyCtrIdx]}@${this.actorIds[op[keyActorIdx]]}`
-        const mark = ACTIONS[op[actionIdx]] !== 'mark' ? null : op[markNameIdx] === null
-          ? {begin: false, expand: !!op[expandIdx]}
-          : {begin: true, name: op[markNameIdx], value: decodeValue(op[valLenIdx], op[valRawIdx]).value, expand: !!op[expandIdx]}
-        inserts.push({id, ref, mark})
-      }
+      const entries = blockInserts(block, this.actorIds, objectId, counter, actor)
+      for (const entry of entries) if (!clock || entry.counter <= clock[entry.actor]) inserts.push(entry)
       if (compareBlockObject(block, this.actorIds, actorId, counter) > 0) break
     }
     return inserts

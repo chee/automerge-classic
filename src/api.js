@@ -1099,7 +1099,9 @@ function objectsBetweenHeads(doc, beforeHeads, afterHeads) {
   const state = Frontend.getBackendState(doc, 'diff')
   const objects = new Set()
   for (const bytes of backend.getChanges(state, beforeHeads).concat(backend.getChanges(state, afterHeads))) {
-    for (const op of decodeChange(bytes, true).ops) objects.add(op.obj)
+    for (const op of decodeChange(bytes, true).ops) {
+      if (op.action === 'markBegin' || op.action === 'markEnd') objects.add(op.obj)
+    }
   }
   return objects
 }
@@ -1148,7 +1150,9 @@ function changeScope(changes, before, after) {
     // a batch can contain changes the previous state already had, and those
     // are part of it rather than left out of it
     if ((clock[change.actor] || 0) >= change.seq) continue
-    for (const op of change.ops) objects.add(op.obj)
+    for (const op of change.ops) {
+      if (op.action === 'markBegin' || op.action === 'markEnd') objects.add(op.obj)
+    }
   }
   return {objects, clock: Frontend.getBackendState(after).state.opClock(clock)}
 }
@@ -1403,7 +1407,7 @@ function documentHasMarkOps(doc, text) {
 
 function markRangesForText(doc, text, clock) {
   if (!documentHasMarkOps(doc, text)) {
-    return {text, values: new Array(text.length).fill(NO_MARKS), ranges: []}
+    return {text, values: new Array(text.length).fill(NO_MARKS)}
   }
   const objectId = Frontend.getObjectId(text)
   // Mark boundaries are elements of the text sequence in the Rust
@@ -1441,20 +1445,20 @@ function markRangesForText(doc, text, clock) {
     }
   }
   const state = Frontend.getBackendState(doc)
-  for (const {id, ref, mark} of (state.source || state.state).sequenceInserts(objectId, clock || state.clock)) {
-    inserts.set(id, ref)
-    if (mark) markers.set(id, mark)
-  }
-  const scanned = inserts.size
+  const sequence = (state.source || state.state).sequenceInserts(objectId, clock || state.clock)
   if (text.context) {
+    for (const {id, ref, mark} of sequence) {
+      inserts.set(id, ref)
+      if (mark) markers.set(id, mark)
+    }
     const size = text.context.ops.reduce((total, op) =>
       total + (op.values ? op.values.length : (op.multiOp || 1)), 0)
     scanOps(text.context.ops, text.context.actorId, text.context.nextOpNum - size)
   }
 
   // Without mark boundaries there is nothing for the sequence walk to resolve
-  if (markers.size === 0) {
-    return {text, values: new Array(text.length).fill(NO_MARKS), ranges: []}
+  if (markers.size === 0 && !sequence.some(insert => insert.mark)) {
+    return {text, values: new Array(text.length).fill(NO_MARKS)}
   }
 
   // Order the children of each element in descending operation-ID order, the
@@ -1463,8 +1467,8 @@ function markRangesForText(doc, text, clock) {
   // and instead makes locally-authored insertions anchor on an adjacent
   // sticky mark boundary at authoring time (see adjustInsertAnchors in the
   // backend), so the wire format alone determines the placement.
-  let order = inserts.keys()
-  if (inserts.size !== scanned) {
+  let order = sequence
+  if (inserts.size > sequence.length) {
     const childrenOf = new Map()
     for (const [elemId, ref] of inserts) {
       if (!childrenOf.has(ref)) childrenOf.set(ref, [])
@@ -1481,7 +1485,7 @@ function markRangesForText(doc, text, clock) {
     const stack = (childrenOf.get('_head') || []).slice().reverse()
     while (stack.length > 0) {
       const elemId = stack.pop()
-      order.push(elemId)
+      order.push({id: elemId, mark: markers.get(elemId)})
       const children = childrenOf.get(elemId)
       if (children) for (let i = children.length - 1; i >= 0; i--) stack.push(children[i])
     }
@@ -1491,12 +1495,11 @@ function markRangesForText(doc, text, clock) {
   // markBegin with the preceding operation ID (mark() always creates them as
   // consecutive operations). For each visible element, the active mark with
   // the highest operation ID provides the value for each mark name.
-  const visibleIds = new Set(text.elems.map(elem => elem.elemId))
+  const elems = text.elems
   const boundaries = new Map()   // markBegin opId -> {name, value, start, end}
   const active = new Map()       // markBegin opId -> same object
   let visibleCount = 0
-  for (const elemId of order) {
-    const marker = markers.get(elemId)
+  for (const {id: elemId, mark: marker} of order) {
     if (marker) {
       if (marker.begin) {
         const boundary = {name: marker.name, value: marker.value, start: visibleCount, end: undefined, id: elemId}
@@ -1511,7 +1514,7 @@ function markRangesForText(doc, text, clock) {
           active.delete(beginId)
         }
       }
-    } else if (visibleIds.has(elemId)) {
+    } else if (visibleCount < elems.length && elems[visibleCount].elemId === elemId) {
       visibleCount++
     }
   }
@@ -1524,7 +1527,7 @@ function markRangesForText(doc, text, clock) {
     return parseInt(leftId[0], 10) - parseInt(rightId[0], 10) || leftId[1].localeCompare(rightId[1])
   })
   const values = markValuesPerElement(operations, text.length)
-  return {text, values, ranges: markRangesFromValues(values, text)}
+  return {text, values}
 }
 
 /**
@@ -1532,12 +1535,15 @@ function markRangesForText(doc, text, clock) {
  * applies to each element of the text. A null value removes the mark.
  */
 function markValuesPerElement(operations, length) {
-  if (operations.length === 0) return new Array(length).fill(NO_MARKS)
-  const values = Array.from({length}, () => ({}))
+  const values = new Array(length).fill(NO_MARKS)
   for (const operation of operations) {
     for (let index = operation.start; index < operation.end; index++) {
-      if (operation.value === null) delete values[index][operation.name]
-      else values[index][operation.name] = operation.value
+      if (operation.value === null) {
+        if (values[index] !== NO_MARKS) delete values[index][operation.name]
+      } else {
+        if (values[index] === NO_MARKS) values[index] = {}
+        values[index][operation.name] = operation.value
+      }
     }
   }
   return values
@@ -1569,7 +1575,8 @@ function markRangesFromValues(values, text) {
 }
 
 export function marks(doc, path) {
-  return markRanges(doc, path).ranges.map(range => Object.assign({}, range))
+  const state = markRanges(doc, path)
+  return markRangesFromValues(state.values, state.text).map(range => Object.assign({}, range))
 }
 
 export function marksAt(doc, path, index) {
@@ -1798,7 +1805,7 @@ export function updateSpans(doc, path, newSpans, config = {}) {
   function expandFor(name) { return config.perMarkExpand && config.perMarkExpand[name] || defaultExpand }
   const updated = richTextTarget(doc, path, 0, 'updateSpans', true)
   const currentDoc = updated.text.context.cache._root
-  const currentMarks = markRangesForText(currentDoc, updated.text).ranges
+  const currentMarks = markRangesFromValues(markRangesForText(currentDoc, updated.text).values, updated.text)
   for (const range of currentMarks) {
     if (!nextMarks.some(nextMark => markEqual(range, nextMark))) {
       unmark(doc, path, {start: range.start, end: range.end, expand: expandFor(range.name)}, range.name)
