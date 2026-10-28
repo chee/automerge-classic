@@ -205,25 +205,9 @@ function updateVisibleMapOps(visibleMapOps, op) {
   visibleMapOps.changes.set(property, values)
 }
 
-/**
- * Updates `objectTree`, which is a tree of nested objects, so that afterwards
- * `objectTree[path[0]][path[1]][...] === value`. Only the root object is mutated, whereas any
- * nested objects are copied before updating. This means that once the root object has been
- * shallow-copied, this function can be used to update it without mutating the previous version.
- */
-function deepCopyUpdate(objectTree, path, value) {
-  if (path.length === 1) {
-    objectTree[path[0]] = value
-  } else {
-    let child = Object.assign({}, objectTree[path[0]])
-    deepCopyUpdate(child, path.slice(1), value)
-    objectTree[path[0]] = child
-  }
-}
-
-function writableObjectMeta(docState) {
-  if (docState.objectMeta === docState.sharedObjectMeta) docState.objectMeta = Object.assign({}, docState.objectMeta)
-  return docState.objectMeta
+function setMeta(docState, target, key, value) {
+  if (docState.metaUndo) docState.metaUndo.push(target, key, target[key])
+  target[key] = value
 }
 
 function visibleRow(row, succNum, counters) {
@@ -1267,15 +1251,20 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   // When the change contains a new make* operation (i.e. with an even-numbered action), record the
   // new parent-child relationship in objectMeta. TODO: also handle link/move operations.
   if (op[actionIdx] % 2 === 0 && !docState.objectMeta[opId]) {
-    const objectMeta = writableObjectMeta(docState)
-    objectMeta[opId] = {parentObj: objectId, parentKey: elemId, opId, type, children: {}}
-    deepCopyUpdate(objectMeta, [objectId, 'children', elemId, opId], {objectId: opId, type, props: {}})
+    setMeta(docState, docState.objectMeta, opId, {parentObj: objectId, parentKey: elemId, opId, type, children: {}})
+    const parent = docState.objectMeta[objectId]
+    if (!parent.hasChildren) setMeta(docState, parent, 'hasChildren', true)
+    setMeta(docState, parent.children, elemId, Object.assign({}, parent.children[elemId], {[opId]: {objectId: opId, type, props: {}}}))
   }
 
+  const propKey = op[keyStrIdx] !== null ? op[keyStrIdx] : op[insertIdx]
+    ? op[idCtrIdx] * docState.actorIds.length + op[idActorIdx]
+    : op[keyCtrIdx] * docState.actorIds.length + op[keyActorIdx]
+
   // firstOp is true if the current operation is the first of a sequence of ops for the same key
-  let prop = propState.get(elemId)
+  let prop = propState.get(propKey)
   const firstOp = !prop
-  if (!prop) propState.set(elemId, prop = {visibleOps: [], hasChild: false})
+  if (!prop) propState.set(propKey, prop = {visibleOps: [], hasChild: false})
 
   // An operation is overwritten if it is a document operation that has at least one successor
   const isOverwritten = (oldSuccNum !== undefined && op[succNumIdx] > 0)
@@ -1353,7 +1342,8 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
   // all of the visible values of the property (even the non-child-object values). Then, when we
   // subsequently process an update within that child object, we can construct the patch to
   // contain the conflicting values.
-  const prevChildren = docState.objectMeta[objectId].children[elemId]
+  const meta = docState.objectMeta[objectId]
+  const prevChildren = prop.hasChild || !meta.hasChildren ? undefined : meta.children[elemId]
   if (prop.hasChild || (prevChildren && Object.keys(prevChildren).length > 0)) {
     let values = {}
     for (let visible of prop.visibleOps) {
@@ -1369,7 +1359,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
     }
 
     // Copy so that objectMeta is not modified if an exception is thrown while applying change
-    deepCopyUpdate(writableObjectMeta(docState), [objectId, 'children', elemId], values)
+    setMeta(docState, meta.children, elemId, values)
   }
 
   let patchKey = emissions.length > 0 ? emissions[0][0] : undefined
@@ -2401,7 +2391,9 @@ class BackendDoc {
     copy.heads = this.heads // immutable, no copying needed
     copy.clock = this.clock // immutable, no copying needed
     copy.blocks = this.blocks // immutable, no copying needed
-    copy.objectMeta = this.objectMeta // immutable, no copying needed
+    copy.objectMeta = this.objectMeta
+    copy.sharedObjectMeta = this.objectMeta
+    this.sharedObjectMeta = this.objectMeta
     copy.visibleMapOps = new Map(this.visibleMapOps)
     copy.cursorIndex = this.cursorIndex
     copy.objectsWithMarks = new Set(this.objectsWithMarks)
@@ -2447,6 +2439,10 @@ class BackendDoc {
       }
     }
     if (queue.length > 1) queue = topologicalOrder(queue, this.changeIndexByHash)
+    if (this.objectMeta === this.sharedObjectMeta) {
+      this.objectMeta = Object.fromEntries(Object.entries(this.objectMeta)
+        .map(([objectId, meta]) => [objectId, Object.assign({}, meta, {children: Object.assign({}, meta.children)})]))
+    }
 
     let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
     let docState = {
@@ -2460,28 +2456,37 @@ class BackendDoc {
       blocks: this.blocks.slice(),
       visibleMapOps: {base: this.visibleMapOps, changes: new Map()},
       objectMeta: this.objectMeta,
-      sharedObjectMeta: this.objectMeta,
+      metaUndo: [],
       objectsWithMarks: new Set(this.objectsWithMarks)
     }
     let allApplied = [], objectIds = new Set()
 
-    while (true) {
-      const [applied, enqueued] = applyChanges(patches, queue, docState, objectIds, this.haveHashGraph)
-      queue = enqueued
-      for (const change of applied) docState.appliedHashes.add(change.hash)
-      if (applied.length > 0) allApplied = allApplied.concat(applied)
-      if (queue.length === 0) break
+    try {
+      while (true) {
+        const [applied, enqueued] = applyChanges(patches, queue, docState, objectIds, this.haveHashGraph)
+        queue = enqueued
+        for (const change of applied) docState.appliedHashes.add(change.hash)
+        if (applied.length > 0) allApplied = allApplied.concat(applied)
+        if (queue.length === 0) break
 
-      // If we are missing a dependency, and we haven't computed the hash graph yet, first compute
-      // the hashes to see if we actually have it already
-      if (applied.length === 0) {
-        if (this.haveHashGraph) break
-        this.computeHashGraph()
-        docState.changeIndexByHash = this.changeIndexByHash
+        // If we are missing a dependency, and we haven't computed the hash graph yet, first compute
+        // the hashes to see if we actually have it already
+        if (applied.length === 0) {
+          if (this.haveHashGraph) break
+          this.computeHashGraph()
+          docState.changeIndexByHash = this.changeIndexByHash
+        }
       }
-    }
 
-    setupPatches(patches, objectIds, docState)
+      setupPatches(patches, objectIds, docState)
+    } catch (e) {
+      const undo = docState.metaUndo
+      for (let i = undo.length - 3; i >= 0; i -= 3) {
+        if (undo[i + 2] === undefined) delete undo[i][undo[i + 1]]
+        else undo[i][undo[i + 1]] = undo[i + 2]
+      }
+      throw e
+    }
 
     if (allApplied.length > 0 && !this.changesEncoders) {
       this.changesEncoders = copyDocumentChanges(this.changesColumns, this.changes.length)

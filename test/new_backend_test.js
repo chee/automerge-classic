@@ -2386,4 +2386,29 @@ describe('BackendDoc applying changes', () => {
       succCtr:   []
     })
   })
+
+  it('should leave object metadata untouched when a change fails, and keep clones apart', () => {
+    const actor = uuid()
+    const change1 = {actor, seq: 1, startOp: 1, time: 0, deps: [], ops: [
+      {action: 'makeMap', obj: '_root', key: 'm', pred: []},
+      {action: 'set', obj: `1@${actor}`, key: 'x', value: 1, pred: []}
+    ]}
+    const bad = {actor, seq: 2, startOp: 3, time: 0, deps: [hash(change1)], ops: [
+      {action: 'makeMap', obj: '_root', key: 'm', pred: [`1@${actor}`]},
+      {action: 'makeList', obj: `1@${actor}`, key: 'l', pred: []},
+      {action: 'set', obj: '_root', key: 'z', value: 1, pred: [`9@${actor}`]}
+    ]}
+    const good = {actor, seq: 2, startOp: 3, time: 0, deps: [hash(change1)], ops: [
+      {action: 'makeList', obj: `1@${actor}`, key: 'l', pred: []}
+    ]}
+    const backend = new BackendDoc()
+    backend.applyChanges([encodeChange(change1)])
+    const copy = backend.clone()
+    const before = JSON.stringify(backend.objectMeta)
+    assert.throws(() => backend.applyChanges([encodeChange(bad)]))
+    assert.strictEqual(JSON.stringify(backend.objectMeta), before)
+    backend.applyChanges([encodeChange(good)])
+    assert.strictEqual(backend.objectMeta[`3@${actor}`].parentObj, `1@${actor}`)
+    assert.strictEqual(JSON.stringify(copy.objectMeta), before)
+  })
 })

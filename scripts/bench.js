@@ -40,7 +40,7 @@ function largeContext(A) {
     const doc = largeDoc(A)
     large = {doc, bytes: A.save(doc)}
   }
-  return {...large, unsaved: A.change(large.doc, d => { d.map.key0 = -1 })}
+  return {...large, unsaved: A.change(A.clone(large.doc), d => { d.map.key0 = -1 })}
 }
 
 const WORKLOADS = {
