@@ -1,6 +1,6 @@
 {
   "name": "@chee/automerge-js",
-  "version": "0.0.0-experimental.1",
+  "version": "0.0.0-experimental.2",
   "license": "MIT",
   "exports": {
     ".": "./src/automerge.js",
