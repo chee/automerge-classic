@@ -26,6 +26,7 @@ const SEQUENCE_INSERTS = new WeakMap()
 const SEQUENCE_ELEMENTS = new WeakMap()
 const BLOCK_OBJECTS = new WeakMap()
 const BLOCK_MARKS = new WeakMap()
+const MARK_STEPS = new WeakMap()
 const HEADS_CLOCKS = new Map()
 const CHANGE_TARGETS = new WeakMap()
 const LOADED_DOCUMENTS = new WeakMap()
@@ -274,7 +275,7 @@ function visibleRow(row, succNum, counters) {
 
 function seekWithinOperations(target, cache, actorIds, resumeInsertion) {
   const rows = cache.operations
-  const {objActor, objActorNum, objCtr, keyActor, keyCtr, keyStr, idActor, idCtr, insert} = target
+  const {objActor, objActorNum, objCtr, keyActor, keyActorNum, keyCtr, keyStr, idActor, idCtr, insert} = target
   let index = 0
 
   if (objCtr !== null && !resumeInsertion) {
@@ -328,13 +329,14 @@ function seekWithinOperations(target, cache, actorIds, resumeInsertion) {
   let found = insert && (resumeInsertion || !hasRef), visibleCount = 0, elemVisible = false
   const counters = []
   for (; index < rows.length; index++) {
-    const row = rows[index], rowIdActor = actorIds[row[idActorIdx]]
+    const row = rows[index]
     if (row[objCtrIdx] !== objCtr || row[objActorIdx] !== objActorNum) break
-    const isRef = row[insertIdx] && row[idCtrIdx] === keyCtr && rowIdActor === keyActor
+    const isRef = row[insertIdx] && row[idCtrIdx] === keyCtr && row[idActorIdx] === keyActorNum
     if (isRef && !insert) return {found: true, skipCount: index, visibleCount}
-    if (found && row[insertIdx] && (row[idCtrIdx] < idCtr || (row[idCtrIdx] === idCtr && rowIdActor <= idActor))) break
+    if (found && row[insertIdx] && (row[idCtrIdx] < idCtr || (row[idCtrIdx] === idCtr && actorIds[row[idActorIdx]] <= idActor))) break
     if (row[insertIdx]) elemVisible = false
-    if (!elemVisible && visibleRow(row, row[succNumIdx], counters)) {
+    if (!elemVisible && (counters.length === 0 && row[succNumIdx] === 0 && row[actionIdx] !== INC_ACTION && row[actionIdx] !== MARK_ACTION ||
+        visibleRow(row, row[succNumIdx], counters))) {
       visibleCount++
       elemVisible = true
     }
@@ -2631,6 +2633,45 @@ function findElem(seq, counter, actorId, actor) {
   return undefined
 }
 
+function rowAnchor(doc, op) {
+  if (op.elemId === '_head') return null
+  const obj = parseOpId(op.obj), objActor = doc.actorIndexById.get(obj.actorId)
+  const {counter, actorId} = parseOpId(op.elemId), actor = doc.actorIndexById.get(actorId)
+  if (objActor === undefined || actor === undefined) return null
+  const candidates = [op.elemId], counters = []
+  let found = false, plain = false
+  for (let index = findBlock(doc.blocks, doc.actorIds, obj.actorId, obj.counter, null); index < doc.blocks.length; index++) {
+    const block = doc.blocks[index]
+    if (found || bloomFilterContains(block.bloom, actor, counter)) {
+      const rows = columnOperationCache(block.columns).operations
+      let i = 0
+      if (!found) {
+        while (i < rows.length && (rows[i][idCtrIdx] !== counter || rows[i][idActorIdx] !== actor || !rows[i][insertIdx])) i++
+        found = i++ < rows.length
+      }
+      for (; i < rows.length; i++) {
+        const row = rows[i]
+        if (row[objCtrIdx] !== obj.counter || row[objActorIdx] !== objActor) return candidates[candidates.length - 1]
+        const visible = visibleRow(row, row[succNumIdx], counters)
+        if (!row[insertIdx]) {
+          if (visible && plain) return candidates[candidates.length - 1]
+        } else if (row[actionIdx] !== MARK_ACTION) {
+          if (visible) return candidates[candidates.length - 1]
+          plain = true
+        } else {
+          plain = false
+          const id = `${row[idCtrIdx]}@${doc.actorIds[row[idActorIdx]]}`
+          const begin = row[markNameIdx] === null ? candidates.indexOf(`${row[idCtrIdx] - 1}@${doc.actorIds[row[idActorIdx]]}`, 1) : -1
+          if (begin >= 0) candidates.length = begin
+          else if ((row[markNameIdx] !== null) === !!row[expandIdx]) candidates.push(id)
+        }
+      }
+    }
+    if (!found && compareBlockObject(block, doc.actorIds, obj.actorId, obj.counter) > 0) return null
+  }
+  return found ? candidates[candidates.length - 1] : null
+}
+
 function insertAnchor(seq, ref) {
   let part = 0, index = 0
   if (ref !== '_head') {
@@ -2667,7 +2708,7 @@ function insertAnchor(seq, ref) {
 }
 
 const SAME = 0, ADD = 1, DEL = 2
-const NO_MARKS = new Map(), NULL_VALUE = {value: null}, NO_MARK_DIFF = {before: null, after: null}
+const NO_MARKS = new Map(), NO_MACHINE = {state: [], current: NO_MARKS, begin: null, from: null}, NULL_VALUE = {value: null}, NO_MARK_DIFF = {before: null, after: null}
 const SET_ACTION = ACTIONS.indexOf('set'), DEL_ACTION = ACTIONS.indexOf('del'), INC_ACTION = ACTIONS.indexOf('inc'),
   MARK_ACTION = ACTIONS.indexOf('mark'), MAKE_MAP_ACTION = ACTIONS.indexOf('makeMap')
 
@@ -2715,11 +2756,15 @@ function blockObjects(block) {
   if (objects) return objects
   objects = new Map()
   const rows = columnOperationCache(block.columns).operations
-  let start = 0
-  for (let i = 1; i <= rows.length; i++) {
-    if (i < rows.length && rows[i][objCtrIdx] === rows[start][objCtrIdx] && rows[i][objActorIdx] === rows[start][objActorIdx]) continue
-    objects.set(rows[start][objCtrIdx] === null ? '_root' : `${rows[start][objCtrIdx]}@${rows[start][objActorIdx]}`, {start, end: i})
-    start = i
+  for (let start = 0; start < rows.length;) {
+    const ctr = rows[start][objCtrIdx], actor = rows[start][objActorIdx]
+    let end = rows.length
+    for (let low = start + 1; low < end;) {
+      const middle = (low + end) >>> 1
+      if (rows[middle][objCtrIdx] === ctr && rows[middle][objActorIdx] === actor) low = middle + 1; else end = middle
+    }
+    objects.set(ctr === null ? '_root' : `${ctr}@${actor}`, {start, end})
+    start = end
   }
   BLOCK_OBJECTS.set(block.columns, objects)
   return objects
@@ -2774,6 +2819,14 @@ function segmentSummary(segment, rows, type) {
   const maxCounters = [], children = [], marks = []
   let visible = 0
   for (let start = segment.start; start < segment.end;) {
+    const first = rows[start], action = first[actionIdx]
+    if (type !== 'map' && first[insertIdx] && first[succNumIdx] === 0 && (action === SET_ACTION || action === MARK_ACTION) &&
+        (start + 1 === segment.end || rows[start + 1][insertIdx])) {
+      if (!(first[idCtrIdx] <= maxCounters[first[idActorIdx]])) maxCounters[first[idActorIdx]] = first[idCtrIdx]
+      if (action === MARK_ACTION) marks.push(first); else visible += type === 'text' ? textWidth(first) : 1
+      start++
+      continue
+    }
     const end = groupEnd(rows, start, segment.end, type), incs = type === 'text' ? null : groupIncrements(rows, start, end)
     let top = null
     for (let i = start; i < end; i++) {
@@ -3626,48 +3679,63 @@ function documentDiff(doc, beforeClock, afterClock, objectIds, valueOf, start, r
 function spliceMarks(ctx, event, actor) {
   if (!ctx.doc.objectsWithMarks.has(event.objectId)) return null
   const doc = ctx.doc, clock = ctx.after.slice(), {counter, actorId} = parseOpId(event.objectId)
-  const key = `${counter}@${doc.actorIndexById.get(actorId)}`, parts = [], machine = {state: [], current: NO_MARKS}
-  let blockIndex = findBlock(doc.blocks, doc.actorIds, actorId, counter, null), ended = false, index = 0
+  const key = `${counter}@${doc.actorIndexById.get(actorId)}`
+  let machine = NO_MACHINE, top = null, inMark = false, last = false
   clock[actor] = event.counter
-  function partAt(k) {
-    while (parts.length <= k && !ended && blockIndex < doc.blocks.length) {
-      const block = doc.blocks[blockIndex++], segment = blockObjects(block).get(key)
-      if (segment) parts.push({segment, operations: columnOperationCache(block.columns).operations})
-      ended = compareBlockObject(block, doc.actorIds, actorId, counter) > 0
-    }
-    return parts[k]
-  }
-  for (let k = 0; partAt(k) && index <= event.prop; k++) {
-    const {segment, operations} = parts[k], next = partAt(k + 1)
-    if (operations[segment.start][insertIdx] && (!next || next.operations[next.segment.start][insertIdx])) {
-      const summary = segmentSummary(segment, operations, 'text')
+  for (let index = findBlock(doc.blocks, doc.actorIds, actorId, counter, null); !last && index < doc.blocks.length; index++) {
+    const block = doc.blocks[index], segment = blockObjects(block).get(key)
+    last = compareBlockObject(block, doc.actorIds, actorId, counter) > 0
+    if (!segment) continue
+    const rows = columnOperationCache(block.columns).operations
+    if (opensGroup(block, key) && !bloomFilterContains(block.bloom, actor, event.counter) && (last || opensGroup(doc.blocks[index + 1], key))) {
+      const summary = segmentSummary(segment, rows, 'text')
       if (settledAt(summary, ctx.before, clock)) {
-        for (const mark of summary.marks) machineMark(machine, mark, ctx.actorRank)
-        index += summary.visible
+        if (inMark && top && top[actionIdx] === MARK_ACTION) machine = markStep(ctx, top, machine, null)
+        inMark = false
+        machine = markStep(ctx, summary, machine, summary.marks)
         continue
       }
     }
-    for (let i = segment.start; i < segment.end && index <= event.prop; i++) {
-      if (!operations[i][insertIdx]) continue
-      let topBefore = null, topAfter = null
-      for (let p = k, j = i; partAt(p) && (j === i && p === k || !parts[p].operations[j][insertIdx]);) {
-        const row = parts[p].operations[j]
-        if (visibleAt(row, ctx.before, null)) topBefore = row
-        if (visibleAt(row, clock, null)) topAfter = row
-        if (++j === parts[p].segment.end && partAt(++p)) j = parts[p].segment.start
+    for (let i = segment.start; i < segment.end; i++) {
+      const row = rows[i]
+      if (!inMark && row[actionIdx] !== MARK_ACTION && row[idCtrIdx] !== event.counter) continue
+      if (row[insertIdx]) {
+        if (inMark && top && top[actionIdx] === MARK_ACTION) machine = markStep(ctx, top, machine, null)
+        if (row[idCtrIdx] === event.counter && row[idActorIdx] === actor) {
+          return exportMarks({before: null, after: machine.current.size > 0 ? machine.current : null})
+        }
+        inMark = row[actionIdx] === MARK_ACTION
+        top = null
       }
-      if (!topAfter) continue
-      if (topAfter[actionIdx] === MARK_ACTION) {
-        machineMark(machine, topAfter, ctx.actorRank)
-      } else if (index === event.prop) {
-        if (topAfter === topBefore || topAfter[actionIdx] === MAKE_MAP_ACTION) return null
-        return exportMarks({before: null, after: machine.current.size > 0 ? machine.current : null})
-      } else {
-        index += textWidth(topAfter)
-      }
+      if (inMark && visibleAt(row, clock, null)) top = row
     }
   }
   return null
+}
+
+function opensGroup(block, key) {
+  const segment = block && blockObjects(block).get(key)
+  return !segment || columnOperationCache(block.columns).operations[segment.start][insertIdx]
+}
+
+function markStep(ctx, key, machine, rows) {
+  const step = MARK_STEPS.get(key)
+  if (step && step.from === machine && step.actorIds === ctx.doc.actorIds) return step.to
+  let to = machine
+  if (rows) {
+    for (const row of rows) to = markStep(ctx, row, to, null)
+  } else if (key[markNameIdx] === null && machine.begin && machine.begin[idCtrIdx] === key[idCtrIdx] - 1 && machine.begin[idActorIdx] === key[idActorIdx]) {
+    to = machine.from
+  } else {
+    to = {state: machine.state.slice(), current: machine.current, begin: null, from: null}
+    machineMark(to, key, ctx.actorRank)
+    if (key[markNameIdx] !== null && to.state.length > machine.state.length) {
+      to.begin = key
+      to.from = machine
+    }
+  }
+  MARK_STEPS.set(key, {from: machine, to, actorIds: ctx.doc.actorIds})
+  return to
 }
 
 function machineMark(machine, row, actorRank) {
@@ -3692,7 +3760,7 @@ function localPatches(doc, change, actor, startOp, afterClock, events, valueOf) 
   ctx.exposed = []
   const sorted = events.slice().sort((left, right) => compareObjectIds(left.objectId, right.objectId)).map(event => {
     if (event.kind === 'put' || event.kind === 'insert') return Object.assign({}, event, {value: valueOf(event.value), conflict: false})
-    if (event.kind === 'splice') return Object.assign({}, event, {marks: doc.objectsWithMarks.has(event.objectId) ? spliceMarks(ctx, event, actor) : null})
+    if (event.kind === 'splice') return {objectId: event.objectId, kind: 'splice', prop: event.prop, text: event.text, marks: doc.objectsWithMarks.has(event.objectId) ? spliceMarks(ctx, event, actor) : null}
     return event
   })
   return buildPatches(ctx, sorted)
@@ -3721,7 +3789,7 @@ function isolatedPatches(doc, current, scope, after, touched, change, actor, eve
   ctx.exposed = isolation.exposed
   const sorted = diffEvents.concat(events.map(event => {
     if (event.kind === 'put' || event.kind === 'insert') return Object.assign({}, event, {value: valueOf(event.value), conflict: false})
-    if (event.kind === 'splice') return Object.assign({}, event, {marks: spliceMarks(local, event, actor)})
+    if (event.kind === 'splice') return {objectId: event.objectId, kind: 'splice', prop: event.prop, text: event.text, marks: spliceMarks(local, event, actor)}
     return event
   })).sort((left, right) => compareObjectIds(left.objectId, right.objectId))
   return buildPatches(ctx, sorted)
@@ -3831,6 +3899,12 @@ class BackendDoc {
     const marked = new Set(this.objectsWithMarks)
     for (const op of change.ops) if (op.action === 'markBegin') marked.add(op.obj)
     if (!change.ops.some(op => op.insert && marked.has(op.obj))) return
+    const targets = change.ops.filter(op => marked.has(op.obj) && op.elemId !== undefined)
+    const anchor = !clock && targets.length === 1 && targets[0].insert ? rowAnchor(this, targets[0]) : null
+    if (anchor !== null) {
+      targets[0].elemId = anchor
+      return
+    }
     const elemIds = change.ops.map(op => op.elemId)
     if (!clock && this.anchorInserts(change, marked, true)) return
     change.ops.forEach((op, i) => { op.elemId = elemIds[i] })
