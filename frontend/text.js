@@ -1,6 +1,6 @@
 import { OBJECT_ID } from './constants.js'
 import { isObject } from '../src/common.js'
-const strings = new WeakMap(), offsets = new WeakMap(), widths = new WeakMap()
+const strings = new WeakMap(), widths = new WeakMap(), STRING = Symbol('string'), STARTS = Symbol('starts')
 const CHUNK_SIZE = 256
 class Text {
   constructor (text) {
@@ -105,7 +105,9 @@ class Text {
    * JSON serialization of an Automerge document represents text nicely.
    */
   toJSON() {
-    let str = strings.get(this.chunks)
+    let str = this[STRING]
+    if (str !== undefined) return str
+    str = strings.get(this.chunks)
     if (str !== undefined) return str
     str = ''
     for (const chunk of this.chunks) {
@@ -131,7 +133,7 @@ class Text {
       throw new RangeError('getWriteable() requires the objectId to be set')
     }
 
-    const instance = instantiateText(this[OBJECT_ID], this.chunks)
+    const instance = instantiateText(this[OBJECT_ID], this.chunks, this[STRING])
     instance.context = context
     instance.path = path
     return instance
@@ -195,11 +197,10 @@ function localElems(text) {
 }
 
 function chunkStarts(chunks) {
-  let starts = offsets.get(chunks)
-  if (starts) return starts
-  starts = [0]
+  if (chunks[STARTS]) return chunks[STARTS]
+  const starts = [0]
   for (const chunk of chunks) starts.push(starts[starts.length - 1] + chunk.length)
-  offsets.set(chunks, starts)
+  if (!Object.isFrozen(chunks)) chunks[STARTS] = starts
   return starts
 }
 
@@ -208,7 +209,7 @@ function elemWidth(elem) {
 }
 
 function textOffset(text, index) {
-  const string = strings.get(text.chunks)
+  const string = text[STRING] !== undefined ? text[STRING] : strings.get(text.chunks)
   if (string !== undefined && string.length === text.length) return index
   let offset = 0
   for (const chunk of text.chunks) {
@@ -257,14 +258,17 @@ function spliceChunks(chunks, index, deleteCount, elems) {
   } else {
     for (let i = 0; i < merged.length; i += CHUNK_SIZE) pieces.push(merged.slice(i, i + CHUNK_SIZE))
   }
-  return chunks.slice(0, first).concat(pieces, chunks.slice(last + 1))
+  const result = chunks.slice(0, first).concat(pieces, chunks.slice(last + 1))
+  chunkStarts(result)
+  return result
 }
 
-function instantiateText(objectId, chunks) {
+function instantiateText(objectId, chunks, string) {
   const instance = Object.create(Text.prototype)
   instance[OBJECT_ID] = objectId
   instance.chunks = chunks
+  if (string !== undefined) Object.defineProperty(instance, STRING, {value: string})
   return instance
 }
 
-export { Text, instantiateText, elemAt, spliceChunks, strings, textOffset }
+export { Text, instantiateText, elemAt, spliceChunks, textOffset }

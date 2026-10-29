@@ -1,4 +1,4 @@
-import { decompressChange, documentChanges, encodeChangeColumns, splitContainers } from './columnar.js'
+import { decompressChange, documentChanges, encodeChangeColumns, encodeLocalChange, splitContainers } from './columnar.js'
 import { decodeBundle, encodeBundle, encodeDocumentBundle } from './bundle.js'
 import { BackendDoc, concatBuffers, markEvent } from './new.js'
 import { documentOps } from './fragments.js'
@@ -85,7 +85,7 @@ function applyLocalChange(backend, change) {
     state.anchorSource.doc.adjustInsertAnchors(Object.assign({}, change, {ops: state.anchorSource.ops}), state.anchorSource.clock)
   }
   state.adjustInsertAnchors(change)
-  const decoded = encodeChangeColumns(change)
+  const decoded = encodeLocalChange(change) || encodeChangeColumns(change)
   const patch = state.applyDecodedChanges([decoded], true)
   backend.frozen = true
 

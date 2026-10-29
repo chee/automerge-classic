@@ -17,7 +17,7 @@ const PRED_COLUMN_IDS = CHANGE_COLUMNS
   .filter(column => ['predNum', 'predActor', 'predCtr'].includes(column.columnName))
   .map(column => column.columnId)
 
-const COLUMN_OPERATIONS = new WeakMap()
+const OPERATIONS = Symbol('operations')
 const COLUMN_DATA = new WeakMap()
 const COLUMN_SPLICES = new WeakMap()
 const ENCODED_COLUMNS = new WeakMap()
@@ -40,7 +40,7 @@ function operationValueCount(column, value) {
 }
 
 function columnOperationCache(columns) {
-  let cache = COLUMN_OPERATIONS.get(columns)
+  let cache = columns[OPERATIONS]
   if (cache) return cache
   for (const column of columns) column.decoder.reset()
   const documentColumns = columns.length === DOC_OPS_COLUMNS.length &&
@@ -49,7 +49,7 @@ function columnOperationCache(columns) {
   if (!documentColumns) while (!columns[actionIdx].decoder.done) operations.push(readOperation(columns))
   for (const column of columns) column.decoder.reset()
   cache = {operations}
-  COLUMN_OPERATIONS.set(columns, cache)
+  columns[OPERATIONS] = cache
   return cache
 }
 
@@ -112,7 +112,7 @@ function operationColumns(template, operations) {
   const encoders = columnEncoders(template)
   appendOperations(encoders, operations)
   const columns = columnDecoders(encoders)
-  COLUMN_OPERATIONS.set(columns, {operations})
+  columns[OPERATIONS] = {operations}
   return columns
 }
 
@@ -138,7 +138,7 @@ function columnsFromOperations(template, operations) {
     column.cachedDecoder = undefined
     columns.push(column)
   }
-  COLUMN_OPERATIONS.set(columns, {operations})
+  columns[OPERATIONS] = {operations}
   return columns
 }
 
@@ -170,7 +170,7 @@ function spliceColumns(columns, startRow, endRow, inserted, outputOperations) {
   const output = columnsFromOperations(columns, outputOperations)
   const data = COLUMN_DATA.get(columns)
   if (data) {
-    COLUMN_SPLICES.set(output, {data, operations: COLUMN_OPERATIONS.get(columns).operations, startRow, endRow, inserted})
+    COLUMN_SPLICES.set(output, {data, operations: columns[OPERATIONS].operations, startRow, endRow, inserted})
   }
   return output
 }
@@ -360,7 +360,7 @@ function seekWithinOperations(target, cache, actorIds, resumeInsertion) {
  *   elements that precede the position where the new operations should be applied.
  */
 function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
-  const cached = COLUMN_OPERATIONS.get(docCols)
+  const cached = docCols[OPERATIONS]
   if (cached) return seekWithinOperations(ops, cached, actorIds, resumeInsertion)
   for (let col of docCols) col.decoder.reset()
   const { objActor, objActorNum, objCtr, keyActor, keyCtr, keyStr, idActor, idCtr, insert } = ops
@@ -631,7 +631,7 @@ function bloomFilterContains(bloom, elemIdActor, elemIdCtr) {
  */
 function updateBlockMetadata(block, visibleMapOps) {
   resetBlockMetadata(block)
-  const cached = COLUMN_OPERATIONS.get(block.columns), counters = []
+  const cached = block.columns[OPERATIONS], counters = []
   if (cached) {
     for (const op of cached.operations) addOperationMetadata(block, op, visibleMapOps, counters)
     return
@@ -949,7 +949,7 @@ function concatBlocks(blocks, previous) {
       let encoded = ENCODED_COLUMNS.get(block.columns)
       if (!encoded) {
         const blockEncoders = columnEncoders(block.columns)
-        appendOperations(blockEncoders, COLUMN_OPERATIONS.get(block.columns).operations)
+        appendOperations(blockEncoders, block.columns[OPERATIONS].operations)
         encoded = columnDecoders(blockEncoders)
         ENCODED_COLUMNS.set(block.columns, encoded)
       }
@@ -2092,17 +2092,13 @@ function applyOps(patches, changeState, docState) {
  */
 function updateBlockColumns(docState, changeCols) {
   // Check that the columns of a change appear at the index at which we expect them to be
-  const names = ['objActor', 'objCtr', 'keyActor', 'keyCtr', 'keyStr', 'idActor', 'idCtr', 'insert', 'action',
-    'valLen', 'valRaw', 'chldActor', 'chldCtr', 'predNum', 'predActor', 'predCtr']
-  if (names.some((name, index) => changeCols[index].columnId !== CHANGE_COLUMNS[index].columnId ||
-                                  CHANGE_COLUMNS[index].columnName !== name)) {
-    throw new RangeError('unexpected columnId')
+  for (let index = 0; index <= predCtrIdx; index++) {
+    if (changeCols[index].columnId !== CHANGE_COLUMNS[index].columnId) throw new RangeError('unexpected columnId')
   }
 
   // Check if there any columns in the change that are not in the document, apart from pred*
   const docCols = docState.blocks[0].columns
-  if (!changeCols.every(changeCol => PRED_COLUMN_IDS.includes(changeCol.columnId) ||
-                                     docCols.find(docCol => docCol.columnId === changeCol.columnId))) {
+  if (hasNewColumns(docCols, changeCols)) {
     let allCols = docCols.map(docCol => ({columnId: docCol.columnId}))
     for (let changeCol of changeCols) {
       const { columnId } = changeCol
@@ -2118,6 +2114,16 @@ function updateBlockColumns(docState, changeCols) {
       docState.blocks[blockIndex] = block
     }
   }
+}
+
+function hasNewColumns(docCols, changeCols) {
+  let at = 0
+  for (const {columnId} of changeCols) {
+    if (PRED_COLUMN_IDS.includes(columnId)) continue
+    while (at < docCols.length && docCols[at].columnId < columnId) at++
+    if (at === docCols.length || docCols[at].columnId !== columnId) return true
+  }
+  return false
 }
 
 /**
@@ -2312,9 +2318,7 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
 
   if (applied.length > 0) {
     for (const change of applied) {
-      const docCols = docState.blocks[0].columns
-      if (change.columns.some(changeCol => !PRED_COLUMN_IDS.includes(changeCol.columnId) &&
-          !docCols.some(docCol => docCol.columnId === changeCol.columnId))) {
+      if (hasNewColumns(docState.blocks[0].columns, change.columns)) {
         updateBlockColumns(docState, makeDecoders(change.columns, CHANGE_COLUMNS))
       }
     }
@@ -2587,7 +2591,7 @@ function appendBlockElements(block, actorIds, objectId, counter, actor, elems, c
     if (op[insertIdx]) {
       inserted = true
       const mark = op[actionIdx] !== MARK_ACTION ? null : op[markNameIdx] === null ? 'end' : 'begin'
-      elems.push({id: `${op[idCtrIdx]}@${actorIds[op[idActorIdx]]}`, counter: op[idCtrIdx], mark, expand: !!op[expandIdx], visible})
+      elems.push({actorId: actorIds[op[idActorIdx]], counter: op[idCtrIdx], mark, expand: !!op[expandIdx], visible})
     } else {
       if (!inserted) leading = true
       if (visible && elems.length > 0) elems[elems.length - 1].visible = true
@@ -2611,17 +2615,17 @@ function loadPart(seq, k) {
   return seq.parts[k]
 }
 
-function findElem(seq, id, counter, actor) {
+function findElem(seq, counter, actorId, actor) {
   for (let k = 0; k < seq.parts.length; k++) {
     if (!seq.parts[k]) continue
-    const index = seq.parts[k].findIndex(e => e.counter === counter && e.id === id)
+    const index = seq.parts[k].findIndex(e => e.counter === counter && e.actorId === actorId)
     if (index >= 0) return {part: k, index}
   }
   for (let k = 0; k < seq.parts.length; k++) {
     if (seq.parts[k] !== undefined || actor === undefined || !bloomFilterContains(seq.blocks[k].bloom, actor, counter)) continue
     const part = loadPart(seq, k)
     if (part === null) return null
-    const index = part.findIndex(e => e.counter === counter && e.id === id)
+    const index = part.findIndex(e => e.counter === counter && e.actorId === actorId)
     if (index >= 0) return {part: k, index}
   }
   return undefined
@@ -2630,13 +2634,13 @@ function findElem(seq, id, counter, actor) {
 function insertAnchor(seq, ref) {
   let part = 0, index = 0
   if (ref !== '_head') {
-    const {counter, actorId} = parseOpId(ref), found = findElem(seq, ref, counter, seq.actorIndexById.get(actorId))
+    const {counter, actorId} = parseOpId(ref), found = findElem(seq, counter, actorId, seq.actorIndexById.get(actorId))
     if (found === null) return null
     if (found === undefined) return {ref, part, index}
     part = found.part
     index = found.index + 1
   }
-  const candidates = [{ref, id: null, part, index}]
+  const candidates = [{ref, counter: null, actorId: null, part, index}]
   for (;; index++) {
     let elems = loadPart(seq, part)
     while (elems && index >= elems.length && part < seq.parts.length - 1) {
@@ -2647,15 +2651,17 @@ function insertAnchor(seq, ref) {
     if (index >= elems.length) break
     const elem = elems[index]
     if (elem.mark === 'end') {
-      const {counter, actorId} = parseOpId(elem.id)
-      const found = candidates.findIndex(c => c.id === `${counter - 1}@${actorId}`)
+      const found = candidates.findIndex(c => c.counter === elem.counter - 1 && c.actorId === elem.actorId)
       if (found >= 0) {
         candidates.length = found
         continue
       }
     }
-    if (elem.mark && (elem.mark === 'begin') === elem.expand) candidates.push({ref: elem.id, id: elem.id, part, index: index + 1})
-    else if (!elem.mark && elem.visible) break
+    if (elem.mark && (elem.mark === 'begin') === elem.expand) {
+      candidates.push({ref: `${elem.counter}@${elem.actorId}`, counter: elem.counter, actorId: elem.actorId, part, index: index + 1})
+    } else if (!elem.mark && elem.visible) {
+      break
+    }
   }
   return candidates[candidates.length - 1]
 }
@@ -3553,29 +3559,21 @@ function objectEventsInner(ctx, objectId, events) {
   }
 }
 
-function applyEvent(ctx, event) {
-  const {objectId} = event
-  if (event.kind === 'put') {
-    addPatch(ctx, objectId, event.prop, event.conflict
-      ? {action: 'put', path: null, value: event.value, conflict: true} : {action: 'put', path: null, value: event.value})
-  } else if (event.kind === 'insert') {
-    insertPatch(ctx, objectId, event.prop, event.value, event.conflict)
-  } else if (event.kind === 'splice') {
-    splicePatch(ctx, objectId, event.prop, event.text, event.marks)
-  } else if (event.kind === 'del') {
-    deletePatch(ctx, objectId, event.prop, event.length)
-  } else if (event.kind === 'delMap') {
-    addPatch(ctx, objectId, event.prop, {action: 'del', path: null})
-  } else if (event.kind === 'inc') {
-    addPatch(ctx, objectId, event.prop, {action: 'inc', path: null, value: event.value})
-  } else if (event.kind === 'conflict') {
-    conflictPatch(ctx, objectId, event.prop)
-  } else if (event.kind === 'mark') {
+const EVENT_PATCHES = {
+  put: (ctx, event) => addPatch(ctx, event.objectId, event.prop, event.conflict
+    ? {action: 'put', path: null, value: event.value, conflict: true} : {action: 'put', path: null, value: event.value}),
+  insert: (ctx, event) => insertPatch(ctx, event.objectId, event.prop, event.value, event.conflict),
+  splice: (ctx, event) => splicePatch(ctx, event.objectId, event.prop, event.text, event.marks),
+  del: (ctx, event) => deletePatch(ctx, event.objectId, event.prop, event.length),
+  delMap: (ctx, event) => addPatch(ctx, event.objectId, event.prop, {action: 'del', path: null}),
+  inc: (ctx, event) => addPatch(ctx, event.objectId, event.prop, {action: 'inc', path: null, value: event.value}),
+  conflict: (ctx, event) => conflictPatch(ctx, event.objectId, event.prop),
+  mark: (ctx, event) => {
     const marks = []
     for (const name of [...event.marks.keys()].sort(compareUtf8)) {
       for (const {value, start, end} of event.marks.get(name)) marks.push({name, value: ctx.valueOf(value, true), start, end})
     }
-    markPatch(ctx, objectId, marks)
+    markPatch(ctx, event.objectId, marks)
   }
 }
 
@@ -3610,7 +3608,7 @@ function diffContext(doc, beforeClock, afterClock, objectIds, valueOf, start, ba
     doc, valueOf, before: beforeClock, after: afterClock, rows: new Map(), pathMap: new Map(), seen: new Set(),
     actorRank: doc.actorIds.map(actor => sortedActors.indexOf(actor)),
     patches: [], patchObjects: [], lastMarks: null, exposed: [], batch,
-    touched: objectIds, children: new Map(), skipped: new Map(), skippedEntries: new Map(), truncated: new Map(), reachable: new Map([[start, true]])
+    touched: objectIds, children: new Map(), skipped: new Map(), skippedEntries: new Map(), truncated: new Map(), reachable: new Map().set(start, true)
   }
 }
 
@@ -3627,33 +3625,46 @@ function documentDiff(doc, beforeClock, afterClock, objectIds, valueOf, start, r
 
 function spliceMarks(ctx, event, actor) {
   if (!ctx.doc.objectsWithMarks.has(event.objectId)) return null
-  const clock = ctx.after.slice()
+  const doc = ctx.doc, clock = ctx.after.slice(), {counter, actorId} = parseOpId(event.objectId)
+  const key = `${counter}@${doc.actorIndexById.get(actorId)}`, parts = [], machine = {state: [], current: NO_MARKS}
+  let blockIndex = findBlock(doc.blocks, doc.actorIds, actorId, counter, null), ended = false, index = 0
   clock[actor] = event.counter
-  const rows = objectRows(ctx.doc, event.objectId, 'text', ctx.before, clock, ctx.touched.get(event.objectId))
-  const machine = {state: [], current: NO_MARKS}
-  let index = 0
-  for (let i = 0; i < rows.length && index <= event.prop; i++) {
-    const row = rows[i]
-    if (row.skip) {
-      for (const mark of row.summary.marks) machineMark(machine, mark, ctx.actorRank)
-      index += row.summary.visible
-      i += row.length
-      continue
+  function partAt(k) {
+    while (parts.length <= k && !ended && blockIndex < doc.blocks.length) {
+      const block = doc.blocks[blockIndex++], segment = blockObjects(block).get(key)
+      if (segment) parts.push({segment, operations: columnOperationCache(block.columns).operations})
+      ended = compareBlockObject(block, doc.actorIds, actorId, counter) > 0
     }
-    if (!row[insertIdx]) continue
-    let topBefore = null, topAfter = null
-    for (let j = i; j < rows.length && (j === i || (!rows[j].skip && !rows[j][insertIdx])); j++) {
-      if (visibleAt(rows[j], ctx.before, null)) topBefore = rows[j]
-      if (visibleAt(rows[j], clock, null)) topAfter = rows[j]
+    return parts[k]
+  }
+  for (let k = 0; partAt(k) && index <= event.prop; k++) {
+    const {segment, operations} = parts[k], next = partAt(k + 1)
+    if (operations[segment.start][insertIdx] && (!next || next.operations[next.segment.start][insertIdx])) {
+      const summary = segmentSummary(segment, operations, 'text')
+      if (settledAt(summary, ctx.before, clock)) {
+        for (const mark of summary.marks) machineMark(machine, mark, ctx.actorRank)
+        index += summary.visible
+        continue
+      }
     }
-    if (!topAfter) continue
-    if (topAfter[actionIdx] === MARK_ACTION) {
-      machineMark(machine, topAfter, ctx.actorRank)
-    } else if (index === event.prop) {
-      if (topAfter === topBefore || topAfter[actionIdx] === MAKE_MAP_ACTION) return null
-      return exportMarks({before: null, after: machine.current.size > 0 ? machine.current : null})
-    } else {
-      index += textWidth(topAfter)
+    for (let i = segment.start; i < segment.end && index <= event.prop; i++) {
+      if (!operations[i][insertIdx]) continue
+      let topBefore = null, topAfter = null
+      for (let p = k, j = i; partAt(p) && (j === i && p === k || !parts[p].operations[j][insertIdx]);) {
+        const row = parts[p].operations[j]
+        if (visibleAt(row, ctx.before, null)) topBefore = row
+        if (visibleAt(row, clock, null)) topAfter = row
+        if (++j === parts[p].segment.end && partAt(++p)) j = parts[p].segment.start
+      }
+      if (!topAfter) continue
+      if (topAfter[actionIdx] === MARK_ACTION) {
+        machineMark(machine, topAfter, ctx.actorRank)
+      } else if (index === event.prop) {
+        if (topAfter === topBefore || topAfter[actionIdx] === MAKE_MAP_ACTION) return null
+        return exportMarks({before: null, after: machine.current.size > 0 ? machine.current : null})
+      } else {
+        index += textWidth(topAfter)
+      }
     }
   }
   return null
@@ -3675,15 +3686,13 @@ function localPatches(doc, change, actor, startOp, afterClock, events, valueOf) 
     }
   }
   const touchedParents = [...parents].filter(objectId => objects.has(objectId)).sort(compareObjectIds)
-  if (touchedParents.length > 0 || [...objects].some(objectId => doc.objectsWithMarks.has(objectId))) {
-    changeObjects(decodeTargets(change), objectIds, doc.actorIndexById)
-  }
+  if (touchedParents.length > 0) changeObjects(decodeTargets(change), objectIds, doc.actorIndexById)
   const ctx = diffContext(doc, beforeClock, afterClock, objectIds, valueOf, '_root', false)
   for (const objectId of touchedParents) objectEvents(ctx, objectId, [])
   ctx.exposed = []
   const sorted = events.slice().sort((left, right) => compareObjectIds(left.objectId, right.objectId)).map(event => {
     if (event.kind === 'put' || event.kind === 'insert') return Object.assign({}, event, {value: valueOf(event.value), conflict: false})
-    if (event.kind === 'splice') return Object.assign({}, event, {marks: spliceMarks(ctx, event, actor)})
+    if (event.kind === 'splice') return Object.assign({}, event, {marks: doc.objectsWithMarks.has(event.objectId) ? spliceMarks(ctx, event, actor) : null})
     return event
   })
   return buildPatches(ctx, sorted)
@@ -3722,7 +3731,7 @@ function buildPatches(ctx, events) {
   for (const event of events) {
     while (ctx.exposed.length > 0 && compareObjectIds(ctx.exposed[0], event.objectId) < 0) flushExposed(ctx, ctx.exposed[0])
     if (ctx.exposed[0] === event.objectId) continue
-    applyEvent(ctx, event)
+    if (EVENT_PATCHES[event.kind]) EVENT_PATCHES[event.kind](ctx, event)
   }
   while (ctx.exposed.length > 0) flushExposed(ctx, ctx.exposed[0])
   return ctx.patches.map(patch => exportPatch(ctx, patch))
@@ -3842,12 +3851,12 @@ class BackendDoc {
           op.elemId = anchor.ref
           const mark = op.action === 'markBegin' ? 'begin' : op.action === 'markEnd' ? 'end' : null
           for (let i = 0; i < count; i++) {
-            elems.splice(anchor.index + i, 0, {id: `${opNum + i}@${change.actor}`, counter: opNum + i, mark, expand: !!op.expand, visible: true})
+            elems.splice(anchor.index + i, 0, {actorId: change.actor, counter: opNum + i, mark, expand: !!op.expand, visible: true})
           }
         } else {
           const {counter, actorId} = parseOpId(op.elemId), actor = this.actorIndexById.get(actorId)
           for (let i = 0; i < count; i++) {
-            const found = findElem(seq, `${counter + i}@${actorId}`, counter + i, actor)
+            const found = findElem(seq, counter + i, actorId, actor)
             if (found === null) return false
             if (found) seq.parts[found.part][found.index] = Object.assign({}, seq.parts[found.part][found.index], {visible: op.action !== 'del'})
           }

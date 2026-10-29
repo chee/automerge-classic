@@ -870,7 +870,7 @@ function spliceText(text, index, del, newText) {
   const chars = [...newText]
   const start = textElementIndex(text, index)
   let deleteCount = 0, deleted = 0
-  while (start + deleteCount < text.length && deleted < del) {
+  while (deleted < del && start + deleteCount < text.length) {
     deleted += textElementWidth(text.get(start + deleteCount))
     deleteCount++
   }

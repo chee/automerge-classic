@@ -1723,6 +1723,129 @@ function writeChangeChunk(encoder, change, startOp, deps) {
   return {hash, bytes: output.subarray(start, start + total)}
 }
 
+const LOCAL_HEX = /^(?:[0-9a-f]{2})+$/, LOCAL_HASH = /^[0-9a-f]{64}$/, LOCAL_OP_ID = /^(\d+)@((?:[0-9a-f]{2})+)$/
+const localEncoder = {
+  head: changeWriter(0), writers: CHANGE_OP_COLUMNS.map(({columnId}) => changeWriter(columnId)),
+  others: [], actorBytes: [], output: new Uint8Array(0), outputUsed: 0
+}
+const localValue = {
+  sizeTag: 0, valLen: {appendValue(sizeTag) { localValue.sizeTag = sizeTag }}, valRaw: new Encoder(),
+  op: {action: 'set', value: null, datatype: undefined}
+}
+
+function localOpId(opId) {
+  const match = typeof opId === 'string' && LOCAL_OP_ID.exec(opId)
+  if (!match) return null
+  const counter = Number(match[1])
+  return Number.isSafeInteger(counter) && counter > 0 ? {counter, actorId: match[2]} : null
+}
+
+function localOps(change) {
+  const ops = [], actors = new Set([change.actor])
+  let opNum = change.startOp
+  for (const op of change.ops) {
+    if (op === null || typeof op !== 'object' || op[UNKNOWN_COLUMNS] || op[RAW_VALUE] || op.child !== undefined || !Array.isArray(op.pred)) return null
+    const action = op.action === 'markBegin' || op.action === 'markEnd' ? 7 : ACTIONS.indexOf(op.action)
+    const obj = op.obj === '_root' ? null : localOpId(op.obj)
+    const markName = op.markName === undefined ? op.name : op.markName
+    if (action < 0 || obj === null && op.obj !== '_root' || markName !== undefined && markName !== null && typeof markName !== 'string') return null
+    const preds = []
+    for (const pred of op.pred) {
+      const id = localOpId(pred)
+      if (!id) return null
+      preds.push(id)
+    }
+    let elem = null
+    if (op.key !== undefined) {
+      if (typeof op.key !== 'string' || op.elemId !== undefined) return null
+    } else if (op.elemId !== '_head' || !op.insert) {
+      elem = localOpId(op.elemId)
+      if (!elem) return null
+    }
+    const multi = op.action === 'set' && op.values && op.insert ? 'insert' : op.action === 'del' && op.multiOp > 1 ? 'del' : null
+    if (multi === 'insert' && (!Array.isArray(op.values) || preds.length !== 0 || op.key !== undefined ||
+          !op.values.every(value => validDatatype(value, op.datatype))) ||
+        multi === 'del' && (preds.length !== 1 || !elem || !Number.isSafeInteger(op.multiOp)) ||
+        multi === null && (op.values !== undefined || op.multiOp !== undefined && op.action !== 'del')) return null
+    if (obj) actors.add(obj.actorId)
+    if (elem) actors.add(elem.actorId)
+    for (const pred of preds) actors.add(pred.actorId)
+    const count = multi === 'insert' ? op.values.length : multi === 'del' ? op.multiOp : 1
+    ops.push({op, multi, count, start: opNum, obj, elem, action, preds: preds.sort(compareParsedOpIds), markName: markName === undefined ? null : markName})
+    opNum += count
+  }
+  return {ops, actors}
+}
+
+function encodeLocalChange(change) {
+  const message = change.message || ''
+  if (change.hash !== undefined || change.extra_bytes !== undefined || change.extraBytes !== undefined ||
+      typeof change.actor !== 'string' || !LOCAL_HEX.test(change.actor) || typeof message !== 'string' ||
+      !Number.isSafeInteger(change.seq) || change.seq < 0 || !Number.isSafeInteger(change.startOp) || change.startOp < 0 ||
+      !Number.isSafeInteger(change.time) || !Array.isArray(change.ops) || !Array.isArray(change.deps) ||
+      !change.deps.every(dep => typeof dep === 'string' && LOCAL_HASH.test(dep))) return null
+  const parsed = localOps(change)
+  if (!parsed) return null
+  const actorIds = [change.actor].concat([...parsed.actors].filter(actor => actor !== change.actor).sort())
+  const localOf = new Map(actorIds.map((actor, index) => [actor, index]))
+  const [objActorW, objCtrW, keyActorW, keyCtrW, keyStrW, insertW, actionW, valLenW, valRawW, chldActorW, chldCtrW,
+    predNumW, predActorW, predCtrW, expandW, markNameW] = localEncoder.writers
+  const expand = parsed.ops.some(({op, multi}) => multi === null && op.expand)
+  for (const writer of localEncoder.writers) resetWriter(writer)
+  for (const {op, multi, count, start, obj, elem, action, preds, markName} of parsed.ops) {
+    for (let i = 0; i < count; i++) {
+      rleAppend(objActorW, obj ? localOf.get(obj.actorId) : null)
+      rleAppend(objCtrW, obj ? obj.counter : null)
+      if (multi === 'insert' && i > 0) {
+        rleAppend(keyActorW, 0)
+        deltaAppend(keyCtrW, start + i - 1)
+      } else {
+        rleAppend(keyActorW, elem ? localOf.get(elem.actorId) : null)
+        deltaAppend(keyCtrW, elem ? elem.counter + i : op.key === undefined ? 0 : null)
+      }
+      rleAppend(keyStrW, op.key === undefined ? null : op.key)
+      booleanAppend(insertW, multi === 'insert' || multi === null && !!op.insert)
+      rleAppend(actionW, action)
+      let valueOp = op
+      if (multi === 'insert') {
+        valueOp = localValue.op
+        valueOp.value = op.values[i]
+        valueOp.datatype = op.datatype
+      }
+      localValue.valRaw.reset()
+      encodeValue(valueOp, localValue)
+      rleAppend(valLenW, localValue.sizeTag)
+      if (localValue.valRaw.offset > 0) putBytes(valRawW, localValue.valRaw.buf.subarray(0, localValue.valRaw.offset))
+      if (expand) booleanAppend(expandW, multi === null && !!op.expand)
+      rleAppend(markNameW, multi === null ? markName : null)
+      rleAppend(chldActorW, null)
+      deltaAppend(chldCtrW, null)
+      rleAppend(predNumW, preds.length)
+      for (const pred of preds) {
+        rleAppend(predActorW, localOf.get(pred.actorId))
+        deltaAppend(predCtrW, pred.counter + i)
+      }
+    }
+  }
+  const deps = change.deps.slice().sort()
+  localEncoder.actorBytes = actorIds.map(hexStringToBytes)
+  localEncoder.others = actorIds.map((actor, index) => index).slice(1)
+  const chunk = writeChangeChunk(localEncoder, {actorNum: 0, seq: change.seq, time: change.time, message, extraBytes: NO_BYTES},
+    change.startOp, deps.map(hexStringToBytes))
+  const bytes = chunk.bytes.slice(), columns = []
+  let at = bytes.byteLength - localEncoder.writers.reduce((total, writer) => total + writer.offset, 0)
+  for (const writer of localEncoder.writers) {
+    if (writer.offset === 0) continue
+    columns.push({columnId: writer.columnId, bufferLen: writer.offset, buffer: bytes.subarray(at, at + writer.offset)})
+    at += writer.offset
+  }
+  return {
+    actor: change.actor, seq: change.seq, startOp: change.startOp, time: change.time, message, deps, actorIds, columns,
+    hash: bytesToHexString(chunk.hash),
+    buffer: bytes.byteLength > DEFLATE_MIN_SIZE ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, data => deflate(data, {len: 0, cap: 0}).output) : bytes
+  }
+}
+
 /**
  * DEFLATE-compresses the given column if it is large enough to make the compression worthwhile.
  */
@@ -1751,6 +1874,6 @@ export {
   COLUMN_TYPE, VALUE_TYPE, ACTIONS, OBJECT_TYPE, DOC_OPS_COLUMNS, CHANGE_COLUMNS, DOCUMENT_COLUMNS,
   encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue, decodeColumns, decodeOps, encodeOp,
   encodeColumnInfo, decodeColumnInfo, encodeContainer, decodeContainerHeader, deflateColumn, inflateColumn,
-  splitContainers, decompressChange, encodeChange, encodeChangeColumns, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
+  splitContainers, decompressChange, encodeChange, encodeChangeColumns, encodeLocalChange, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
   encodeDocumentHeader, decodeDocumentHeader, documentChanges, documentRows, columnReader, readNext, changeColumnReaders, NO_SUCC, NO_BYTES
 }
