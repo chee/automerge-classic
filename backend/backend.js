@@ -3,6 +3,7 @@ import { decodeBundle, encodeBundle, encodeDocumentBundle } from './bundle.js'
 import { BackendDoc, concatBuffers, markEvent } from './new.js'
 import { documentOps } from './fragments.js'
 import { backendState } from './util.js'
+import { PanicError } from '../src/common.js'
 /**
  * Returns an empty node state.
  */
@@ -19,6 +20,14 @@ function free(backend) {
   backend.frozen = true
 }
 
+function applyRemoteChanges(state, changes) {
+  try {
+    return state.applyChanges(changes)
+  } catch (error) {
+    throw error.panic ? new PanicError(error.panic) : error
+  }
+}
+
 /**
  * Applies a list of `changes` from remote nodes to the node state `backend`.
  * Returns a two-element array `[state, patch]` where `state` is the updated
@@ -27,7 +36,7 @@ function free(backend) {
  */
 function applyChanges(backend, changes) {
   const state = backendState(backend)
-  const patch = state.applyChanges(changes)
+  const patch = applyRemoteChanges(state, changes)
   backend.frozen = true
   return [{state, heads: state.heads}, patch]
 }
@@ -152,8 +161,11 @@ function loadIncremental(backend, data) {
   }
 
   let patch = null
-  if (changes.length > 0) patch = state.applyChanges(changes)
-  if (replaced) patch = state.getPatch()
+  if (changes.length > 0) patch = applyRemoteChanges(state, changes)
+  if (replaced) {
+    patch = state.getPatch()
+    state.loaded = true
+  }
   // Nothing was applied, so the caller's document is still current and must
   // not be frozen: a sync message that carries only changes we already have
   // leaves the document unchanged
@@ -173,12 +185,24 @@ function getPatch(backend) {
   return backendState(backend, true).getPatch()
 }
 
+function viewHashes(source, heads) {
+  let hashes = heads, size = -1
+  while (hashes.length !== size) {
+    size = hashes.length
+    hashes = Object.entries(source.clockAt(hashes).clock).flatMap(([actor, seq]) => source.hashesByActor[actor].slice(0, seq))
+  }
+  return hashes
+}
+
 function viewState(source, heads, clock) {
   let state
   return {
     heads, source, clock,
     get state() {
-      if (state === undefined) state = loadChanges(init(), source.getChangesByHash(source.clockAt(heads).hashes)).state
+      if (state === undefined) {
+        state = backendState(init())
+        state.applyChanges(source.getChangesByHash(viewHashes(source, heads)), false, true)
+      }
       return state
     },
     set state(value) {
@@ -309,6 +333,14 @@ function localPatches(backend, change, actorId, startOp, clock, events, valueOf)
   return backendState(backend, true).localPatches(change, actorId, startOp, clock, events, valueOf)
 }
 
+function isolatedPatches(backend, currentHeads, scopeHeads, newHeads, change, actorId, events, valueOf, loaded) {
+  return backendState(backend, true).isolatedPatches(currentHeads, scopeHeads, newHeads, change, actorId, events, valueOf, loaded)
+}
+
+function isLoaded(backend) {
+  return !!backendState(backend, true).loaded
+}
+
 function saveBundleByHash(backend, hashes) {
   const state = backendState(backend, true)
   return encodeDocumentBundle(state.getChangesByHash(hashes), documentOps(state))
@@ -318,5 +350,5 @@ export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
   load, loadChanges, loadIncremental, getPatch, view, viewOf, getHeads, getAllChanges, getChanges,
   getChangesAdded, getChangeByHash, getLastChangeByActor, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta, isolatedActor, isolateAnchors,
-  getChangesByHash, topoHistoryTraversal, stats, diff, clockDiff, localPatches, markEvent, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
+  getChangesByHash, topoHistoryTraversal, stats, diff, clockDiff, localPatches, isolatedPatches, isLoaded, markEvent, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
 }

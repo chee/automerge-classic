@@ -30,6 +30,18 @@ function getValue(patch, object, updated, textV2) {
   }
 }
 
+const integralFloats = new WeakMap()
+
+function noteDatatype(values, opId, patch) {
+  if (patch.datatype !== 'float64' || !Number.isInteger(patch.value)) return
+  if (!integralFloats.has(values)) integralFloats.set(values, new Set())
+  integralFloats.get(values).add(opId)
+}
+
+function isIntegralFloat(values, opId) {
+  return integralFloats.has(values) && integralFloats.get(values).has(opId)
+}
+
 function getStoredValue(patch, object, updated, textV2) {
   const value = getValue(patch, object, updated, textV2)
   return textV2 && typeof value === 'string' ? new ImmutableString(value) : value
@@ -73,6 +85,7 @@ function applyProperties(props, object, conflicts, updated, textV2) {
     const values = {}, opIds = Object.keys(props[key]).sort(lamportCompare)
     for (let opId of opIds) {
       values[opId] = getStoredValue(props[key][opId], conflicts[key] && conflicts[key][opId], updated, textV2)
+      noteDatatype(values, opId, props[key][opId])
     }
 
     if (opIds.length === 0) {
@@ -167,6 +180,7 @@ function updateListObject(patch, obj, updated, textV2) {
         values = Object.fromEntries(opIds.map(opId => [opId, values[opId]]))
         lastValue = values[opIds[opIds.length - 1]]
       }
+      for (let j = first; j <= i; j++) noteDatatype(values, patch.edits[j].opId, patch.edits[j].value)
 
       const visible = textV2 && lastValue instanceof Text ? lastValue.toJSON() : lastValue
       if (edit.action === 'insert') {
@@ -184,8 +198,10 @@ function updateListObject(patch, obj, updated, textV2) {
       edit.values.forEach((value, index) => {
         const elemId = `${startElemId.counter + index}@${startElemId.actorId}`
         const scalar = getStoredValue({ value, datatype }, undefined, updated, textV2)
+        const values = {[elemId]: scalar}
+        noteDatatype(values, elemId, {value, datatype})
         newValues.push(scalar)
-        newConflicts.push({[elemId]: scalar})
+        newConflicts.push(values)
         newElems.push(elemId)
       })
       list.splice(edit.index, 0, ...newValues)
@@ -310,5 +326,5 @@ function reorderNewKeys(object) {
 }
 
 export {
-  interpretPatch, cloneMapObject, lamportCompare, reorderNewKeys
+  interpretPatch, cloneMapObject, lamportCompare, reorderNewKeys, isIntegralFloat
 }

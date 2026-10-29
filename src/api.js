@@ -1,7 +1,7 @@
 import * as Frontend from '../frontend/index.js'
-import { CHANGE, OPTIONS, STATE } from '../frontend/constants.js'
+import { CACHE, CHANGE, OPTIONS, STATE } from '../frontend/constants.js'
 import { decodeChange, decodeChangeColumns, decodeChangeMeta, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
-import { compareUtf8, isObject, parseOpId, wellFormedString } from './common.js'
+import { PanicError, compareUtf8, isObject, parseOpId, wellFormedString } from './common.js'
 import { ImmutableString, isImmutableString } from './immutable_string.js'
 import { graphemes, myersDiff, replaceHook } from './text_diff.js'
 import { instantiateText, textOffset } from '../frontend/text.js'
@@ -10,6 +10,10 @@ import * as backend from '../backend/index.js'
 const viewDocs = new WeakSet()
 const recentPatches = new WeakMap()
 const diffCache = new WeakMap()
+const isolatedSources = new WeakMap()
+const isolations = new WeakMap()
+const residues = new WeakMap()
+const viewSources = new WeakMap()
 
 /**
  * Automerge.* API
@@ -73,6 +77,7 @@ export function from(initialState, options) {
 }
 
 export function change(doc, options, callback) {
+  if (isolations.has(doc)) return isolatedChange(doc, isolations.get(doc).at(-1), options, callback, 'change').newDoc
   return changeWithSource(doc, options, callback, 'change')
 }
 
@@ -142,7 +147,7 @@ export function getAllChanges(doc) {
 }
 
 export function getHeads(doc) {
-  return backend.getHeads(Frontend.getBackendState(doc, 'getHeads'))
+  return isolations.has(doc) ? isolations.get(doc).at(-1) : backend.getHeads(Frontend.getBackendState(doc, 'getHeads'))
 }
 
 export function getBackend(doc) {
@@ -186,7 +191,13 @@ function patchOptions(doc, options, source) {
   const callback = normalized.patchCallback || doc[OPTIONS] && doc[OPTIONS].patchCallback
   normalized.patchCallback = (patch, before, after, local, changes, events) => {
     const state = Frontend.getBackendState(after), clock = after[STATE].clock, beforeHeads = getHeads(before)
-    const actor = Frontend.getActorId(after), startOp = before[STATE].maxOp + 1
+    const actor = Frontend.getActorId(after), startOp = before[STATE].maxOp + 1, residue = events.length > 0 && residues.get(before)
+    if (residue) {
+      residues.delete(before)
+      progress(before, after, callback, source, beforeHeads, () => residue.patches.concat(
+        backend.isolatedPatches(state, residue.from, residue.to, getHeads(after), changes[0], actor, events, diffValue, false)))
+      return
+    }
     progress(before, after, callback, source, source === 'emptyChange' ? undefined : beforeHeads,
       beforeHeads.length === 0 ? () => backend.clockDiff(state, {}, clock, diffValue, false)
         : () => backend.localPatches(state, changes[0], actor, startOp, clock, events, diffValue),
@@ -196,7 +207,10 @@ function patchOptions(doc, options, source) {
 }
 
 function progress(before, after, callback, source, beforeHeads, compute, patches = null) {
-  if (callback && !patches) patches = compute()
+  const residue = residues.get(before), prefix = residue && residue.patches.concat(diff(before, residue.from, residue.to))
+  const recent = prefix ? () => prefix.concat(compute()) : compute
+  if (prefix && patches) patches = prefix.concat(patches)
+  if (callback && !patches) patches = recent()
   if (callback && patches.length > 0) callback(patches, {before, after, source})
   const heads = getHeads(after), state = Frontend.getBackendState(after)
   diffCache.set(state.state, {before: getHeads(before), after: heads, objectId: '_root', recursive: true, compute})
@@ -204,7 +218,7 @@ function progress(before, after, callback, source, beforeHeads, compute, patches
   if (!changed) {
     if (recentPatches.has(before)) recentPatches.set(after, recentPatches.get(before))
   } else if (beforeHeads) {
-    recentPatches.set(after, {before: beforeHeads, after: heads, patches, compute})
+    recentPatches.set(after, {before: beforeHeads, after: heads, patches, compute: recent})
   }
 }
 
@@ -439,7 +453,7 @@ export function addFragments(doc, fragments, options) {
   try {
     [newState, patch] = backend.loadIncremental(state, data)
   } catch (error) {
-    if (state.frozen) throw error
+    if (state.frozen || error instanceof PanicError) throw error
     throw new RangeError(`error loading fragment bundles: ${parseErrorMessage(data, error, 'chunk')}`)
   }
   if (!patch) {
@@ -472,9 +486,11 @@ export function getHistory(doc) {
 
 export function view(doc, heads) {
   if (!Array.isArray(heads)) throw new TypeError('Pass an array of hashes to view()')
+  materialized(doc)
   const [state, patch] = backend.view(Frontend.getBackendState(doc, 'view'), heads)
   const snapshot = Frontend.applyPatch(init({freeze: doc[OPTIONS].freeze}), patch, state)
   viewDocs.add(snapshot)
+  viewSources.set(snapshot, viewSources.get(doc) || doc)
   if (recentPatches.has(doc)) recentPatches.set(snapshot, recentPatches.get(doc))
   return snapshot
 }
@@ -485,83 +501,69 @@ export function changeAt(doc, heads, options, callback) {
     callback = options
     options = undefined
   }
-  const current = getHeads(doc)
-  if (heads.length === current.length && heads.every((hash, i) => hash === current[i])) {
-    const newDoc = changeWithSource(doc, options, callback, 'changeAt')
-    return {newDoc, newHeads: newDoc === doc ? null : getHeads(newDoc)}
+  if (isolations.has(doc) || !equals(heads, getHeads(doc))) return isolatedChange(doc, heads, options, callback, 'changeAt')
+  const newDoc = changeWithSource(doc, options, callback, 'changeAt')
+  return {newDoc, newHeads: newDoc === doc ? null : getHeads(newDoc)}
+}
+
+function isolatedChange(doc, heads, options, callback, source) {
+  assertWritable(doc)
+  if (typeof options === 'function') {
+    callback = options
+    options = undefined
   }
-  const isolated = backend.isolatedActor(Frontend.getBackendState(doc, 'changeAt'), Frontend.getActorId(doc), heads)
-  const branch = clone(view(doc, heads), {actor: isolated.actor})
+  const state = Frontend.getBackendState(doc, source), current = backend.getHeads(state)
+  const points = (isolations.get(doc) || [current]).slice(), moved = !equals(points.at(-1), heads)
+  if (moved) points.push(heads)
+  const isolated = backend.isolatedActor(state, Frontend.getActorId(doc), heads)
+  const [scoped, scopePatch] = backend.view(state, heads)
+  scoped.state = backend.clone(state).state
+  const branch = Frontend.applyPatch(init({actor: isolated.actor}), scopePatch, scoped)
+  branch[STATE].seq = isolated.seq - 1
   // The Rust implementation numbers the operations of the isolated change
   // above every operation in the document, not just those it can see, so that
   // successive changes at the same heads are ordered by the order they were
   // made.
   branch[STATE].maxOp = Math.max(branch[STATE].maxOp, doc[STATE].maxOp)
-  backend.isolateAnchors(Frontend.getBackendState(branch, 'changeAt'), Frontend.getBackendState(doc, 'changeAt'), heads)
-  let branchPatches = []
+  backend.isolateAnchors(Frontend.getBackendState(branch, source), state, heads)
+  isolatedSources.set(branch[CACHE], doc)
+  let branchEvents = [], changed
   const branchOptions = Object.assign(typeof options === 'string' ? {message: options} : Object.assign({}, options),
-    {patchCallback: patches => { branchPatches = patches }})
-  const changed = changeWithSource(branch, branchOptions, callback, 'changeAt')
-  if (changed === branch) return {newDoc: doc, newHeads: null}
-  const change = decodeChange(getLastLocalChange(changed), true)
-  const ops = Frontend.getBackendState(changed, 'changeAt').state.anchorSource.ops
-  const bytes = encodeChangeRaw(Object.assign(change, {seq: isolated.seq, deps: heads.slice().sort(), ops}))
-  const [newState, patch] = backend.applyChanges(Frontend.getBackendState(doc, 'changeAt'), [bytes])
-  const newDoc = Frontend.applyPatch(doc, patch, newState), newHeads = [decodeChange(bytes).hash]
-  progress(doc, newDoc, isObject(options) && options.patchCallback || doc[OPTIONS].patchCallback, 'changeAt', heads, () => {
-    const objectIds = new Map(diff(doc, current, heads).concat(branchPatches)
-      .map(patch => Object.assign({}, patch, patch.values && {values: patch.values.slice()}))
-      .map(patch => [patch, patchObjectId(changed, patch)]))
-    const isolatedPatches = [...objectIds.keys()].filter(patch => objectIds.get(patch))
-      .sort((left, right) => compareObjectIds(objectIds.get(left), objectIds.get(right)))
-    const merged = []
-    for (const patch of isolatedPatches) {
-      const last = merged[merged.length - 1]
-      if (!last || objectIds.get(last) !== objectIds.get(patch) || !mergePatch(last, patch)) merged.push(patch)
+    {patchCallback: (patch, before, after, local, changes, events) => { branchEvents = events }})
+  try {
+    changed = Frontend.change(branch, branchOptions, callback)[0]
+  } catch (error) {
+    isolations.set(doc, points)
+    throw error
+  }
+  if (changed === branch) {
+    if (moved) {
+      isolations.delete(doc)
+      const residue = residues.get(doc), pending = residue ? residue.patches.concat(diff(doc, residue.from, residue.to)) : []
+      residues.set(doc, {patches: pending.concat(points.slice(1).flatMap((point, i) => diff(doc, points[i], point))), from: heads, to: current})
     }
-    return merged.filter(patch => patch.action !== 'splice' || patch.value !== '').concat(diff(newDoc, newHeads, getHeads(newDoc)))
-  })
+    return {newDoc: doc, newHeads: null}
+  }
+  const change = decodeChange(getLastLocalChange(changed), true)
+  const ops = Frontend.getBackendState(changed, source).state.anchorSource.ops
+  const bytes = encodeChangeRaw(Object.assign(change, {seq: isolated.seq, deps: heads.slice().sort(), ops}))
+  const loaded = backend.isLoaded(state), [newState, patch] = backend.applyChanges(state, [bytes])
+  const newDoc = Frontend.applyPatch(doc, patch, newState), newHeads = [decodeChange(bytes).hash]
+  progress(doc, newDoc, isObject(options) && options.patchCallback || doc[OPTIONS].patchCallback, source, heads, () =>
+    points.slice(1, -1).flatMap((point, i) => diff(doc, points[i], point))
+      .concat(backend.isolatedPatches(newState, points.at(-2) || heads, heads, newHeads, bytes, isolated.actor, branchEvents, diffValue, loaded))
+      .concat(diff(newDoc, newHeads, getHeads(newDoc))))
   return {newDoc, newHeads}
 }
 
-function patchObjectId(doc, patch) {
-  let object = doc
-  for (const key of patch.action === 'mark' ? patch.path : patch.path.slice(0, -1)) {
-    if (!isObject(object)) return undefined
-    const index = object instanceof Frontend.Text && textCursorIndex(object, key)
-    object = object instanceof Frontend.Text ? index < object.length && object.get(index) : valueAt(object, key)
-  }
-  return Frontend.getObjectId(object)
-}
-
-function mergePatch(last, patch) {
-  const at = patch.path[patch.path.length - 1] - last.path[last.path.length - 1]
-  const size = last.action === 'splice' ? last.value.length : last.action === 'insert' ? last.values.length : 0
-  if (patch.action === 'splice' && last.action === 'splice' && at >= 0 && at <= size &&
-      JSON.stringify(patch.marks) === JSON.stringify(last.marks)) {
-    last.value = last.value.slice(0, at) + patch.value + last.value.slice(at)
-  } else if (patch.action === 'insert' && last.action === 'insert' && at >= 0 && at <= size && !patch.conflicts && !last.conflicts) {
-    last.values.splice(at, 0, ...patch.values)
-  } else if (patch.action === 'del' && (last.action === 'splice' || last.action === 'insert') && at >= 0 && at + (patch.length || 1) <= size) {
-    if (last.action === 'splice') last.value = last.value.slice(0, at) + last.value.slice(at + (patch.length || 1))
-    else last.values.splice(at, patch.length || 1)
-  } else if (patch.action === 'del' && last.action === 'del' && at === 0 && typeof patch.path[patch.path.length - 1] === 'number') {
-    last.length = (last.length || 1) + (patch.length || 1)
-  } else {
-    return false
-  }
-  return true
-}
-
-function compareObjectIds(left, right) {
-  if (left === right) return 0
-  if (left === '_root') return -1
-  if (right === '_root') return 1
-  const l = parseOpId(left), r = parseOpId(right)
-  return l.counter - r.counter || (l.actorId < r.actorId ? -1 : 1)
+function materialized(doc) {
+  const source = viewSources.get(doc) || doc
+  residues.delete(source)
+  if (isolations.has(source)) isolations.set(source, [isolations.get(source).at(-1)])
 }
 
 export function toJS(value) {
+  if (isObject(value) && value[STATE]) materialized(value)
   if (value instanceof Frontend.Text) {
     let text = ''
     for (const item of value) text += typeof item === 'string' ? item : '\ufffc'
@@ -1449,7 +1451,9 @@ export function block(doc, path, index) {
   const target = richTextTarget(doc, path, index, 'block', false)
   if (!target) return null
   const value = 'element' in target ? target.element : target.text.get(target.index)
-  return isRecord(value) ? toJS(value) : null
+  if (!isRecord(value)) return null
+  const context = doc[CHANGE], source = context && isolatedSources.get(context.cache), objectId = Frontend.getObjectId(value)
+  return toJS(source && !context.updated[objectId] && source[CACHE][objectId] || value)
 }
 
 export function splitBlock(doc, path, index, value) {
@@ -1461,7 +1465,7 @@ export function splitBlock(doc, path, index, value) {
 
 export function joinBlock(doc, path, index) {
   const target = richTextTarget(doc, path, index, 'joinBlock', true)
-  target.text.deleteAt(target.index)
+  target.text.context.splice(target.text.path, target.index, 1, [], target.offset)
 }
 
 export function updateBlock(doc, path, index, value) {
@@ -1470,8 +1474,8 @@ export function updateBlock(doc, path, index, value) {
   // The Rust implementation deletes the existing block marker and inserts a
   // replacement built with its properties in sorted order, rather than
   // overwriting the element in place.
-  target.text.deleteAt(target.index)
-  if (target.offset > textLength(richTextTarget(doc, path, 0, name, false).text)) {
+  target.text.context.splice(target.text.path, target.index, 1, [], target.offset)
+  if (target.offset > textLength(richTextTarget(doc, path, 0, 'splitBlock', false).text)) {
     throw new RangeError(RICH_TEXT_ERRORS[name] + `index ${target.offset} is out of bounds`)
   }
   const split = richTextTarget(doc, path, target.offset, 'splitBlock', false)

@@ -1,5 +1,5 @@
 import { CHANGE, OBJECT_ID, PROXY_PATH, STATE } from './constants.js'
-import { isObject } from '../src/common.js'
+import { compareUtf8, isObject } from '../src/common.js'
 import { Text } from './text.js'
 import { Counter } from './counter.js'
 function parseListIndex(key) {
@@ -144,7 +144,7 @@ const MapHandler = {
 
   ownKeys (target) {
     const { context, objectId } = target
-    return Object.keys(context.getObject(objectId))
+    return Object.keys(context.getObject(objectId)).sort(compareUtf8)
   }
 }
 

@@ -1,5 +1,5 @@
 import { CACHE, CONFLICTS, ELEM_IDS, OBJECT_ID, OPTIONS, STATE } from './constants.js'
-import { interpretPatch, lamportCompare } from './apply_patch.js'
+import { interpretPatch, isIntegralFloat, lamportCompare } from './apply_patch.js'
 import { Text, elemAt, textOffset } from './text.js'
 import { Counter, getWriteableCounter } from './counter.js'
 import { Float64, Int, Uint } from './numbers.js'
@@ -426,7 +426,7 @@ class Context {
    * Updates the list object at path `path`, deleting `deletions` list elements starting from
    * list index `start`, and inserting the list of new elements `insertions` at that position.
    */
-  splice(path, start, deletions, insertions) {
+  splice(path, start, deletions, insertions, blockOffset) {
     const objectId = pathObjectId(path)
     const list = this.getObject(objectId)
     if (deletions < 0) {
@@ -468,7 +468,9 @@ class Context {
         if (list instanceof Text) {
           const at = textOffset(list, start)
           const inserted = insertions.reduce((width, value) => width + (typeof value === 'string' ? value.length : 1), 0)
-          this.events.push({objectId, kind: 'del', prop: at + inserted, length: textOffset(list, start + deletions) - at})
+          this.events.push(blockOffset === undefined
+            ? {objectId, kind: 'del', prop: at + inserted, length: textOffset(list, start + deletions) - at}
+            : {objectId, kind: 'del', prop: blockOffset, length: deletions})
         } else {
           this.events.push({objectId, kind: 'del', prop: start + insertions.length, length: deletions})
         }
@@ -554,7 +556,7 @@ function isScalarObject(value, hydrate = false) {
 }
 
 function assignment(object, key, value, textV2) {
-  if (value === undefined || (textV2 && typeof value === 'string') || !sameValue(object[key], value)) return 'set'
+  if (value === undefined || (textV2 && typeof value === 'string') || !sameValue(object[key], value, storedFloat(object, key))) return 'set'
   return getPred(object, key).length > 1 ? 'resolve' : null
 }
 
@@ -562,12 +564,21 @@ function winner(opIds) {
   return opIds.reduce((a, b) => (lamportCompare(a, b) > 0 ? a : b))
 }
 
-function sameValue(a, b) {
+function storedFloat(object, key) {
+  const values = !(object instanceof Text) && object[CONFLICTS] && object[CONFLICTS][key]
+  return !!values && isIntegralFloat(values, Object.keys(values).pop())
+}
+
+function sameValue(a, b, float) {
+  if (typeof a === 'number') {
+    const int = !float && Number.isInteger(a)
+    if (typeof b === 'number') return a === b && int === Number.isSafeInteger(b)
+    if (typeof b === 'bigint') return int && a === Number(b)
+    if (b instanceof Int) return int && a === b.value
+    return b instanceof Float64 && !int && a === b.value
+  }
   if (a === b) return true
   if (typeof a === 'bigint' && b instanceof Uint) return a === BigInt(b.value)
-  if (typeof a === 'number' && typeof b === 'bigint') return a === Number(b)
-  if (typeof a === 'number' && b instanceof Int) return a === b.value
-  if (typeof a === 'number' && b instanceof Float64) return a === b.value && !Number.isInteger(a)
   if (isImmutableString(a) && isImmutableString(b)) return a.val === b.val
   if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime()
   if (a instanceof Counter && b instanceof Counter) return a.value === b.value

@@ -321,7 +321,7 @@ function getHashesToSend(doc, have, need, theirHeads) {
 function saveDoc(backend, doc) {
   const saveCursor = doc.saveCursor
   try {
-    return concatChunks([Backend.save(backend), ...doc.queue.map(change => change.buffer)])
+    return Backend.save(backend)
   } finally {
     doc.saveCursor = saveCursor
   }

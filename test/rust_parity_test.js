@@ -655,4 +655,203 @@ describe('@automerge/automerge 3.5.0 parity', () => {
       assert.deepStrictEqual(patches, [{action: 'insert', path: ['l', 0], values: ['']}, {action: 'splice', path: ['l', 1, 0], value: 'x'}])
     })
   })
+
+  describe('unified fuzz regressions', () => {
+    function fail(fn) {
+      try {
+        fn()
+      } catch (error) {
+        return `${error.name}: ${error.message}`
+      }
+    }
+    function patchesOf(fn) {
+      const patches = []
+      fn(p => patches.push(...p))
+      return patches
+    }
+
+    it('replaces the only block of a text', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.t = '' })
+      doc = Automerge.change(doc, {time: 0}, draft => Automerge.splitBlock(draft, ['t'], 0, {type: 'li', parents: [], attrs: {}}))
+      doc = Automerge.change(doc, {time: 0}, draft => Automerge.updateBlock(draft, ['t'], 0, {type: 'paragraph', parents: [], attrs: {}}))
+      assert.deepStrictEqual(Automerge.spans(doc, ['t']).map(span => (span.type === 'block' ? span.value.type : span.value)), ['paragraph'])
+      assert.deepStrictEqual(Automerge.getHeads(doc), ['ee08f605d80bb4c28a82327b6f9e1e195ccc13078e8541d1c6753e01d442ad7d'])
+    })
+
+    it('reports block deletions as one element at the requested offset', () => {
+      const doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.t = 'a😀b'; draft.u = '{}' })
+      const patches = patchesOf(cb => Automerge.change(doc, {time: 0, patchCallback: cb}, draft => {
+        Automerge.joinBlock(draft, ['t'], 2)
+        Automerge.splice(draft, ['u'], 1, 0, '👨‍👩')
+        Automerge.joinBlock(draft, ['u'], 4)
+      }))
+      assert.deepStrictEqual(patches, [{action: 'del', path: ['t', 2]}, {action: 'splice', path: ['u', 1], value: '👨‍�'}])
+    })
+
+    it('enumerates map keys in sorted order inside a change', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.m = {z: 1, b: 2}; draft.k = 1 })
+      const keys = []
+      doc = Automerge.change(doc, {time: 0}, draft => {
+        draft.c = 1; draft.a = 2; draft.m.a = 3
+        keys.push(Object.keys(draft).join(), Object.keys(draft.m).join(), JSON.stringify(draft))
+      })
+      assert.deepStrictEqual(keys, ['a,c,k,m', 'a,b,z', '{"a":2,"c":1,"k":1,"m":{"a":3,"b":2,"z":1}}'])
+      assert.deepStrictEqual(Object.keys(doc), ['k', 'm', 'c', 'a'])
+    })
+
+    it('compares integral floats by datatype when assigning', () => {
+      const doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => {
+        draft.f = new Automerge.Float64(3); draft.z = new Automerge.Float64(0); draft.l = [0, -2, 3]
+      })
+      function ops(fn) {
+        const next = Automerge.change(Automerge.clone(doc, ACTOR_B), {time: 0}, fn)
+        if (Automerge.getHeads(next).join() === Automerge.getHeads(doc).join()) return []
+        return Automerge.decodeChange(Automerge.getLastLocalChange(next)).ops.map(op => [op.key || op.elemId, op.value, op.datatype])
+      }
+      assert.deepStrictEqual(ops(draft => { draft.f = 3 }), [['f', 3, 'int']])
+      assert.deepStrictEqual(ops(draft => { draft.f = new Automerge.Int(3) }), [['f', 3, 'int']])
+      assert.deepStrictEqual(ops(draft => { draft.f = new Automerge.Float64(3) }), [])
+      assert.deepStrictEqual(ops(draft => { draft.z = 0 }), [['z', 0, 'int']])
+      assert.deepStrictEqual(ops(draft => { draft.l[0] = 0; draft.l[1] = -2; draft.l[2] = 3 }), [[`4@${ACTOR_A}`, 0, 'int'], [`5@${ACTOR_A}`, -2, 'int']])
+      assert.deepStrictEqual(ops(draft => { draft.l[0] = new Automerge.Float64(0) }), [])
+      const loaded = Automerge.load(Automerge.save(doc), {actor: ACTOR_B})
+      assert.deepStrictEqual(Automerge.getHeads(Automerge.change(loaded, {time: 0}, draft => { draft.f = new Automerge.Float64(3) })), Automerge.getHeads(doc))
+    })
+
+    it('sends orphaned changes once in a full-document sync message', () => {
+      let a = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.x = 1 })
+      a = Automerge.change(a, {time: 0}, draft => { draft.y = 1 })
+      a = Automerge.change(a, {time: 0}, draft => { draft.z = 1 })
+      const [b] = Automerge.applyChanges(Automerge.init(ACTOR_B), [Automerge.getAllChanges(a)[0], Automerge.getAllChanges(a)[2]])
+      let [state, message] = Automerge.generateSyncMessage(b, Automerge.initSyncState())
+      const peer = Automerge.init('cccc')
+      const [, peerState] = Automerge.receiveSyncMessage(peer, Automerge.initSyncState(), message)
+      ;[, message] = Automerge.generateSyncMessage(peer, peerState)
+      ;[, state] = Automerge.receiveSyncMessage(b, state, message)
+      ;[state, message] = Automerge.generateSyncMessage(b, state)
+      assert.strictEqual(message.length, 258)
+      assert.strictEqual(Automerge.decodeSyncMessage(message).changes.length, 1)
+    })
+
+    it('panics like wasm when applying changes out of sequence', () => {
+      let a = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.x = 1 })
+      const first = Automerge.getHeads(a)
+      a = Automerge.emptyChange(a, {time: 0})
+      a = Automerge.changeAt(a, first, {time: 0}, draft => { draft.y = 2 }).newDoc
+      const changes = Automerge.getAllChanges(a)
+      assert.deepStrictEqual(changes.map(change => Automerge.decodeChange(change).seq), [1, 2, 3])
+      assert.strictEqual(fail(() => Automerge.applyChanges(Automerge.init(ACTOR_B), [changes[0], changes[2]])),
+        'PanicError: assertion `left == right` failed\n  left: 2\n right: 3')
+    })
+
+    function missing(op) {
+      const base = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.t = 'xy'; draft.l = [1, 2] })
+      const change = Automerge.encodeChange({actor: 'cccc', seq: 1, startOp: 20, time: 0, message: null, deps: Automerge.getHeads(base), ops: [op]})
+      return fail(() => Automerge.applyChanges(Automerge.load(Automerge.save(base)), [change]))
+    }
+
+    it('panics like wasm when inserting after a missing element', () => {
+      assert.strictEqual(missing({action: 'set', obj: `1@${ACTOR_A}`, elemId: `11@${ACTOR_A}`, insert: true, value: 'L', pred: []}),
+        'PanicError: assertion failed: self.entry.is_empty()')
+    })
+
+    it('panics like wasm when a change references an unknown actor', () => {
+      assert.strictEqual(missing({action: 'set', obj: `1@${ACTOR_A}`, elemId: `11@${ACTOR_B}`, insert: true, value: 'L', pred: []}),
+        'PanicError: called `Option::unwrap()` on a `None` value')
+    })
+
+    it('applies a batch whose changes anchor on each other out of causal order', () => {
+      let base = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.t = 'x' })
+      const scope = Automerge.getHeads(base)
+      let b = Automerge.change(Automerge.clone(base, ACTOR_B), {time: 0}, draft => Automerge.mark(draft, ['t'], {start: 0, end: 1, expand: 'both'}, 'b', true))
+      b = Automerge.changeAt(b, scope, {time: 0}, draft => Automerge.splice(draft, ['t'], 0, 0, 'y')).newDoc
+      const added = Automerge.getChanges(base, b).reverse()
+      const [merged] = Automerge.applyChanges(base, added)
+      assert.deepStrictEqual(Automerge.getHeads(merged), Automerge.getHeads(b))
+      assert.strictEqual(Automerge.toJS(merged).t, 'yx')
+    })
+
+    it('makes changes at heads that skip an empty change of the same actor', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.x = 1 })
+      const first = Automerge.getHeads(doc)
+      doc = Automerge.emptyChange(doc, {time: 0})
+      const second = Automerge.changeAt(doc, first, {time: 0}, draft => { draft.y = 2 })
+      const third = Automerge.changeAt(second.newDoc, second.newHeads, {time: 0}, draft => { draft.z = 3 })
+      assert.deepStrictEqual(third.newHeads, ['89ce537076197a72720bbb6f14dc1c8290b605b8ba912f6ea1ae5d6df52d8e4f'])
+      assert.deepStrictEqual(Automerge.toJS(third.newDoc), {x: 1, y: 2, z: 3})
+    })
+
+    it('makes changes at heads that include an insertion anchored outside them', () => {
+      let base = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.t = 'x' })
+      const scope = Automerge.getHeads(base)
+      base = Automerge.change(base, {time: 0}, draft => Automerge.mark(draft, ['t'], {start: 0, end: 1, expand: 'both'}, 'b', true))
+      const anchored = Automerge.changeAt(base, scope, {time: 0}, draft => Automerge.splice(draft, ['t'], 0, 0, 'y'))
+      const later = Automerge.changeAt(anchored.newDoc, anchored.newHeads, {time: 0}, draft => Automerge.splice(draft, ['t'], 0, 0, 'z'))
+      assert.deepStrictEqual(later.newHeads, ['32dbae020cf42b7f87afc831b6f9deb77830e0a5bc4aa13fda0781275383d526'])
+      assert.strictEqual(Automerge.toJS(later.newDoc).t, 'zyx')
+    })
+
+    it('sorts the isolation diff together with the change at the new heads', () => {
+      let doc = Automerge.change(Automerge.init({actor: ACTOR_A}), {time: 0}, draft => { draft.l = [{t: ''}] })
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => Automerge.splice(draft, ['l', 0, 't'], 0, 0, 'c'))
+      const patches = patchesOf(cb => Automerge.changeAt(doc, scope, {time: 0, patchCallback: cb}, draft => { draft.l.insertAt(0, 'txt8') }))
+      assert.deepStrictEqual(patches, [{action: 'insert', path: ['l', 0], values: ['']}, {action: 'del', path: ['l', 1, 't', 0]},
+        {action: 'splice', path: ['l', 0, 0], value: 'txt8'}, {action: 'splice', path: ['l', 1, 't', 0], value: 'c'}])
+    })
+
+    it('drops isolation events of later actors on a freshly loaded document', () => {
+      const a = Automerge.change(Automerge.init('11'), {time: 0}, draft => { draft.k = 0 })
+      const b = Automerge.change(Automerge.clone(a, '22'), {time: 0}, draft => { draft.m = {p: 'q'} })
+      let doc = Automerge.merge(Automerge.clone(a, '11'), b)
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.m.p = 'r'; draft.k = 1 })
+      const loaded = Automerge.load(Automerge.save(doc), {actor: '11'})
+      const synced = Automerge.change(Automerge.load(Automerge.save(doc), {actor: '11'}), {time: 0}, draft => { draft.v = 1 })
+      const stale = patchesOf(cb => Automerge.changeAt(loaded, scope, {time: 0, patchCallback: cb}, draft => { draft.w = 1 }))
+      const fresh = patchesOf(cb => Automerge.changeAt(synced, scope, {time: 0, patchCallback: cb}, draft => { draft.w = 1 }))
+      assert.deepStrictEqual(stale, [{action: 'put', path: ['k'], value: 0}, {action: 'put', path: ['w'], value: 1}, {action: 'put', path: ['k'], value: 1},
+        {action: 'put', path: ['m', 'p'], value: ''}, {action: 'splice', path: ['m', 'p', 0], value: 'r'}])
+      assert.deepStrictEqual(fresh, [{action: 'put', path: ['k'], value: 0}, {action: 'del', path: ['v']}, {action: 'put', path: ['w'], value: 1},
+        {action: 'put', path: ['m', 'p'], value: ''}, {action: 'splice', path: ['m', 'p', 0], value: 'q'}, {action: 'put', path: ['k'], value: 1},
+        {action: 'put', path: ['v'], value: 1}, {action: 'put', path: ['m', 'p'], value: ''}, {action: 'splice', path: ['m', 'p', 0], value: 'r'}])
+    })
+
+    it('reports an empty change at other heads with the next patch', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.x = 1 })
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.y = 2 })
+      const empty = Automerge.changeAt(doc, scope, {time: 0}, () => {})
+      assert.strictEqual(empty.newHeads, null)
+      const patches = patchesOf(cb => Automerge.change(doc, {time: 0, patchCallback: cb}, draft => { draft.z = 3 }))
+      assert.deepStrictEqual(patches, [{action: 'del', path: ['y']}, {action: 'put', path: ['y'], value: 2}, {action: 'put', path: ['z'], value: 3}])
+    })
+
+    it('stays isolated at the heads of a changeAt that threw', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.a = 1; draft.t = 'hello' })
+      const first = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.b = 2; Automerge.splice(draft, ['t'], 5, 0, ' world') })
+      const second = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.a = 9 })
+      assert.strictEqual(fail(() => Automerge.changeAt(doc, first, {time: 0}, () => { throw new RangeError('boom') })), 'RangeError: boom')
+      assert.deepStrictEqual(Automerge.getHeads(doc), first)
+      assert.strictEqual(fail(() => Automerge.changeAt(doc, second, {time: 0}, () => { throw new RangeError('again') })), 'RangeError: again')
+      assert.deepStrictEqual(Automerge.getHeads(doc), second)
+      const patches = patchesOf(cb => { doc = Automerge.change(doc, {time: 0, patchCallback: cb}, draft => { draft.c = 3 }) })
+      const change = Automerge.decodeChange(Automerge.getAllChanges(doc).at(-1))
+      assert.deepStrictEqual([change.actor, change.seq, change.deps], ['13b2230901' + ACTOR_A, 1, second])
+      assert.deepStrictEqual(patches, [{action: 'put', path: ['a'], value: 1}, {action: 'del', path: ['b']}, {action: 'del', path: ['t', 5], length: 6},
+        {action: 'put', path: ['b'], value: 2}, {action: 'put', path: ['c'], value: 3}, {action: 'splice', path: ['t', 5], value: ' world'}, {action: 'put', path: ['a'], value: 9}])
+      assert.deepStrictEqual(Automerge.toJS(doc), {a: 9, b: 2, c: 3, t: 'hello world'})
+    })
+
+    it('reads the block of an untouched element at the current heads inside changeAt', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.l = [{t: 'x'}] })
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => Automerge.splice(draft, ['l', 0, 't'], 0, 0, 'q'))
+      let block
+      Automerge.changeAt(doc, scope, {time: 0}, draft => { block = Automerge.block(draft, ['l'], 0); draft.w = 1 })
+      assert.deepStrictEqual(block, {t: 'qx'})
+    })
+  })
 })

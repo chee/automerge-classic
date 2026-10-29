@@ -82,6 +82,9 @@ function wellFormedString(string) {
   return string.replace(/([\ud800-\udbff][\udc00-\udfff])|[\ud800-\udfff]/g, (match, pair) => pair || '\ufffd')
 }
 
+class PanicError extends Error {}
+Object.defineProperty(PanicError.prototype, 'name', {value: 'PanicError'})
+
 export {
-  isObject, copyObject, parseOpId, equalBytes, createArrayOfNulls, compareUtf8, wellFormedString
+  isObject, copyObject, parseOpId, equalBytes, createArrayOfNulls, compareUtf8, wellFormedString, PanicError
 }

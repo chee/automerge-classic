@@ -1,4 +1,4 @@
-import { compareUtf8, copyObject, parseOpId } from '../src/common.js'
+import { PanicError, compareUtf8, copyObject, parseOpId, wellFormedString } from '../src/common.js'
 import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, decodeChangeColumns, decodeChangeMeta, decodeDocumentHeader, decodeValue, decoderByColumnId, documentChanges, encodeDocumentHeader, encoderByColumnId, makeDecoders } from './columnar.js'
 import * as ColumnData from './column_data.js'
 import { Decoder, Encoder } from './encoding.js'
@@ -512,6 +512,10 @@ function visibleListElements(docState, blockIndex, objActorNum, objCtr) {
   }
 }
 
+function referenceNotFound({keyCtr, keyActor, insert}) {
+  return Object.assign(new RangeError(`Reference element not found: ${keyCtr}@${keyActor}`), insert && {panic: 'assertion failed: self.entry.is_empty()'})
+}
+
 /**
  * Scans the blocks of document operations to find the position where a new operation should be
  * inserted. Returns an object with keys:
@@ -555,7 +559,7 @@ function seekToOp(docState, ops, startBlockIndex) {
           // If we reach the end of the list object without a Bloom filter hit, the reference element
           // doesn't exist
           if (docState.blocks[blockIndex].lastObjectCtr > objCtr) {
-            throw new RangeError(`Reference element not found: ${keyCtr}@${keyActor}`)
+            throw referenceNotFound(ops)
           }
 
           // Add up number of visible list elements in any blocks we skip, for list index computation
@@ -577,7 +581,7 @@ function seekToOp(docState, ops, startBlockIndex) {
         if (found) {
           return {blockIndex, skipCount, visibleCount: totalVisible + visibleCount}
         } else {
-          throw new RangeError(`Reference element not found: ${keyCtr}@${keyActor}`)
+          throw referenceNotFound(ops)
         }
 
       } else if (found && skipCount < docState.blocks[blockIndex].numOps) {
@@ -2064,7 +2068,7 @@ function getActorTable(actorIds, actorIndexById, change) {
   for (let actorId of change.actorIds) {
     const index = actorIndexById.get(actorId)
     if (index === undefined) {
-      throw new RangeError(`actorId ${actorId} is not known to document`)
+      throw new PanicError('called `Option::unwrap()` on a `None` value')
     }
     actorTable.push(index)
   }
@@ -2224,7 +2228,7 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
         return [[], decodedChanges]
       }
     } else if (change.seq > expectedSeq) {
-      throw new RangeError(`Skipped sequence number ${expectedSeq} for actor ${change.actor}`)
+      throw new PanicError(`assertion \`left == right\` failed\n  left: ${expectedSeq}\n right: ${change.seq}`)
     } else {
       clock[change.actor] = change.seq
       changeHashes.add(change.hash)
@@ -2242,7 +2246,7 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
         updateBlockColumns(docState, makeDecoders(change.columns, CHANGE_COLUMNS))
       }
     }
-    let changeState = {changes: applied, changeIndex: -1, objectIds}
+    let changeState = {changes: applied.slice().sort((a, b) => a.startOp - b.startOp), changeIndex: -1, objectIds}
     readNextChangeOp(docState, changeState)
     while (!changeState.done) applyOps(patches, changeState, docState)
 
@@ -3478,7 +3482,7 @@ function exportPatch(ctx, patch) {
     return result
   }
   if (patch.action === 'splice') {
-    const result = {action: 'splice', path: patch.path, value: patch.value}
+    const result = {action: 'splice', path: patch.path, value: wellFormedString(patch.value)}
     if (patch.marks) result.marks = Object.fromEntries(patch.marks.map(([name, value]) => [name, ctx.valueOf(value, true)]))
     return result
   }
@@ -3552,6 +3556,35 @@ function localPatches(doc, change, actor, startOp, afterClock, events, valueOf) 
   return buildPatches(ctx, sorted)
 }
 
+function staleObjectId(objectId, actors, stale) {
+  if (objectId === '_root') return objectId
+  const {counter, actorId} = parseOpId(objectId)
+  return `${counter}@${actors[stale.indexOf(actorId)]}`
+}
+
+function isolatedPatches(doc, current, scope, after, touched, change, actor, events, valueOf, loaded) {
+  const isolation = diffContext(doc, current, scope, touched, valueOf, '_root', false), diffEvents = []
+  for (const objectId of [...touched.keys()].sort(compareObjectIds)) {
+    if (reachable(isolation, objectId)) objectEvents(isolation, objectId, diffEvents)
+  }
+  if (loaded && decodeChangeMeta(change).seq === 1) {
+    const actors = doc.actorIds.slice().sort(), stale = actors.filter(actorId => actorId !== doc.actorIds[actor])
+    for (const event of diffEvents) event.objectId = staleObjectId(event.objectId, actors, stale)
+    isolation.exposed = isolation.exposed.map(objectId => staleObjectId(objectId, actors, stale)).sort(compareObjectIds)
+  }
+  const changed = new Map()
+  changeObjects(decodeTargets(change), changed, doc.actorIndexById)
+  const local = diffContext(doc, scope, after, changed, valueOf, '_root', false)
+  const ctx = diffContext(doc, scope, after, new Map(), valueOf, '_root', false)
+  ctx.exposed = isolation.exposed
+  const sorted = diffEvents.concat(events.map(event => {
+    if (event.kind === 'put' || event.kind === 'insert') return Object.assign({}, event, {value: valueOf(event.value), conflict: false})
+    if (event.kind === 'splice') return Object.assign({}, event, {marks: spliceMarks(local, event, actor)})
+    return event
+  })).sort((left, right) => compareObjectIds(left.objectId, right.objectId))
+  return buildPatches(ctx, sorted)
+}
+
 function buildPatches(ctx, events) {
   for (const event of events) {
     while (ctx.exposed.length > 0 && compareObjectIds(ctx.exposed[0], event.objectId) < 0) flushExposed(ctx, ctx.exposed[0])
@@ -3585,6 +3618,7 @@ class BackendDoc {
     this.objectsWithMarks = new Set()
 
     if (buffer) {
+      this.loaded = true
       const doc = decodeDocumentHeader(buffer)
       const {clock, headActors, numChanges} = readDocumentChanges(doc)
       this.binaryDoc = buffer
@@ -3735,6 +3769,7 @@ class BackendDoc {
     copy.anchorSource = this.anchorSource
     copy.queue = this.queue // immutable, no copying needed
     copy.saveCursor = this.saveCursor
+    copy.loaded = this.loaded
     copy.changesEncoders = this.changesEncoders &&
       this.changesEncoders.map(col => ({columnId: col.columnId, encoder: col.encoder.clone()}))
     copy.changesColumns = this.changesColumns
@@ -3750,7 +3785,7 @@ class BackendDoc {
    * document. Returns a patch to apply to the frontend. If an exception is thrown, the document
    * object is not modified.
    */
-  applyChanges(changeBuffers, isLocal = false) {
+  applyChanges(changeBuffers, isLocal = false, inOrder = false) {
     if (changeBuffers instanceof Uint8Array) {
       throw new TypeError('applyChanges takes an array of Uint8Arrays, not just a single Uint8Array')
     }
@@ -3763,10 +3798,10 @@ class BackendDoc {
       const decoded = decodeChangeColumns(buffer)
       decoded.buffer = buffer
       return decoded
-    }), isLocal)
+    }), isLocal, inOrder)
   }
 
-  applyDecodedChanges(decodedChanges, isLocal) {
+  applyDecodedChanges(decodedChanges, isLocal, inOrder) {
     let queue = this.queue.concat(decodedChanges)
     if (!this.haveHashGraph) {
       const hashes = new Set(queue.map(change => change.hash))
@@ -3775,7 +3810,7 @@ class BackendDoc {
         this.computeHashGraph()
       }
     }
-    if (queue.length > 1) queue = topologicalOrder(queue, this.changeIndexByHash)
+    if (queue.length > 1 && !inOrder) queue = topologicalOrder(queue, this.changeIndexByHash)
 
     let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
     let docState = {
@@ -3858,6 +3893,7 @@ class BackendDoc {
     this.queue        = queue
     this.binaryDoc    = null
     this.initPatch    = null
+    this.loaded       = false
     if (objectIds.size > 0) {
       this.cursorIndex = new Map(this.cursorIndex)
       for (const objectId of objectIds) this.cursorIndex.delete(objectId)
@@ -4211,6 +4247,13 @@ class BackendDoc {
 
   localPatches(change, actorId, startOp, clock, events, valueOf) {
     return localPatches(this, change, this.actorIndexById.get(actorId), startOp, this.opClock(clock), events, valueOf)
+  }
+
+  isolatedPatches(currentHeads, scopeHeads, newHeads, change, actorId, events, valueOf, loaded) {
+    if (!this.haveHashGraph) this.computeHashGraph()
+    const current = this.headsClock(currentHeads), scope = this.headsClock(scopeHeads)
+    return isolatedPatches(this, this.opClock(current), this.opClock(scope), this.opClock(this.headsClock(newHeads)),
+      this.touchedObjects(current, scope, changeTargets), change, this.actorIndexById.get(actorId), events, valueOf, loaded)
   }
 
   sequenceInserts(objectId, clock) {

@@ -30,15 +30,17 @@ function checkActorId(actorId) {
  * `state`, and returns a new immutable document root object based on `doc` that reflects
  * those updates.
  */
-function updateRootObject(doc, updated, state) {
+function updateRootObject(doc, updated, state, sortNewKeys = true) {
   let newDoc = updated._root
   if (!newDoc) {
     newDoc = cloneMapObject(doc[CACHE]._root, '_root')
     updated._root = newDoc
   }
   const updatedIds = Object.keys(updated)
-  for (let objectId of updatedIds) {
-    reorderNewKeys(updated[objectId])
+  if (sortNewKeys) {
+    for (let objectId of updatedIds) {
+      reorderNewKeys(updated[objectId])
+    }
   }
 
   const previous = doc[CACHE], base = Object.getPrototypeOf(previous)
@@ -109,7 +111,7 @@ function makeChange(doc, context, options) {
       state.clock = patch.clock
       state.deps = patch.deps
       state.maxOp = Math.max(state.maxOp, patch.maxOp)
-      newDoc = updateRootObject(doc, context.updated, state)
+      newDoc = updateRootObject(doc, context.updated, state, doc[OPTIONS].backend.getHeads(doc[STATE].backendState).length === 0)
     } else {
       newDoc = applyPatchToDoc(doc, patch, state)
     }
