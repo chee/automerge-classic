@@ -821,10 +821,10 @@ function encodeChangeContainer(change, actorIds, extraBytes, opColumns) {
   return decoded
 }
 
-function decodeChangeColumns(buffer) {
+function decodeChangeColumns(buffer, computeHash = true) {
   if (buffer[8] === CHUNK_TYPE_DEFLATE) buffer = recodeChange(buffer, CHUNK_TYPE_CHANGE, inflateRaw)
   const decoder = new Decoder(buffer)
-  const header = decodeContainerHeader(decoder, true)
+  const header = decodeContainerHeader(decoder, computeHash)
   const chunkDecoder = new Decoder(header.chunkData)
   if (!decoder.done) throw new RangeError('Encoded change has trailing data')
   if (header.chunkType !== CHUNK_TYPE_CHANGE) throw new RangeError(`Unexpected chunk type: ${header.chunkType}`)

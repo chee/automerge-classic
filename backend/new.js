@@ -2,7 +2,7 @@ import { compareUtf8, copyObject, parseOpId } from '../src/common.js'
 import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, decodeChangeColumns, decodeChangeMeta, decodeDocumentHeader, decodeValue, decoderByColumnId, documentChanges, encodeDocumentHeader, encoderByColumnId, makeDecoders } from './columnar.js'
 import * as ColumnData from './column_data.js'
 import { Decoder, Encoder } from './encoding.js'
-const MAX_BLOCK_SIZE = 600 // operations
+const MAX_BLOCK_SIZE = 300 // operations
 const MAX_MAP_BLOCK_SIZE = 100
 const BLOOM_BITS_PER_ENTRY = 10, BLOOM_NUM_PROBES = 7 // 1% false positive rate
 const BLOOM_FILTER_SIZE = Math.floor(BLOOM_BITS_PER_ENTRY * MAX_BLOCK_SIZE / 8) // bytes
@@ -21,6 +21,8 @@ const COLUMN_DATA = new WeakMap()
 const DOCUMENT_DECODERS = new WeakMap()
 const COLUMN_SPLICES = new WeakMap()
 const SEQUENCE_INSERTS = new WeakMap()
+const SEQUENCE_ELEMENTS = new WeakMap()
+const NO_SUCC = Object.freeze([]), NO_BYTES = new Uint8Array(0)
 const BLOCK_OBJECTS = new WeakMap()
 const BLOCK_MARKS = new WeakMap()
 const HEADS_CLOCKS = new Map()
@@ -50,7 +52,7 @@ function columnOperationCache(columns) {
 
 function readDocumentRows(decoders) {
   const rows = []
-  while (!decoders[actionIdx].done) rows.push(readDocumentRow(decoders))
+  while (!decoders[actionIdx].done) rows.push(readDocumentRow(decoders, true))
   return rows
 }
 
@@ -65,14 +67,14 @@ function documentDecoders(columns) {
   return decoders
 }
 
-function readDocumentRow(decoders) {
+function readDocumentRow(decoders, shared) {
   const row = new Array(DOC_OPS_COLUMNS.length)
   for (let i = 0; i < valLenIdx; i++) row[i] = decoders[i].readValue()
   row[valLenIdx] = decoders[valLenIdx].readValue()
-  row[valRawIdx] = decoders[valRawIdx].readRawBytes(row[valLenIdx] >>> 4)
+  row[valRawIdx] = row[valLenIdx] >>> 4 || !shared ? decoders[valRawIdx].readRawBytes(row[valLenIdx] >>> 4) : NO_BYTES
   row[11] = decoders[11].readValue()
   row[12] = decoders[12].readValue()
-  const count = decoders[succNumIdx].readValue() || 0, actors = [], counters = []
+  const count = decoders[succNumIdx].readValue() || 0, actors = count || !shared ? [] : NO_SUCC, counters = count || !shared ? [] : NO_SUCC
   for (let i = 0; i < count; i++) {
     actors.push(decoders[succActorIdx].readValue())
     counters.push(decoders[succCtrIdx].readValue())
@@ -2445,24 +2447,86 @@ function blockInserts(block, actorIds, objectId, counter, actor) {
   return entries
 }
 
-function insertAnchor(elems, ref) {
-  const candidates = [{ref, id: null}]
-  const start = ref === '_head' ? 0 : elems.findIndex(e => e.id === ref) + 1
-  if (start === 0 && ref !== '_head') return ref
-  for (let i = start; i < elems.length; i++) {
-    const elem = elems[i]
+function appendBlockElements(block, actorIds, objectId, counter, actor, elems, counters, clock) {
+  const entries = blockInserts(block, actorIds, objectId, counter, actor)
+  let next = 0, leading = false
+  for (const op of columnOperationCache(block.columns).operations) {
+    if (op[objCtrIdx] !== counter || op[objActorIdx] !== actor || op[keyStrIdx] !== null) continue
+    const action = ACTIONS[op[actionIdx]], visible = clock ? visibleAt(op, clock, null) : visibleRow(op, op[succNumIdx], counters)
+    if (op[insertIdx]) {
+      const mark = action !== 'mark' ? null : op[markNameIdx] === null ? 'end' : 'begin'
+      const entry = entries[next++]
+      elems.push({id: entry.id, counter: entry.counter, mark, expand: !!op[expandIdx], visible})
+    } else {
+      if (next === 0) leading = true
+      if (visible && elems.length > 0) elems[elems.length - 1].visible = true
+    }
+  }
+  return leading
+}
+
+function loadPart(seq, k) {
+  if (seq.parts[k] !== undefined) return seq.parts[k]
+  const block = seq.blocks[k]
+  let byObject = SEQUENCE_ELEMENTS.get(block.columns)
+  if (!byObject) SEQUENCE_ELEMENTS.set(block.columns, byObject = new Map())
+  let part = byObject.get(seq.objectId)
+  if (part === undefined) {
+    part = []
+    if (appendBlockElements(block, seq.actorIds, seq.objectId, seq.counter, seq.actor, part, [])) part = null
+    byObject.set(seq.objectId, part)
+  }
+  seq.parts[k] = part && part.slice()
+  return seq.parts[k]
+}
+
+function findElem(seq, id, counter, actor) {
+  for (let k = 0; k < seq.parts.length; k++) {
+    if (!seq.parts[k]) continue
+    const index = seq.parts[k].findIndex(e => e.counter === counter && e.id === id)
+    if (index >= 0) return {part: k, index}
+  }
+  for (let k = 0; k < seq.parts.length; k++) {
+    if (seq.parts[k] !== undefined || actor === undefined || !bloomFilterContains(seq.blocks[k].bloom, actor, counter)) continue
+    const part = loadPart(seq, k)
+    if (part === null) return null
+    const index = part.findIndex(e => e.counter === counter && e.id === id)
+    if (index >= 0) return {part: k, index}
+  }
+  return undefined
+}
+
+function insertAnchor(seq, ref) {
+  let part = 0, index = 0
+  if (ref !== '_head') {
+    const {counter, actorId} = parseOpId(ref), found = findElem(seq, ref, counter, seq.actorIndexById.get(actorId))
+    if (found === null) return null
+    if (found === undefined) return {ref, part, index}
+    part = found.part
+    index = found.index + 1
+  }
+  const candidates = [{ref, id: null, part, index}]
+  for (;; index++) {
+    let elems = loadPart(seq, part)
+    while (elems && index >= elems.length && part < seq.parts.length - 1) {
+      elems = loadPart(seq, ++part)
+      index = 0
+    }
+    if (elems === null) return null
+    if (index >= elems.length) break
+    const elem = elems[index]
     if (elem.mark === 'end') {
       const {counter, actorId} = parseOpId(elem.id)
-      const index = candidates.findIndex(c => c.id === `${counter - 1}@${actorId}`)
-      if (index >= 0) {
-        candidates.length = index
+      const found = candidates.findIndex(c => c.id === `${counter - 1}@${actorId}`)
+      if (found >= 0) {
+        candidates.length = found
         continue
       }
     }
-    if (elem.mark && (elem.mark === 'begin') === elem.expand) candidates.push({ref: elem.id, id: elem.id})
+    if (elem.mark && (elem.mark === 'begin') === elem.expand) candidates.push({ref: elem.id, id: elem.id, part, index: index + 1})
     else if (!elem.mark && elem.visible) break
   }
-  return candidates[candidates.length - 1].ref
+  return candidates[candidates.length - 1]
 }
 
 const SAME = 0, ADD = 1, DEL = 2
@@ -2478,16 +2542,22 @@ function changeTargets(buffer) {
 
 function decodeTargets(buffer) {
   const targets = []
-  const change = decodeChangeColumns(buffer)
+  const change = decodeChangeColumns(buffer, false)
   const columns = makeDecoders(change.columns, CHANGE_COLUMNS).map(column => column.decoder)
   function read(index) {
     return columns[index].done ? null : columns[index].readValue()
   }
+  let lastActor, lastCtr, objectId
   for (let counter = change.startOp; !columns[actionIdx].done; counter++) {
     const action = read(actionIdx), objActor = read(objActorIdx), objCtr = read(objCtrIdx), keyActor = read(keyActorIdx)
     const keyCtr = read(keyCtrIdx), keyStr = read(keyStrIdx), insert = read(insertIdx)
     const element = insert ? [change.actorIds[0], counter] : keyStr === null && keyCtr ? [change.actorIds[keyActor], keyCtr] : null
-    targets.push({objectId: objCtr === null ? '_root' : `${objCtr}@${change.actorIds[objActor]}`, mark: action === MARK_ACTION, element})
+    if (objActor !== lastActor || objCtr !== lastCtr) {
+      objectId = objCtr === null ? '_root' : `${objCtr}@${change.actorIds[objActor]}`
+      lastActor = objActor
+      lastCtr = objCtr
+    }
+    targets.push({objectId, mark: action === MARK_ACTION, element})
   }
   return targets
 }
@@ -2555,23 +2625,23 @@ function groupIncrements(rows, start, end) {
 }
 
 function textWidth(row) {
-  if (row[actionIdx] !== SET_ACTION) return 1
+  if (row[actionIdx] !== SET_ACTION || (row[valLenIdx] === (16 | VALUE_TYPE.UTF8) && row[valRawIdx][0] < 0x80)) return 1
   const decoded = decodeValue(row[valLenIdx], row[valRawIdx])
   return typeof decoded.value === 'string' && !decoded.datatype ? decoded.value.length : 1
 }
 
 function segmentSummary(segment, rows, type) {
   if (segment.summary) return segment.summary
-  const maxCounters = new Map(), children = [], marks = []
+  const maxCounters = [], children = [], marks = []
   let visible = 0
   for (let start = segment.start; start < segment.end;) {
     const end = groupEnd(rows, start, segment.end, type), incs = type === 'text' ? null : groupIncrements(rows, start, end)
     let top = null
     for (let i = start; i < end; i++) {
       const row = rows[i]
-      if (!(row[idCtrIdx] <= maxCounters.get(row[idActorIdx]))) maxCounters.set(row[idActorIdx], row[idCtrIdx])
+      if (!(row[idCtrIdx] <= maxCounters[row[idActorIdx]])) maxCounters[row[idActorIdx]] = row[idCtrIdx]
       for (let j = 0; j < row[succNumIdx]; j++) {
-        if (!(row[succCtrIdx][j] <= maxCounters.get(row[succActorIdx][j]))) maxCounters.set(row[succActorIdx][j], row[succCtrIdx][j])
+        if (!(row[succCtrIdx][j] <= maxCounters[row[succActorIdx][j]])) maxCounters[row[succActorIdx][j]] = row[succCtrIdx][j]
       }
       if (visibleNow(row, incs)) top = row
     }
@@ -2583,7 +2653,7 @@ function segmentSummary(segment, rows, type) {
     }
     start = end
   }
-  segment.summary = {maxCounters: [...maxCounters], children, marks, visible}
+  segment.summary = {maxCounters: maxCounters.flatMap((counter, actor) => (counter === undefined ? [] : [[actor, counter]])), children, marks, visible}
   return segment.summary
 }
 
@@ -2604,10 +2674,10 @@ function touchesBlock(doc, block, key, touched) {
   if (!touched.elements.some(([actor, counter]) => bloomFilterContains(block.bloom, actor, counter))) return false
   const segment = blockObjects(block).get(key)
   if (!segment) return false
-  const rows = columnOperationCache(block.columns).operations, ids = new Set(touched.elements.map(([actor, counter]) => `${counter}@${actor}`))
+  const rows = columnOperationCache(block.columns).operations
   for (let i = segment.start; i < segment.end; i++) {
-    const row = rows[i]
-    if (ids.has(row[insertIdx] ? `${row[idCtrIdx]}@${row[idActorIdx]}` : `${row[keyCtrIdx]}@${row[keyActorIdx]}`)) return true
+    const row = rows[i], actor = row[insertIdx] ? row[idActorIdx] : row[keyActorIdx], counter = row[insertIdx] ? row[idCtrIdx] : row[keyCtrIdx]
+    if (touched.elements.some(element => element[0] === actor && element[1] === counter)) return true
   }
   return false
 }
@@ -2897,8 +2967,8 @@ function addedMarks(marks, raw) {
   return [...marks.after].filter(([, value]) => raw || value.value !== null).sort((left, right) => compareUtf8(left[0], right[0]))
 }
 
-function textSpans(rows, before, after, actorRank, addedKey) {
-  const spans = [], machines = {before: {state: [], current: NO_MARKS}, after: {state: [], current: NO_MARKS}}
+function textSpans(rows, before, after, actorRank, addedKey, until = Infinity) {
+  const spans = [], shared = {state: [], current: NO_MARKS}, machines = {before: shared, after: shared}
   let index = 0, next = null, marks = NO_MARK_DIFF
   function flush() {
     if (next && next.length > 0) {
@@ -2910,7 +2980,12 @@ function textSpans(rows, before, after, actorRank, addedKey) {
   function applyMark(row, diff) {
     const id = [row[idCtrIdx], actorRank[row[idActorIdx]]], name = row[markNameIdx]
     const value = name === null ? null : decodeValue(row[valLenIdx], row[valRawIdx])
-    for (const machine of diff === ADD ? [machines.after] : diff === DEL ? [machines.before] : [machines.before, machines.after]) {
+    if (diff !== SAME && machines.before === machines.after) {
+      machines.after = {state: machines.before.state.slice(), current: machines.before.current}
+    }
+    const targets = machines.before === machines.after ? [machines.before]
+      : diff === ADD ? [machines.after] : diff === DEL ? [machines.before] : [machines.before, machines.after]
+    for (const machine of targets) {
       if (name === null) markEnd(machine, id); else markBegin(machine, id, name, value)
     }
     const markBefore = machines.before.current.size > 0 ? machines.before.current : null
@@ -2918,11 +2993,11 @@ function textSpans(rows, before, after, actorRank, addedKey) {
     marks = markBefore || markAfter ? {before: markBefore, after: markAfter} : NO_MARK_DIFF
   }
   let topBefore = null, topAfter = null
-  for (let i = 0; i < rows.length; i++) {
+  for (let i = 0; i < rows.length && index <= until; i++) {
     const row = rows[i]
     if (row.skip) {
       const states = [machines.before.state, machines.after.state]
-      if (states[0].length === states[1].length && states[0].every((mark, k) => compareMarkIds(mark.id, states[1][k].id) === 0)) {
+      if (states[0] === states[1] || (states[0].length === states[1].length && states[0].every((mark, k) => compareMarkIds(mark.id, states[1][k].id) === 0))) {
         flush()
         spans.push({skipped: row.summary, index})
         for (const mark of row.summary.marks) applyMark(mark, SAME)
@@ -3414,7 +3489,7 @@ function spliceMarks(ctx, event, actor) {
   const clock = ctx.after.slice()
   clock[actor] = event.counter
   const rows = objectRows(ctx.doc, event.objectId, 'text', ctx.before, clock, ctx.touched.get(event.objectId))
-  const span = textSpans(rows, ctx.before, clock, ctx.actorRank, marks => addedMarks(marks, false))
+  const span = textSpans(rows, ctx.before, clock, ctx.actorRank, marks => addedMarks(marks, false), event.prop)
     .find(span => span.diff === ADD && !span.row && span.index <= event.prop && event.prop < span.index + span.text.length)
   return span ? exportMarks(span.marks) : null
 }
@@ -3545,53 +3620,59 @@ class BackendDoc {
     const marked = new Set(this.objectsWithMarks)
     for (const op of change.ops) if (op.action === 'markBegin') marked.add(op.obj)
     if (!change.ops.some(op => op.insert && marked.has(op.obj))) return
+    const elemIds = change.ops.map(op => op.elemId)
+    if (!clock && this.anchorInserts(change, marked, true)) return
+    change.ops.forEach((op, i) => { op.elemId = elemIds[i] })
+    this.anchorInserts(change, marked, false, clock)
+  }
+
+  anchorInserts(change, marked, lazy, clock) {
     const sequences = new Map()
     let opNum = change.startOp
     for (const op of change.ops) {
       const count = op.values ? op.values.length : op.multiOp || 1
       if (marked.has(op.obj) && op.elemId !== undefined) {
-        if (!sequences.has(op.obj)) sequences.set(op.obj, this.sequenceElements(op.obj, clock))
-        const elems = sequences.get(op.obj)
+        if (!sequences.has(op.obj)) sequences.set(op.obj, this.sequenceParts(op.obj, lazy, clock))
+        const seq = sequences.get(op.obj)
         if (op.insert) {
-          op.elemId = insertAnchor(elems, op.elemId)
-          const index = op.elemId === '_head' ? 0 : elems.findIndex(e => e.id === op.elemId) + 1
+          const anchor = insertAnchor(seq, op.elemId), elems = anchor && loadPart(seq, anchor.part)
+          if (!elems) return false
+          op.elemId = anchor.ref
           const mark = op.action === 'markBegin' ? 'begin' : op.action === 'markEnd' ? 'end' : null
           for (let i = 0; i < count; i++) {
-            elems.splice(index + i, 0, {id: `${opNum + i}@${change.actor}`, mark, expand: !!op.expand, visible: true})
+            elems.splice(anchor.index + i, 0, {id: `${opNum + i}@${change.actor}`, counter: opNum + i, mark, expand: !!op.expand, visible: true})
           }
         } else {
-          const {counter, actorId} = parseOpId(op.elemId)
+          const {counter, actorId} = parseOpId(op.elemId), actor = this.actorIndexById.get(actorId)
           for (let i = 0; i < count; i++) {
-            const elem = elems.find(e => e.id === `${counter + i}@${actorId}`)
-            if (elem) elem.visible = op.action !== 'del'
+            const found = findElem(seq, `${counter + i}@${actorId}`, counter + i, actor)
+            if (found === null) return false
+            if (found) seq.parts[found.part][found.index] = Object.assign({}, seq.parts[found.part][found.index], {visible: op.action !== 'del'})
           }
         }
       }
       opNum += count
     }
+    return true
   }
 
-  sequenceElements(objectId, clock) {
-    const {counter, actorId} = parseOpId(objectId), elems = [], counters = []
+  sequenceParts(objectId, lazy, clock) {
+    const {counter, actorId} = parseOpId(objectId), blocks = []
     const actor = this.actorIndexById.get(actorId)
-    if (actor === undefined) return elems
-    for (let index = findBlock(this.blocks, this.actorIds, actorId, counter, null); index < this.blocks.length; index++) {
-      const block = this.blocks[index]
-      const entries = blockInserts(block, this.actorIds, objectId, counter, actor)
-      let next = 0
-      for (const op of columnOperationCache(block.columns).operations) {
-        if (op[objCtrIdx] !== counter || op[objActorIdx] !== actor || op[keyStrIdx] !== null) continue
-        const action = ACTIONS[op[actionIdx]], visible = clock ? visibleAt(op, clock, null) : visibleRow(op, op[succNumIdx], counters)
-        if (op[insertIdx]) {
-          const mark = action !== 'mark' ? null : op[markNameIdx] === null ? 'end' : 'begin'
-          elems.push({id: entries[next++].id, mark, expand: !!op[expandIdx], visible})
-        } else if (visible) {
-          elems[elems.length - 1].visible = true
-        }
+    if (actor !== undefined) {
+      for (let index = findBlock(this.blocks, this.actorIds, actorId, counter, null); index < this.blocks.length; index++) {
+        blocks.push(this.blocks[index])
+        if (compareBlockObject(this.blocks[index], this.actorIds, actorId, counter) > 0) break
       }
-      if (compareBlockObject(block, this.actorIds, actorId, counter) > 0) break
     }
-    return elems
+    const seq = {blocks, parts: new Array(blocks.length), objectId, counter, actor, actorIds: this.actorIds, actorIndexById: this.actorIndexById}
+    if (!lazy || blocks.length === 0) {
+      const elems = [], counters = []
+      for (const block of blocks) appendBlockElements(block, this.actorIds, objectId, counter, actor, elems, counters, clock)
+      seq.blocks = [null]
+      seq.parts = [elems]
+    }
+    return seq
   }
 
   /**
@@ -3613,9 +3694,8 @@ class BackendDoc {
     copy.heads = this.heads // immutable, no copying needed
     copy.clock = this.clock // immutable, no copying needed
     copy.blocks = this.blocks // immutable, no copying needed
-    copy.objectMeta = this.objectMeta
-    copy.sharedObjectMeta = this.objectMeta
-    this.sharedObjectMeta = this.objectMeta
+    copy.objectMeta = Object.fromEntries(Object.entries(this.objectMeta)
+      .map(([objectId, meta]) => [objectId, Object.assign({}, meta, {children: Object.assign({}, meta.children)})]))
     copy.visibleMapOps = new Map(this.visibleMapOps)
     copy.cursorIndex = this.cursorIndex
     copy.objectsWithMarks = new Set(this.objectsWithMarks)
@@ -3663,10 +3743,6 @@ class BackendDoc {
       }
     }
     if (queue.length > 1) queue = topologicalOrder(queue, this.changeIndexByHash)
-    if (this.objectMeta === this.sharedObjectMeta) {
-      this.objectMeta = Object.fromEntries(Object.entries(this.objectMeta)
-        .map(([objectId, meta]) => [objectId, Object.assign({}, meta, {children: Object.assign({}, meta.children)})]))
-    }
 
     let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
     let docState = {
