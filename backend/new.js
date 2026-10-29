@@ -22,6 +22,7 @@ const COLUMN_DATA = new WeakMap()
 const DOCUMENT_DECODERS = new WeakMap()
 const COLUMN_SPLICES = new WeakMap()
 const ENCODED_COLUMNS = new WeakMap()
+const COLUMN_TAILS = new WeakMap()
 const SEQUENCE_INSERTS = new WeakMap()
 const SEQUENCE_ELEMENTS = new WeakMap()
 const NO_SUCC = Object.freeze([]), NO_BYTES = new Uint8Array(0)
@@ -124,7 +125,14 @@ function columnEncoders(columns) {
 }
 
 function columnDecoders(encoders) {
-  return encoders.map(column => ({columnId: column.columnId, decoder: decoderByColumnId(column.columnId, column.encoder.buffer)}))
+  const tails = []
+  const columns = encoders.map(({columnId, encoder}) => {
+    const {offset, state, lastValue, count, literal, absoluteValue} = encoder
+    tails.push({offset, state, lastValue, count, literal, absoluteValue})
+    return {columnId, decoder: decoderByColumnId(columnId, encoder.buffer)}
+  })
+  COLUMN_TAILS.set(columns, tails)
+  return columns
 }
 
 const DATA_COLUMN = {
@@ -980,15 +988,13 @@ function concatBlocks(blocks, previous) {
         encoded = columnDecoders(blockEncoders)
         ENCODED_COLUMNS.set(block.columns, encoded)
       }
-      for (let col of encoded) col.decoder.reset()
-      copyColumns(encoders, encoded, block.numOps)
+      appendBlock(encoders, encoded, block.numOps)
     } else if (block.columns.every(column => column.columnData)) {
       for (let index = 0; index < block.columns.length; index++) {
         appendColumnData(encoders[index].encoder, block.columns[index])
       }
     } else {
-      for (let col of block.columns) col.decoder.reset()
-      copyColumns(encoders, block.columns, block.numOps)
+      appendBlock(encoders, block.columns, block.numOps)
     }
   }
   let buffers
@@ -1014,6 +1020,108 @@ function concatBlocks(blocks, previous) {
     encoders: encoders.map(({columnId}, index) => ({columnId, encoder: {buffer: buffers[index]}})),
     cache: {columnIds, columns: blocks.map(block => block.columns), snapshots, buffers}
   }
+}
+
+function appendBlock(encoders, columns, numOps) {
+  const tails = COLUMN_TAILS.get(columns)
+  let same = tails !== undefined && columns.length === encoders.length
+  for (let index = 0; same && index < columns.length; index++) same = columns[index].columnId === encoders[index].columnId
+  if (!same) {
+    for (const column of columns) column.decoder.reset()
+    return copyColumns(encoders, columns, numOps)
+  }
+  for (let index = 0; index < columns.length; index++) {
+    const {columnId, decoder} = columns[index], {encoder} = encoders[index], tail = tails[index], type = columnId & 7
+    if (type === COLUMN_TYPE.VALUE_RAW) {
+      encoder.appendRawBytes(decoder.buf)
+    } else if (type === COLUMN_TYPE.BOOLEAN) {
+      appendBooleanColumn(encoder, decoder, tail)
+    } else if (tail.offset === 0 && tail.absoluteValue === undefined) {
+      if (tail.state !== 'literal') encoder._appendValue(tail.lastValue, tail.count)
+      else appendLiteral(encoder, tail.literal)
+    } else {
+      appendColumn(encoder, decoder, tail)
+    }
+  }
+}
+
+function appendLiteral(encoder, values) {
+  if (values[0] === encoder.lastValue) {
+    for (const value of values) encoder._appendValue(value)
+    return
+  }
+  if (encoder.state === 'literal') {
+    encoder.literal.push(encoder.lastValue)
+  } else if (encoder.state === 'loneValue') {
+    encoder.literal = [encoder.lastValue]
+  } else {
+    encoder.flush()
+    encoder.literal = []
+  }
+  encoder.literal.push(...values)
+  encoder.lastValue = encoder.literal.pop()
+  encoder.state = 'literal'
+}
+
+function appendColumn(encoder, decoder, tail) {
+  const buf = decoder.buf, delta = tail.absoluteValue !== undefined
+  let pending = delta
+  decoder.offset = 0
+  while (decoder.offset < tail.offset) {
+    const start = decoder.offset, header = decoder.readInt53()
+    const first = header === 0 ? null : decoder.readRawValue()
+    if (!pending && first !== encoder.lastValue && !(header < 0 && (encoder.state === 'literal' || encoder.state === 'loneValue'))) {
+      if (encoder.state === 'literal') encoder.literal.push(encoder.lastValue)
+      encoder.flush()
+      encoder.appendRawBytes(buf.subarray(start, tail.offset))
+      encoder.state = tail.state
+      encoder.lastValue = tail.lastValue
+      encoder.count = tail.count
+      encoder.literal = tail.state === 'literal' ? tail.literal.slice(0, -1) : []
+      if (delta) encoder.absoluteValue = tail.absoluteValue
+      return
+    }
+    if (header === 0) {
+      encoder._appendValue(null, decoder.readUint53())
+    } else {
+      pending = appendRun(encoder, first, header > 0 ? header : 1, pending)
+      for (let i = header + 1; i < 0; i++) pending = appendRun(encoder, decoder.readRawValue(), 1, pending)
+    }
+  }
+  if (tail.state === 'literal' && !pending) {
+    appendLiteral(encoder, tail.literal)
+  } else if (tail.state === 'literal') {
+    for (const value of tail.literal) pending = appendRun(encoder, value, 1, pending)
+  } else {
+    pending = appendRun(encoder, tail.lastValue, tail.count, pending)
+  }
+  if (delta && !pending) encoder.absoluteValue = tail.absoluteValue
+}
+
+function appendRun(encoder, value, count, pending) {
+  if (pending && value !== null && count > 0) {
+    encoder._appendValue(value - encoder.absoluteValue)
+    encoder._appendValue(value, count - 1)
+    return false
+  }
+  encoder._appendValue(value, count)
+  return pending
+}
+
+function appendBooleanColumn(encoder, decoder, tail) {
+  if (tail.offset === 0) return encoder.appendValue(tail.lastValue, tail.count)
+  decoder.offset = 0
+  let value = false, count = decoder.readUint53()
+  if (count === 0) {
+    value = true
+    count = decoder.readUint53()
+  }
+  if (decoder.offset > tail.offset) return encoder.appendValue(tail.lastValue, tail.count)
+  encoder.appendValue(value, count)
+  encoder.appendUint53(encoder.count)
+  encoder.appendRawBytes(decoder.buf.subarray(decoder.offset, tail.offset))
+  encoder.lastValue = tail.lastValue
+  encoder.count = tail.count
 }
 
 function appendColumnData(encoder, column) {
@@ -1976,7 +2084,7 @@ function applyOps(patches, changeState, docState) {
 
   // Copy the remaining operations after the insertion position
   const lastBlock = docState.blocks[lastBlockIndex]
-  let copyAfterMerge = -skipCount - docOpsConsumed
+  let copyAfterMerge = 0 - skipCount - docOpsConsumed
   for (let i = blockIndex; i <= lastBlockIndex; i++) copyAfterMerge += docState.blocks[i].numOps
   const suffixStart = lastBlock.numOps - copyAfterMerge
   const lastOperations = columnOperationCache(lastBlock.columns).operations

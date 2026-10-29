@@ -178,7 +178,7 @@ function scanTree(desc) {
   }
 }
 
-const EMPTY = new Uint8Array(0)
+const EMPTY = new Uint8Array(0), UTF16 = new TextDecoder('utf-16le', {ignoreBOM: true})
 let out = EMPTY, outPos = 0, bitBuf = 0, bitCount = 0
 
 function sendBits(value, length) {
@@ -623,6 +623,8 @@ function readRest(r, vec, length) {
 
 function equalBytes(a, b) {
   if (a.length !== b.length) return false
+  const text = UTF16.decode(a)
+  if (!text.includes('\uFFFD')) return text === UTF16.decode(b)
   let i = 0
   if (a.byteOffset % 4 === 0 && b.byteOffset % 4 === 0) {
     const aWords = new Int32Array(a.buffer, a.byteOffset, a.length >> 2)

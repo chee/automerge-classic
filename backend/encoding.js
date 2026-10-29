@@ -160,6 +160,11 @@ class Encoder {
    * (53 bits).
    */
   appendUint53(value) {
+    if ((value & 0x7f) === value) {
+      if (this.offset >= this.buf.byteLength) this.grow()
+      this.buf[this.offset++] = value
+      return 1
+    }
     if (!Number.isInteger(value)) throw new RangeError('value is not an integer')
     if (value < 0 || value > Number.MAX_SAFE_INTEGER) {
       throw new RangeError('number out of range')
@@ -175,6 +180,11 @@ class Encoder {
    * (53 bits).
    */
   appendInt53(value) {
+    if ((value << 25 >> 25) === value) {
+      if (this.offset >= this.buf.byteLength) this.grow()
+      this.buf[this.offset++] = value & 0x7f
+      return 1
+    }
     if (!Number.isInteger(value)) throw new RangeError('value is not an integer')
     if (value < Number.MIN_SAFE_INTEGER || value > Number.MAX_SAFE_INTEGER) {
       throw new RangeError('number out of range')
@@ -279,6 +289,19 @@ class Encoder {
    */
   appendPrefixedString(value) {
     if (typeof value !== 'string') throw new TypeError('value is not a string')
+    const length = value.length
+    if (length < 0x80) {
+      if (this.offset + length + 1 > this.buf.byteLength) this.grow(this.offset + length + 1)
+      const start = this.offset
+      this.buf[start] = length
+      for (let i = 0; i < length; i++) {
+        const code = value.charCodeAt(i)
+        if (code > 127) return this.appendPrefixedBytes(stringToUtf8(value))
+        this.buf[start + 1 + i] = code
+      }
+      this.offset = start + 1 + length
+      return this
+    }
     return this.appendPrefixedBytes(stringToUtf8(value))
   }
 
@@ -400,7 +423,13 @@ class Decoder {
    * (up to 2^53 - 1), and throws an exception outside of that range.
    */
   readUint53() {
+    const byte = this.buf[this.offset]
+    if (byte < 0x80) {
+      this.offset++
+      return byte
+    }
     const { low32, high32 } = this.readUint64()
+    if (high32 === 0 && low32 < 0x40000000) return low32 | 0
     if (high32 < 0 || high32 > 0x1fffff) {
       throw new RangeError('number out of range')
     }
@@ -413,7 +442,14 @@ class Decoder {
    * (between -(2^53 - 1) and 2^53 - 1), throws an exception outside of that range.
    */
   readInt53() {
+    const byte = this.buf[this.offset]
+    if (byte < 0x80) {
+      this.offset++
+      return byte < 0x40 ? byte : byte - 0x80
+    }
     const { low32, high32 } = this.readInt64()
+    if (high32 === 0 && low32 < 0x40000000) return low32 | 0
+    if (high32 === -1 && low32 >= 0x80000000) return low32 | 0
     if (high32 < -0x200000 || (high32 === -0x200000 && low32 === 0) || high32 > 0x1fffff) {
       throw new RangeError('number out of range')
     }

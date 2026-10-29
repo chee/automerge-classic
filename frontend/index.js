@@ -176,6 +176,15 @@ function replaceChild(object, conflicts, key, before, after) {
   conflicts[key] = Object.fromEntries(Object.entries(conflicts[key]).map(([opId, value]) => [opId, value === before ? after : value]))
 }
 
+function expandNode(node) {
+  if (!node) return
+  if (node.items !== undefined) {
+    for (const item of (node.items ||= node.src.map(docNode))) expandNode(item)
+  } else {
+    for (const key of (node.keys ||= Object.keys(node.src))) expandNode(nodeChild(node, key))
+  }
+}
+
 function rebuildNode(object, node, updated) {
   if (!node || !isObject(object) || object[OBJECT_ID] === undefined || Array.isArray(object) !== (node.items !== undefined)) return object
   const objectId = object[OBJECT_ID]
@@ -207,8 +216,9 @@ function rebuildNode(object, node, updated) {
  * Returns `after` with the keys of its map objects in the order that results from applying
  * `patches` to `before` one by one, the way the Rust implementation updates a document.
  */
-function followPatchOrder(before, after, patches) {
+function followPatchOrder(before, after, patches, everywhere = false) {
   const root = docNode(before)
+  if (everywhere) expandNode(root)
   for (const patch of patches) {
     let node = root
     for (const key of patch.path.slice(0, -1)) node = node && nodeChild(node, key)

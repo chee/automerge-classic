@@ -13,6 +13,7 @@ const diffCache = new WeakMap()
 const isolatedSources = new WeakMap()
 const isolations = new WeakMap()
 const scopedDocs = new WeakMap()
+const isolatedViews = new WeakMap()
 const residues = new WeakMap()
 const viewSources = new WeakMap()
 
@@ -88,12 +89,40 @@ function changeWithSource(doc, options, callback, source) {
     callback = options
     options = undefined
   }
+  doc = integrated(doc)
   return Frontend.change(doc, patchOptions(doc, options, source), callback)[0]
+}
+
+function integrated(doc) {
+  const full = !isolations.has(doc) && isolatedViews.get(doc)
+  if (!full) return doc
+  if (residues.has(doc)) residues.set(full, residues.get(doc))
+  return full
 }
 
 export function emptyChange(doc, options) {
   assertWritable(doc)
+  if (isolations.has(doc)) {
+    const quiet = Object.assign(typeof options === 'string' ? {message: options} : Object.assign({}, options), {patchCallback: () => {}})
+    return isolatedView(doc, Frontend.emptyChange(isolatedViews.get(doc) || doc, quiet)[0])
+  }
+  doc = integrated(doc)
   return Frontend.emptyChange(doc, patchOptions(doc, options, 'emptyChange'))[0]
+}
+
+function isolatedView(doc, full, callback, source) {
+  const points = isolations.get(doc), heads = points.at(-1), state = Frontend.getBackendState(full), residue = residues.get(doc)
+  const patches = (residue ? residue.patches.concat(diff(full, residue.from, residue.to)) : [])
+    .concat(points.slice(1).flatMap((point, i) => diff(full, points[i], point)))
+  const {clock, deps, maxOp} = full[STATE]
+  const view = patches.length === 0
+    ? Frontend.applyPatch(doc, {clock, deps, maxOp, diffs: {objectId: '_root', type: 'map', props: {}}}, state)
+    : Frontend.followPatchOrder(doc, Frontend.applyPatch(Frontend.init(Object.assign({}, full[OPTIONS])),
+      Object.assign({}, backend.view(state, heads)[1], {clock, deps, maxOp}), state), patches, true)
+  isolatedViews.set(view, full)
+  isolations.set(view, [heads])
+  if (callback && patches.length > 0) callback(patches, {before: doc, after: view, source})
+  return view
 }
 
 export function clone(doc, options = {}) {
@@ -233,6 +262,11 @@ function cachedDiff(doc, before, after, objectId, recursive) {
 }
 
 function applyBackendPatch(doc, patch, backendState, options, source, beforeHeads) {
+  if (isolations.has(doc)) {
+    const base = isolatedViews.get(doc) || doc
+    return isolatedView(doc, patch ? Frontend.applyPatch(base, patch, backendState) : base, options.patchCallback || doc[OPTIONS].patchCallback, source)
+  }
+  doc = integrated(doc)
   const newDoc = Frontend.applyPatch(doc, patch, backendState)
   const before = doc[STATE].clock, after = newDoc[STATE].clock, batch = getHeads(doc).length > 0
   progress(doc, newDoc, options.patchCallback || doc[OPTIONS].patchCallback, source, beforeHeads,
@@ -254,6 +288,7 @@ export function loadIncremental(doc, data, options = {}) {
   assertWritable(doc)
   const oldState = Frontend.getBackendState(doc, 'loadIncremental')
   const [newState, patch] = backend.loadIncremental(oldState, data)
+  if (!patch && isolations.has(doc)) return applyBackendPatch(doc, null, newState, options, 'loadIncremental')
   if (!patch) {
     diffCache.delete(oldState.state)
     return doc
@@ -458,6 +493,7 @@ export function addFragments(doc, fragments, options) {
     if (state.frozen || error instanceof PanicError) throw error
     throw new RangeError(`error loading fragment bundles: ${parseErrorMessage(data, error, 'chunk')}`)
   }
+  if (!patch && isolations.has(doc)) return applyBackendPatch(doc, null, newState, options || {}, 'addFragments')
   if (!patch) {
     diffCache.delete(state.state)
     return doc
@@ -550,7 +586,7 @@ function isolatedChange(doc, heads, options, callback, source) {
   const ops = Frontend.getBackendState(changed, source).state.anchorSource.ops
   const bytes = encodeChangeRaw(Object.assign(change, {seq: isolated.seq, deps: heads.slice().sort(), ops}))
   const loaded = backend.isLoaded(state), [newState, patch] = backend.applyChanges(state, [bytes])
-  const applied = Frontend.applyPatch(doc, patch, newState), newHeads = [decodeChange(bytes, true).hash]
+  const applied = Frontend.applyPatch(isolatedViews.get(doc) || doc, patch, newState), newHeads = [decodeChange(bytes, true).hash]
   const patches = points.slice(1, -1).flatMap((point, i) => diff(doc, points[i], point))
     .concat(backend.isolatedPatches(newState, points.at(-2) || heads, heads, newHeads, bytes, isolated.actor, branchEvents, diffValue, loaded))
     .concat(diff(applied, newHeads, getHeads(applied)))
@@ -572,6 +608,11 @@ export function toJS(value) {
     const {heads, state} = scopedDocs.get(value), [scoped, patch] = backend.view(state, heads)
     return toJS(Frontend.applyPatch(init(), patch, scoped))
   }
+  if (isObject(value) && isolations.has(value)) {
+    const [scoped, patch] = backend.view(Frontend.getBackendState(value), isolations.get(value).at(-1))
+    return toJS(Frontend.applyPatch(init(), patch, scoped))
+  }
+  if (isObject(value) && isolatedViews.has(value)) return toJS(isolatedViews.get(value))
   if (value instanceof Frontend.Text) {
     let text = ''
     for (const item of value) text += typeof item === 'string' ? item : '\ufffc'
@@ -1700,6 +1741,7 @@ export function receiveSyncMessage(doc, oldSyncState, message, options = {}) {
   assertWritable(doc)
   const oldBackendState = Frontend.getBackendState(doc, 'receiveSyncMessage')
   const [backendState, syncState, patch] = backend.receiveSyncMessage(oldBackendState, oldSyncState, message)
+  if (!patch && isolations.has(doc)) return [applyBackendPatch(doc, null, backendState, options, 'receiveSyncMessage'), syncState, null]
   if (!patch) {
     diffCache.delete(oldBackendState.state)
     return [doc, syncState, null]
