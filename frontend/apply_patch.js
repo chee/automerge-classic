@@ -1,4 +1,4 @@
-import { compareUtf8, copyObject, isObject, parseOpId } from '../src/common.js'
+import { compareUtf8, copyObject, exportInt, isObject, parseOpId } from '../src/common.js'
 import { CONFLICTS, ELEM_IDS, NEW_KEYS, OBJECT_ID } from './constants.js'
 // Set of patch objects already applied in the current patch application (a
 // non-enumerable property of the `updated` map)
@@ -21,9 +21,11 @@ function getValue(patch, object, updated, textV2) {
     // Timestamp: value is milliseconds since 1970 epoch
     return new Date(patch.value)
   } else if (patch.datatype === 'counter') {
-    return new Counter(patch.value)
+    return new Counter(exportInt(patch.value))
   } else if (patch.datatype === 'uint') {
     return BigInt(patch.value)
+  } else if (patch.datatype === 'int') {
+    return exportInt(patch.value)
   } else {
     // Primitive value (int, uint, float64, string, boolean, or null)
     return patch.value
@@ -326,5 +328,5 @@ function reorderNewKeys(object) {
 }
 
 export {
-  interpretPatch, cloneMapObject, lamportCompare, reorderNewKeys, isIntegralFloat
+  interpretPatch, cloneMapObject, cloneListObject, lamportCompare, reorderNewKeys, isIntegralFloat
 }

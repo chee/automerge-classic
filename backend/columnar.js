@@ -1,6 +1,6 @@
 import { inflateSync as inflateRaw } from 'fflate'
 import { deflate, extendVec } from './deflate.js'
-import { copyObject, equalBytes, parseOpId } from '../src/common.js'
+import { copyObject, equalBytes, parseOpId, safeInt } from '../src/common.js'
 import { BooleanDecoder, BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, Encoder, RLEDecoder, RLEEncoder, bytesToHexString, hexStringToBytes, stringToUtf8, utf8ToString } from './encoding.js'
 // Maybe we should be using the platform's built-in hash implementation?
 // Node has the crypto module: https://nodejs.org/api/crypto.html and browsers have
@@ -298,6 +298,11 @@ function encodeValue(op, columns) {
       numBytes = columns.valRaw.appendInt53(op.value)
     }
     columns.valLen.appendValue(numBytes << 4 | typeTag)
+  } else if (typeof op.value === 'bigint') {
+    const typeTag = NUMBER_TYPES.get(op.datatype) || VALUE_TYPE.LEB128_INT
+    const high32 = Number(op.value >> 32n), low32 = Number(op.value & 0xffffffffn)
+    const numBytes = typeTag === VALUE_TYPE.LEB128_UINT ? columns.valRaw.appendUint64(high32, low32) : columns.valRaw.appendInt64(high32, low32)
+    columns.valLen.appendValue(numBytes << 4 | typeTag)
   } else if (typeof op.datatype === 'number' && op.datatype >= VALUE_TYPE.MIN_UNKNOWN &&
              op.datatype <= VALUE_TYPE.MAX_UNKNOWN && op.value instanceof Uint8Array) {
     const numBytes = columns.valRaw.appendRawBytes(op.value)
@@ -307,6 +312,11 @@ function encodeValue(op, columns) {
   } else {
     throw new RangeError(`Unsupported value in operation: ${op.value}`)
   }
+}
+
+function readInt64({high32, low32}) {
+  const value = high32 * 0x100000000 + low32
+  return Number.isSafeInteger(value) ? value : safeInt((BigInt(high32) << 32n) + BigInt(low32))
 }
 
 /**
@@ -321,13 +331,13 @@ function decodeValue(sizeTag, bytes) {
   if (sizeTag === VALUE_TYPE.TRUE) return {value: true}
   const type = sizeTag % 16
   if (type === VALUE_TYPE.UTF8) return {value: utf8ToString(bytes)}
-  if (type === VALUE_TYPE.LEB128_UINT) return {value: new Decoder(bytes).readUint53(), datatype: 'uint'}
-  if (type === VALUE_TYPE.LEB128_INT) return {value: new Decoder(bytes).readInt53(), datatype: 'int'}
+  if (type === VALUE_TYPE.LEB128_UINT) return {value: readInt64(new Decoder(bytes).readUint64()), datatype: 'uint'}
+  if (type === VALUE_TYPE.LEB128_INT) return {value: readInt64(new Decoder(bytes).readInt64()), datatype: 'int'}
   if (type === VALUE_TYPE.IEEE754) {
     if (bytes.byteLength !== 8) throw new RangeError(`Invalid length for floating point number: ${bytes.byteLength}`)
     return {value: new DataView(bytes.buffer, bytes.byteOffset, 8).getFloat64(0, true), datatype: 'float64'}
   }
-  if (type === VALUE_TYPE.COUNTER) return {value: new Decoder(bytes).readInt53(), datatype: 'counter'}
+  if (type === VALUE_TYPE.COUNTER) return {value: readInt64(new Decoder(bytes).readInt64()), datatype: 'counter'}
   if (type === VALUE_TYPE.TIMESTAMP) return {value: new Decoder(bytes).readInt53(), datatype: 'timestamp'}
   return {value: bytes, datatype: type}
 }
@@ -857,6 +867,7 @@ function decodeChange(buffer, raw = false) {
       delete change.extraBytes
     }
     for (const op of change.ops) {
+      if (typeof op.value === 'bigint') throw new RangeError(`Error: ${op.value} can't be represented as a JavaScript number`)
       delete op[UNKNOWN_COLUMNS]
       delete op[RAW_VALUE]
       if (!op.insert) delete op.insert

@@ -134,13 +134,13 @@ describe('Automerge proxy API', () => {
 
     it('should support Object.keys()', () => {
       Automerge.change(root, doc => {
-        assert.deepStrictEqual(Object.keys(doc.list), ['0', '1', '2'])
+        assert.deepStrictEqual(Object.keys(doc.list), [])
       })
     })
 
     it('should support Object.getOwnPropertyNames()', () => {
       Automerge.change(root, doc => {
-        assert.deepStrictEqual(Object.getOwnPropertyNames(doc.list), ['length', '0', '1', '2'])
+        assert.deepStrictEqual(Object.getOwnPropertyNames(doc.list), ['length'])
       })
     })
 

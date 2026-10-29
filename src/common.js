@@ -82,9 +82,39 @@ function wellFormedString(string) {
   return string.replace(/([\ud800-\udbff][\udc00-\udfff])|[\ud800-\udfff]/g, (match, pair) => pair || '\ufffd')
 }
 
+const I64_MIN = -(2n ** 63n), I64_MAX = 2n ** 63n - 1n, U64_MAX = 2n ** 64n - 1n
+
+function safeInt(value) {
+  return typeof value === 'bigint' && value >= -Number.MAX_SAFE_INTEGER && value <= Number.MAX_SAFE_INTEGER ? Number(value) : value
+}
+
+function exportInt(value) {
+  return typeof value === 'number' && value >= -Number.MAX_SAFE_INTEGER && value < Number.MAX_SAFE_INTEGER ? value : BigInt(value)
+}
+
+function addInt(a, b) {
+  if (typeof a === 'number' && typeof b === 'number' && Number.isSafeInteger(a + b)) return a + b
+  return safeInt(BigInt.asIntN(64, BigInt(a) + BigInt(b)))
+}
+
+function truncateInt(value) {
+  if (Number.isSafeInteger(value)) return value
+  if (Number.isNaN(value)) return 0
+  if (value >= 2 ** 63) return I64_MAX
+  if (value <= -(2 ** 63)) return I64_MIN
+  return safeInt(BigInt(Math.trunc(value)))
+}
+
+function importBigInt(value, max, nested) {
+  if (value > max) throw new RangeError(nested ? 'invalid value' : `bignum ${value} larger than max ${max}`)
+  if (value < I64_MIN) throw new RangeError(nested ? 'invalid value' : `bignum ${value} smaller than min ${I64_MIN}`)
+  return value > I64_MAX ? value : safeInt(value)
+}
+
 class PanicError extends Error {}
 Object.defineProperty(PanicError.prototype, 'name', {value: 'PanicError'})
 
 export {
-  isObject, copyObject, parseOpId, equalBytes, createArrayOfNulls, compareUtf8, wellFormedString, PanicError
+  isObject, copyObject, parseOpId, equalBytes, createArrayOfNulls, compareUtf8, wellFormedString, PanicError,
+  I64_MAX, U64_MAX, safeInt, exportInt, addInt, truncateInt, importBigInt
 }

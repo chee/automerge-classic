@@ -3,7 +3,7 @@ import { interpretPatch, isIntegralFloat, lamportCompare } from './apply_patch.j
 import { Text, elemAt, textOffset } from './text.js'
 import { Counter, getWriteableCounter } from './counter.js'
 import { Float64, Int, Uint } from './numbers.js'
-import { compareUtf8, equalBytes, isObject, parseOpId, wellFormedString } from '../src/common.js'
+import { I64_MAX, U64_MAX, compareUtf8, equalBytes, importBigInt, isObject, parseOpId, truncateInt, wellFormedString } from '../src/common.js'
 import { isImmutableString } from '../src/immutable_string.js'
 /**
  * An instance of this class is passed to `rootObjectProxy()`. The methods are
@@ -51,8 +51,9 @@ class Context {
    * Takes a value and returns an object describing the value (in the format used by patches).
    */
   getValueDescription(value, hydrate = false) {
-    if (typeof value === 'bigint' && value >= Number.MIN_SAFE_INTEGER && value <= Number.MAX_SAFE_INTEGER) {
-      return {type: 'value', value: Number(value), datatype: 'int'}
+    if (typeof value === 'bigint') {
+      const imported = importBigInt(value, U64_MAX, this.nested)
+      return {type: 'value', value: imported, datatype: imported > I64_MAX ? 'uint' : 'int'}
     }
     if (!['object', 'boolean', 'number', 'string'].includes(typeof value)) {
       throw new TypeError(`Unsupported type of value: ${typeof value}`)
@@ -76,7 +77,8 @@ class Context {
         return {type: 'value', value: value.value, datatype: 'float64'}
       } else if (value instanceof Counter) {
         // Counter object
-        return {type: 'value', value: value.value, datatype: 'counter'}
+        const counter = typeof value.value === 'bigint' ? importBigInt(value.value, I64_MAX, this.nested) : truncateInt(value.value)
+        return {type: 'value', value: counter, datatype: 'counter'}
 
       } else {
         // Nested object (map, list, text, or table)
@@ -86,8 +88,8 @@ class Context {
         return {objectId, type: 'map', props: {}}
       }
     } else if (typeof value === 'number') {
-      if (Number.isInteger(value) && value <= Number.MAX_SAFE_INTEGER && value >= Number.MIN_SAFE_INTEGER && (value > 0 || !hydrate)) {
-        return {type: 'value', value, datatype: 'int'}
+      if (Number.isInteger(value) && (value > 0 || !hydrate)) {
+        return {type: 'value', value: truncateInt(value), datatype: 'int'}
       } else {
         return {type: 'value', value, datatype: 'float64'}
       }
@@ -223,10 +225,12 @@ class Context {
     try {
       callback()
       this.hydrating = true
+      this.nested = true
       for (let i = 0; i < this.queue.length; i++) this.queue[i]()
     } finally {
       this.queue = null
       this.hydrating = false
+      this.nested = false
     }
   }
 
@@ -296,6 +300,7 @@ class Context {
     if (changed.length === 0) return
     this.applyAtPath(path, subpatch => {
       this.hydrating = hydrate
+      if (hydrate) for (const [, value] of changed) checkNumbers(value, false)
       for (const [key, value, action] of changed) {
         const pred = getPred(object, key)
         if (action === 'resolve') {
@@ -391,6 +396,7 @@ class Context {
   setListIndex(path, index, value) {
     const objectId = pathObjectId(path)
     const list = this.getObject(objectId)
+    checkNumbers(value, true)
 
     if (index > list.length) throw new RangeError(`index ${index} is out of bounds`)
     if (index === list.length) {
@@ -429,6 +435,7 @@ class Context {
   splice(path, start, deletions, insertions, blockOffset) {
     const objectId = pathObjectId(path)
     const list = this.getObject(objectId)
+    for (const value of insertions) checkNumbers(value, false)
     if (deletions < 0) {
       if (start + deletions < 0) throw new RangeError(`index ${start} is out of bounds`)
       start += deletions
@@ -548,6 +555,16 @@ function eventValue(description) {
 
 function pathObjectId(path) {
   return path.length === 0 ? '_root' : path[path.length - 1].objectId
+}
+
+function checkNumbers(value, invalidNested, depth = 0) {
+  if (typeof value === 'bigint') {
+    importBigInt(value, U64_MAX, invalidNested && depth > 0)
+  } else if (value instanceof Counter) {
+    if (typeof value.value === 'bigint') importBigInt(value.value, I64_MAX, invalidNested && depth > 0)
+  } else if (isObject(value) && !value[OBJECT_ID] && (Array.isArray(value) || Object.getPrototypeOf(value) === Object.prototype)) {
+    for (const key of Object.keys(value)) checkNumbers(value[key], invalidNested, depth + 1)
+  }
 }
 
 function isScalarObject(value, hydrate = false) {

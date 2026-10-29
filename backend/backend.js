@@ -211,6 +211,10 @@ function viewState(source, heads, clock) {
   }
 }
 
+function objectPatch(backend, objectId) {
+  return backendState(backend, true).objectPatch(objectId)
+}
+
 function view(backend, heads) {
   const source = backendState(backend, true)
   const {patch, clock} = source.viewAt(heads)
@@ -348,7 +352,7 @@ function saveBundleByHash(backend, hashes) {
 
 export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
-  load, loadChanges, loadIncremental, getPatch, view, viewOf, getHeads, getAllChanges, getChanges,
+  load, loadChanges, loadIncremental, getPatch, objectPatch, view, viewOf, getHeads, getAllChanges, getChanges,
   getChangesAdded, getChangeByHash, getLastChangeByActor, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta, isolatedActor, isolateAnchors,
   getChangesByHash, topoHistoryTraversal, stats, diff, clockDiff, localPatches, isolatedPatches, isLoaded, markEvent, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
 }

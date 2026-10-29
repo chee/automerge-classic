@@ -854,4 +854,111 @@ describe('@automerge/automerge 3.5.0 parity', () => {
       assert.deepStrictEqual(block, {t: 'qx'})
     })
   })
+
+  describe('parity round 3', () => {
+    function fail(fn) {
+      try {
+        fn()
+      } catch (error) {
+        return `${error.name}: ${error.message}`
+      }
+    }
+
+    it('applies a batch whose later change overwrites an older value of a key the earlier change deleted', () => {
+      let a = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.l = ['x']; draft.d = 1 })
+      a = Automerge.change(a, {time: 0}, draft => { draft.d = 2 })
+      let b = Automerge.change(Automerge.init(ACTOR_B), {time: 0}, draft => { draft.p = [0, 0, 0, 0, 0, 0, 0, 0]; draft.d = 3; delete draft.d })
+      ;[b] = Automerge.applyChanges(b, Automerge.getAllChanges(a))
+      b = Automerge.change(b, {time: 0}, draft => { draft.d = {n: 3} })
+      a = Automerge.change(a, {time: 0}, draft => { draft.d = 4 })
+      a = Automerge.change(a, {time: 0}, draft => { delete draft.d })
+      const patches = []
+      ;[a] = Automerge.applyChanges(a, Automerge.getAllChanges(b).filter(c => Automerge.decodeChange(c).actor === ACTOR_B), {patchCallback: p => patches.push(...p)})
+      assert.deepStrictEqual(Automerge.toJS(a), {d: {n: 3}, l: ['x'], p: [0, 0, 0, 0, 0, 0, 0, 0]})
+      assert.deepStrictEqual(patches, [{action: 'put', path: ['d'], value: {}}, {action: 'put', path: ['p'], value: []},
+        {action: 'insert', path: ['p', 0], values: [0, 0, 0, 0, 0, 0, 0, 0]}, {action: 'put', path: ['d', 'n'], value: 3}])
+    })
+
+    it('exposes only length as an own key of a list proxy', () => {
+      const doc = Automerge.from({list: [1, 2, 3]})
+      Automerge.change(doc, draft => {
+        const forIn = []
+        for (const key in draft.list) if (Object.prototype.hasOwnProperty.call(draft.list, key)) forIn.push(key)
+        assert.deepStrictEqual([Object.keys(draft.list), Object.getOwnPropertyNames(draft.list), Object.entries(draft.list), forIn, Object.assign({}, draft.list)],
+          [[], ['length'], [], [], {}])
+        assert.deepStrictEqual([JSON.stringify(draft.list), [...draft.list]], ['[1,2,3]', [1, 2, 3]])
+      })
+    })
+
+    it('orders map keys after changeAt by the patches that rewind and replay the document', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.d = {a: 1}; draft.x = 1 })
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.d.b = 2; draft.y = 3 })
+      const patches = []
+      doc = Automerge.changeAt(doc, scope, {time: 0, patchCallback: p => patches.push(...p)}, draft => { draft.d.z = 4; draft.d.a = 5 }).newDoc
+      assert.deepStrictEqual(patches, [{action: 'del', path: ['y']}, {action: 'del', path: ['d', 'b']}, {action: 'put', path: ['d', 'z'], value: 4},
+        {action: 'put', path: ['d', 'a'], value: 5}, {action: 'put', path: ['y'], value: 3}, {action: 'put', path: ['d', 'b'], value: 2}])
+      assert.deepStrictEqual([Object.keys(doc), Object.keys(doc.d)], [['d', 'x', 'y'], ['a', 'z', 'b']])
+    })
+
+    it('accepts and discards an update of a list element that does not exist', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.l = [1, 2]; draft.t = 'ab' })
+      const ops = [{action: 'del', obj: `1@${ACTOR_A}`, elemId: `9@${ACTOR_A}`, insert: false, pred: [`9@${ACTOR_A}`]},
+        {action: 'set', obj: `4@${ACTOR_A}`, elemId: `9@${ACTOR_A}`, insert: false, value: 'z', pred: []}]
+      const change = Automerge.encodeChange({actor: ACTOR_B, seq: 1, startOp: 20, time: 0, message: '', deps: Automerge.getHeads(doc), ops})
+      const patches = []
+      ;[doc] = Automerge.applyChanges(doc, [change], {patchCallback: p => patches.push(...p)})
+      assert.deepStrictEqual([patches, Automerge.toJS(doc)], [[], {l: [1, 2], t: 'ab'}])
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l.push(3) })
+      assert.deepStrictEqual([Automerge.decodeChange(Automerge.getLastLocalChange(doc)).startOp, Automerge.getHeads(doc), Automerge.save(doc).length, Automerge.toJS(doc)],
+        [22, ['972e235f3784ff3cf43f25522b5b5a2b0232524a4ff3b5261ce913a7646c5570'], 208, {l: [1, 2, 3], t: 'ab'}])
+    })
+
+    it('stores bigints above i64 as uint and integers outside the safe range as 64-bit ints', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => {
+        draft.u = 2n ** 64n - 1n
+        draft.i = -(2n ** 63n)
+        draft.edge = 9007199254740991
+        draft.sat = 1e20
+        draft.l = [2n ** 63n]
+        draft.l.push(5n)
+        draft.c = new Automerge.Counter(2n ** 62n)
+      })
+      assert.deepStrictEqual([doc.u, doc.i, doc.edge, doc.sat, doc.l[0], doc.l[1], doc.c.value],
+        [2n ** 64n - 1n, -(2n ** 63n), 9007199254740991n, 2n ** 63n - 1n, 2n ** 63n, 5, 2n ** 62n])
+      assert.deepStrictEqual(Automerge.getHeads(doc), ['f3e48e1c42bad408b75f25abfdc11b75dbfd9aa9ee02a0f354cbb67241f4c3c6'])
+      assert.deepStrictEqual(Automerge.toJS(Automerge.load(Automerge.save(doc))), Automerge.toJS(doc))
+      assert.strictEqual(fail(() => Automerge.decodeChange(Automerge.getLastLocalChange(doc))),
+        "RangeError: Error: 18446744073709551615 can't be represented as a JavaScript number")
+      assert.strictEqual(fail(() => Automerge.change(doc, draft => { draft.x = 2n ** 64n })), 'RangeError: bignum 18446744073709551616 larger than max 18446744073709551615')
+      assert.strictEqual(fail(() => Automerge.change(doc, draft => { draft.x = {y: -(2n ** 63n) - 1n} })), 'RangeError: invalid value')
+      assert.strictEqual(fail(() => Automerge.change(doc, draft => { draft.l.push({y: 2n ** 64n}) })), 'RangeError: bignum 18446744073709551616 larger than max 18446744073709551615')
+      assert.strictEqual(fail(() => Automerge.change(doc, draft => { Automerge.insertAt(draft.l, 9, 2n ** 64n) })), 'RangeError: bignum 18446744073709551616 larger than max 18446744073709551615')
+      assert.strictEqual(fail(() => Automerge.change(doc, draft => { draft.c2 = new Automerge.Counter(2n ** 63n) })), 'RangeError: bignum 9223372036854775808 larger than max 9223372036854775807')
+      assert.strictEqual(fail(() => Automerge.change(doc, draft => { draft.c.increment(1) })), 'TypeError: Cannot mix BigInt and other types, use explicit conversions')
+    })
+
+    it('leaves the document passed to changeAt at the scope of the change', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.x = 1 })
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.y = 2 })
+      const current = Automerge.getHeads(doc)
+      const {newDoc} = Automerge.changeAt(doc, scope, {time: 0}, draft => { draft.z = 3 })
+      assert.deepStrictEqual([Automerge.getHeads(doc), Automerge.toJS(doc)], [scope, {x: 1}])
+      assert.deepStrictEqual(Automerge.toJS(newDoc), {x: 1, y: 2, z: 3})
+      assert.ok(current.every(head => Automerge.getHeads(newDoc).includes(head)))
+    })
+
+    it('reads a block inside changeAt from all operations plus the pending ones', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.l = [{t: 'x'}, {t: 'y'}] })
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { Automerge.splice(draft, ['l', 0, 't'], 0, 1); draft.l.deleteAt(1) })
+      const blocks = []
+      Automerge.changeAt(doc, scope, {time: 0}, draft => {
+        Automerge.splice(draft, ['l', 0, 't'], 0, 0, 'q')
+        blocks.push(Automerge.block(draft, ['l'], 0), Automerge.block(draft, ['l'], 1))
+      })
+      assert.deepStrictEqual(blocks, [{t: 'q'}, {t: 'y'}])
+    })
+  })
 })

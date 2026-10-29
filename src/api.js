@@ -1,7 +1,7 @@
 import * as Frontend from '../frontend/index.js'
 import { CACHE, CHANGE, OPTIONS, STATE } from '../frontend/constants.js'
 import { decodeChange, decodeChangeColumns, decodeChangeMeta, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
-import { PanicError, compareUtf8, isObject, parseOpId, wellFormedString } from './common.js'
+import { PanicError, compareUtf8, exportInt, isObject, parseOpId, wellFormedString } from './common.js'
 import { ImmutableString, isImmutableString } from './immutable_string.js'
 import { graphemes, myersDiff, replaceHook } from './text_diff.js'
 import { instantiateText, textOffset } from '../frontend/text.js'
@@ -12,6 +12,7 @@ const recentPatches = new WeakMap()
 const diffCache = new WeakMap()
 const isolatedSources = new WeakMap()
 const isolations = new WeakMap()
+const scopedDocs = new WeakMap()
 const residues = new WeakMap()
 const viewSources = new WeakMap()
 
@@ -147,6 +148,7 @@ export function getAllChanges(doc) {
 }
 
 export function getHeads(doc) {
+  if (scopedDocs.has(doc)) return scopedDocs.get(doc).heads
   return isolations.has(doc) ? isolations.get(doc).at(-1) : backend.getHeads(Frontend.getBackendState(doc, 'getHeads'))
 }
 
@@ -526,7 +528,7 @@ function isolatedChange(doc, heads, options, callback, source) {
   // made.
   branch[STATE].maxOp = Math.max(branch[STATE].maxOp, doc[STATE].maxOp)
   backend.isolateAnchors(Frontend.getBackendState(branch, source), state, heads)
-  isolatedSources.set(branch[CACHE], doc)
+  isolatedSources.set(branch[CACHE], {doc, seq: isolated.seq, startOp: branch[STATE].maxOp + 1})
   let branchEvents = [], changed
   const branchOptions = Object.assign(typeof options === 'string' ? {message: options} : Object.assign({}, options),
     {patchCallback: (patch, before, after, local, changes, events) => { branchEvents = events }})
@@ -548,11 +550,13 @@ function isolatedChange(doc, heads, options, callback, source) {
   const ops = Frontend.getBackendState(changed, source).state.anchorSource.ops
   const bytes = encodeChangeRaw(Object.assign(change, {seq: isolated.seq, deps: heads.slice().sort(), ops}))
   const loaded = backend.isLoaded(state), [newState, patch] = backend.applyChanges(state, [bytes])
-  const newDoc = Frontend.applyPatch(doc, patch, newState), newHeads = [decodeChange(bytes).hash]
-  progress(doc, newDoc, isObject(options) && options.patchCallback || doc[OPTIONS].patchCallback, source, heads, () =>
-    points.slice(1, -1).flatMap((point, i) => diff(doc, points[i], point))
-      .concat(backend.isolatedPatches(newState, points.at(-2) || heads, heads, newHeads, bytes, isolated.actor, branchEvents, diffValue, loaded))
-      .concat(diff(newDoc, newHeads, getHeads(newDoc))))
+  const applied = Frontend.applyPatch(doc, patch, newState), newHeads = [decodeChange(bytes, true).hash]
+  const patches = points.slice(1, -1).flatMap((point, i) => diff(doc, points[i], point))
+    .concat(backend.isolatedPatches(newState, points.at(-2) || heads, heads, newHeads, bytes, isolated.actor, branchEvents, diffValue, loaded))
+    .concat(diff(applied, newHeads, getHeads(applied)))
+  const newDoc = Frontend.followPatchOrder(doc, applied, patches)
+  progress(doc, newDoc, isObject(options) && options.patchCallback || doc[OPTIONS].patchCallback, source, heads, () => patches)
+  scopedDocs.set(doc, {heads, state: newState})
   return {newDoc, newHeads}
 }
 
@@ -564,6 +568,10 @@ function materialized(doc) {
 
 export function toJS(value) {
   if (isObject(value) && value[STATE]) materialized(value)
+  if (isObject(value) && scopedDocs.has(value)) {
+    const {heads, state} = scopedDocs.get(value), [scoped, patch] = backend.view(state, heads)
+    return toJS(Frontend.applyPatch(init(), patch, scoped))
+  }
   if (value instanceof Frontend.Text) {
     let text = ''
     for (const item of value) text += typeof item === 'string' ? item : '\ufffc'
@@ -860,7 +868,7 @@ export function diff(doc, beforeHeads, afterHeads) {
   const recent = recentPatches.get(doc)
   if (recent && equals(recent.before, beforeHeads) && equals(recent.after, afterHeads)) {
     if (!recent.patches) recent.patches = recent.compute()
-    return recent.patches
+    if (recent.patches.length > 0) return recent.patches
   }
   if (!hasHeads(doc, beforeHeads) || !hasHeads(doc, afterHeads)) return []
   return cachedDiff(doc, beforeHeads, afterHeads, '_root', true)
@@ -868,7 +876,8 @@ export function diff(doc, beforeHeads, afterHeads) {
 
 function diffValue(value, inMark) {
   if (value.objectType) return value.objectType === 'text' ? '' : value.objectType === 'list' ? [] : {}
-  if (value.datatype === 'counter') return new Frontend.Counter(value.value)
+  if (value.datatype === 'counter') return new Frontend.Counter(exportInt(value.value))
+  if (value.datatype === 'int') return exportInt(value.value)
   if (value.datatype === 'timestamp') return new Date(value.value)
   if (value.datatype === 'uint') return BigInt(value.value)
   if (typeof value.value === 'string' && !inMark) return new ImmutableString(value.value)
@@ -1453,7 +1462,18 @@ export function block(doc, path, index) {
   const value = 'element' in target ? target.element : target.text.get(target.index)
   if (!isRecord(value)) return null
   const context = doc[CHANGE], source = context && isolatedSources.get(context.cache), objectId = Frontend.getObjectId(value)
-  return toJS(source && !context.updated[objectId] && source[CACHE][objectId] || value)
+  return source ? currentBlock(source, context, objectId) : toJS(value)
+}
+
+function currentBlock(source, context, objectId) {
+  let state = backend.clone(Frontend.getBackendState(source.doc, 'block'))
+  if (context.ops.length > 0) {
+    const change = {actor: context.actorId, seq: source.seq, startOp: source.startOp, time: 0, message: '', deps: backend.getHeads(state), ops: context.ops}
+    ;[state] = backend.applyChanges(state, [encodeChangeRaw(change)])
+  }
+  const patch = backend.objectPatch(state, objectId) || {objectId, type: 'map', props: {}}
+  const holder = Frontend.applyPatch(init(), {maxOp: 0, clock: {}, deps: [], diffs: {objectId: '_root', type: 'map', props: {block: {[objectId]: patch}}}}, state)
+  return toJS(holder.block)
 }
 
 export function splitBlock(doc, path, index, value) {

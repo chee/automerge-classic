@@ -1,4 +1,4 @@
-import { PanicError, compareUtf8, copyObject, parseOpId, wellFormedString } from '../src/common.js'
+import { PanicError, addInt, compareUtf8, copyObject, parseOpId, wellFormedString } from '../src/common.js'
 import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, decodeChangeColumns, decodeChangeMeta, decodeDocumentHeader, decodeValue, decoderByColumnId, documentChanges, encodeDocumentHeader, encoderByColumnId, makeDecoders } from './columnar.js'
 import * as ColumnData from './column_data.js'
 import { Decoder, Encoder } from './encoding.js'
@@ -319,7 +319,7 @@ function seekWithinOperations(target, cache, actorIds, resumeInsertion) {
 
   const first = rows[index]
   if ((!first || first[objCtrIdx] !== objCtr || first[objActorIdx] !== objActorNum) && !resumeInsertion) {
-    return {found: true, skipCount: index, visibleCount: 0}
+    return {found: keyStr !== null || !(keyCtr !== null && keyCtr > 0 && keyActor !== null), skipCount: index, visibleCount: 0}
   }
 
   if (keyStr !== null) {
@@ -412,7 +412,7 @@ function seekWithinBlock(ops, docCols, actorIds, resumeInsertion) {
     }
   }
   if ((nextObjCtr !== objCtr || nextObjActor !== objActor) && !resumeInsertion) {
-    return {found: true, skipCount, visibleCount: 0}
+    return {found: keyStr !== null || !(keyCtr !== null && keyCtr > 0 && keyActor !== null), skipCount, visibleCount: 0}
   }
 
   // Seek to the appropriate key (if string key is used)
@@ -559,7 +559,8 @@ function seekToOp(docState, ops, startBlockIndex) {
           // If we reach the end of the list object without a Bloom filter hit, the reference element
           // doesn't exist
           if (docState.blocks[blockIndex].lastObjectCtr > objCtr) {
-            throw referenceNotFound(ops)
+            if (ops.insert) throw referenceNotFound(ops)
+            return null
           }
 
           // Add up number of visible list elements in any blocks we skip, for list index computation
@@ -580,8 +581,10 @@ function seekToOp(docState, ops, startBlockIndex) {
         // Last block: if we haven't found the reference element by now, it's an error
         if (found) {
           return {blockIndex, skipCount, visibleCount: totalVisible + visibleCount}
-        } else {
+        } else if (ops.insert) {
           throw referenceNotFound(ops)
+        } else {
+          return null
         }
 
       } else if (found && skipCount < docState.blocks[blockIndex].numOps) {
@@ -1517,7 +1520,7 @@ function updatePatchProperty(patches, newBlock, objectId, op, docState, propStat
     delete pendingBySucc[opId]
     const delta = decodeValue(op[valLenIdx], op[valRawIdx]).value
     for (const state of states) {
-      state.value += delta
+      state.value = addInt(state.value, delta)
       delete state.succs[opId]
       if (oldSuccNum !== undefined && ++state.oldIncs === state.oldSuccNum) wasVisible = true
       if (state.dead || Object.keys(state.succs).length > 0) continue
@@ -1698,7 +1701,7 @@ function mergeDocChangeOps(patches, newBlock, outOps, changeState, docState, lis
                    nextOp[keyCtrIdx] === lastOp[idCtrIdx]) {
           // Collect consecutive insertions
         } else if (!insert && lastOp !== null && nextOp[keyStrIdx] !== null &&
-                   nextOp[keyStrIdx] === lastOp[keyStrIdx] && !isOverwrite) {
+                   nextOp[keyStrIdx] === lastOp[keyStrIdx] && !isOverwrite && !docState.predSeek) {
           // Collect several updates to the same key
         } else if (!insert && lastOp !== null &&
                    nextOp[keyStrIdx] === null && lastOp[keyStrIdx] === null &&
@@ -1931,7 +1934,13 @@ function applyOps(patches, changeState, docState) {
   }
   ops.predIds = predIds
   ops.predRows = predRows
-  const {blockIndex, skipCount, visibleCount} = seekToOp(docState, ops, startBlockIndex)
+  docState.predSeek = predRows !== undefined
+  const position = seekToOp(docState, ops, startBlockIndex)
+  if (!position) {
+    readNextChangeOp(docState, changeState)
+    return
+  }
+  const {blockIndex, skipCount, visibleCount} = position
   const block = docState.blocks[blockIndex]
   const firstWrite = keyStr !== null && !block.hasListOps && changeState.nextOp[predNumIdx] === 0 && changeState.changes.length === 1
   docState.readFromColumns = false
@@ -2338,7 +2347,7 @@ function documentPatch(docState, clock) {
     }
     updatePatchProperty(patches, null, objectId, docOp, docState, propState, listIndex, docOp[succNumIdx])
   }
-  return patches._root
+  return patches[docState.patchObject || '_root']
 }
 
 /**
@@ -3096,7 +3105,7 @@ function isMakeRow(row) {
 function rowValue(ctx, row, incAfter) {
   if (isMakeRow(row)) return ctx.valueOf({objectType: OBJECT_TYPE[ACTIONS[row[actionIdx]]]})
   const decoded = decodeValue(row[valLenIdx], row[valRawIdx])
-  if (decoded.datatype === 'counter') decoded.value += incAfter
+  if (decoded.datatype === 'counter') decoded.value = addInt(decoded.value, incAfter)
   return ctx.valueOf(decoded)
 }
 
@@ -3338,8 +3347,8 @@ function markEvent(events, objectId, marks, index, length) {
 
 function trailingInsertShift(ctx, rows, type, events, first) {
   let last = -1
-  for (let i = 0; i < rows.length; i++) if (!rows[i].skip && rows[i][insertIdx] && covers(ctx.before, rows[i])) last = i
-  if (last < 0) return
+  for (let i = 0; i < rows.length; i++) if (rows[i].skip || rows[i][insertIdx] && covers(ctx.before, rows[i])) last = i
+  if (last < 0 || rows[last].skip) return
   let end = last + 1
   while (end < rows.length && !rows[end].skip && !rows[end][insertIdx]) end++
   const group = rows.slice(last, end), ids = new Set(group.map(row => `${row[idCtrIdx]}@${row[idActorIdx]}`))
@@ -3825,7 +3834,8 @@ class BackendDoc {
       visibleMapOps: {base: this.visibleMapOps, changes: new Map()},
       objectMeta: this.objectMeta,
       metaUndo: [],
-      objectsWithMarks: new Set(this.objectsWithMarks)
+      objectsWithMarks: new Set(this.objectsWithMarks),
+      predSeek: false
     }
     let allApplied = [], objectIds = new Set()
 
@@ -4349,6 +4359,11 @@ class BackendDoc {
       }
     }
     return true
+  }
+
+  objectPatch(objectId) {
+    const objectMeta = {_root: {parentObj: null, parentKey: null, opId: null, type: 'map', children: {}}}
+    return documentPatch({blocks: this.blocks, actorIds: this.actorIds, objectMeta, maxOp: 0, patchObject: objectId})
   }
 
   /**

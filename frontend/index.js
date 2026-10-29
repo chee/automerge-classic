@@ -1,7 +1,7 @@
 import { CACHE, CHANGE, CONFLICTS, OBJECT_ID, OPTIONS, PROXY_PATH, STATE } from './constants.js'
 import { copyObject, isObject } from '../src/common.js'
 import uuid from '../src/uuid.js'
-import { cloneMapObject, interpretPatch, lamportCompare, reorderNewKeys } from './apply_patch.js'
+import { cloneListObject, cloneMapObject, interpretPatch, lamportCompare, reorderNewKeys } from './apply_patch.js'
 import { rootObjectProxy } from './proxies.js'
 import { Context } from './context.js'
 import { Text } from './text.js'
@@ -151,6 +151,91 @@ function applyPatchToDoc(doc, patch, state) {
   state.deps  = patch.deps
   state.maxOp = Math.max(state.maxOp, patch.maxOp)
   return updateRootObject(doc, updated, state)
+}
+
+function docNode(value) {
+  if (!isObject(value) || value[OBJECT_ID] === undefined || value instanceof Text) return null
+  return Array.isArray(value) ? {src: value, items: null} : {src: value, keys: null, children: {}}
+}
+
+function patchNode(value) {
+  if (Array.isArray(value)) return {src: [], items: []}
+  if (isObject(value) && Object.getPrototypeOf(value) === Object.prototype) return {src: {}, keys: [], children: {}}
+  return null
+}
+
+function nodeChild(node, key) {
+  if (node.items !== undefined) return (node.items ||= node.src.map(docNode))[key]
+  if (!Object.prototype.hasOwnProperty.call(node.children, key)) node.children[key] = docNode(node.src[key])
+  return node.children[key]
+}
+
+function replaceChild(object, conflicts, key, before, after) {
+  object[key] = after
+  if (!conflicts[key]) return
+  conflicts[key] = Object.fromEntries(Object.entries(conflicts[key]).map(([opId, value]) => [opId, value === before ? after : value]))
+}
+
+function rebuildNode(object, node, updated) {
+  if (!node || !isObject(object) || object[OBJECT_ID] === undefined || Array.isArray(object) !== (node.items !== undefined)) return object
+  const objectId = object[OBJECT_ID]
+  let copy = null
+  const children = node.items !== undefined ? (node.items || []).map((child, index) => [index, child]) : Object.entries(node.children)
+  for (const [key, child] of children) {
+    const value = rebuildNode(object[key], child, updated)
+    if (value === object[key]) continue
+    copy ||= Array.isArray(object) ? cloneListObject(object, objectId) : cloneMapObject(object, objectId)
+    replaceChild(copy, copy[CONFLICTS], key, object[key], value)
+  }
+  if (node.keys) {
+    const keys = Object.keys(object)
+    if (keys.length === node.keys.length && node.keys.some((key, i) => keys[i] !== key) &&
+        node.keys.every(key => Object.prototype.hasOwnProperty.call(object, key))) {
+      copy ||= cloneMapObject(object, objectId)
+      for (const key of node.keys) {
+        const value = copy[key]
+        delete copy[key]
+        copy[key] = value
+      }
+    }
+  }
+  if (copy) updated[objectId] = copy
+  return copy || object
+}
+
+/**
+ * Returns `after` with the keys of its map objects in the order that results from applying
+ * `patches` to `before` one by one, the way the Rust implementation updates a document.
+ */
+function followPatchOrder(before, after, patches) {
+  const root = docNode(before)
+  for (const patch of patches) {
+    let node = root
+    for (const key of patch.path.slice(0, -1)) node = node && nodeChild(node, key)
+    if (!node) continue
+    const key = patch.path[patch.path.length - 1]
+    if (node.items !== undefined) {
+      node.items ||= node.src.map(docNode)
+      const items = node.items
+      if (patch.action === 'insert') items.splice(key, 0, ...patch.values.map(patchNode))
+      else if (patch.action === 'del') items.splice(key, patch.length || 1)
+      else if (patch.action === 'put') items[key] = patchNode(patch.value)
+    } else if (patch.action === 'put' || patch.action === 'del') {
+      node.keys ||= Object.keys(node.src)
+      const keys = node.keys
+      const index = keys.indexOf(key)
+      if (patch.action === 'del') {
+        if (index >= 0) keys.splice(index, 1)
+        node.children[key] = null
+      } else {
+        if (index < 0) keys.push(key)
+        node.children[key] = patchNode(patch.value)
+      }
+    }
+  }
+  const updated = {}
+  rebuildNode(after, root, updated)
+  return updated._root ? updateRootObject(after, updated, after[STATE], false) : after
 }
 
 /**
@@ -440,7 +525,7 @@ function getBackendState(doc, callerName = null, argPos = 'first') {
 }
 
 export {
-  init, from, change, emptyChange, applyPatch, setInteropAttach,
+  init, from, change, emptyChange, applyPatch, followPatchOrder, setInteropAttach,
   getObjectId, getObjectById, getText, getActorId, setActorId, getConflicts, getLastLocalChange,
   getBackendState,
   Text, Counter, Float64, Int, Uint

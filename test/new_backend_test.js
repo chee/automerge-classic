@@ -770,7 +770,7 @@ describe('BackendDoc applying changes', () => {
     assert.strictEqual(backend.blocks[0].lastVisibleCtr, 4)
   })
 
-  it('should throw an error if a deleted element does not exist', () => {
+  it('should ignore the deletion of an element that does not exist', () => {
     const actor = uuid()
     const change1 = {actor, seq: 1, startOp: 1, time: 0, deps: [], ops: [
       {action: 'makeText', obj: '_root',      key: 'text',          insert: false,             pred: []},
@@ -782,7 +782,7 @@ describe('BackendDoc applying changes', () => {
     ]}
     const backend = new BackendDoc()
     backend.applyChanges([encodeChange(change1)])
-    assert.throws(() => { backend.applyChanges([encodeChange(change2)]) }, /Reference element not found/)
+    assert.deepStrictEqual(backend.applyChanges([encodeChange(change2)]).diffs.props, {})
   })
 
   it('should apply concurrent insertions at the same position', () => {

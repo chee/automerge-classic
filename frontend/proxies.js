@@ -200,9 +200,8 @@ const ListHandler = {
     }
   },
 
-  ownKeys (target) {
-    const [context, objectId, /* path */] = target
-    return ['length', ...Object.keys(context.getObject(objectId))]
+  ownKeys () {
+    return ['length']
   }
 }
 
