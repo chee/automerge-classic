@@ -71,6 +71,10 @@ function applyLocalChange(backend, change) {
     change.deps = [...new Set([lastHash, ...change.deps])].sort()
   }
 
+  if (state.anchorSource) {
+    state.anchorSource.ops = change.ops.map(op => Object.assign({}, op))
+    state.anchorSource.doc.adjustInsertAnchors(Object.assign({}, change, {ops: state.anchorSource.ops}), state.anchorSource.clock)
+  }
   state.adjustInsertAnchors(change)
   const decoded = encodeChangeColumns(change)
   const patch = state.applyDecodedChanges([decoded], true)
@@ -241,6 +245,11 @@ function getChangeByHash(backend, hash) {
   return backendState(backend, true).getChangeByHash(hash)
 }
 
+function getLastChangeByActor(backend, actor) {
+  const state = backendState(backend, true), seq = state.clock[actor]
+  return seq ? state.getChangeByHash(hashByActor(state, actor, seq - 1)) : undefined
+}
+
 /**
  * Returns the hashes of any missing dependencies, i.e. where we have applied a
  * change that has a dependency on a change we have not seen.
@@ -261,6 +270,15 @@ function hasHeads(backend, heads) {
 
 function getCursorPosition(backend, objectId, elemId, move) {
   return backendState(backend, true).getCursorPosition(objectId, elemId, move)
+}
+
+function isolatedActor(backend, actor, heads) {
+  return backendState(backend, true).isolatedActor(actor, heads)
+}
+
+function isolateAnchors(branch, source, heads) {
+  const doc = backendState(source, true)
+  backendState(branch).anchorSource = {doc, clock: doc.opClock(doc.clockAt(heads).clock)}
 }
 
 function getChangesMeta(backend, heads = []) {
@@ -299,6 +317,6 @@ function saveBundleByHash(backend, hashes) {
 export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
   load, loadChanges, loadIncremental, getPatch, view, viewOf, getHeads, getAllChanges, getChanges,
-  getChangesAdded, getChangeByHash, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta,
+  getChangesAdded, getChangeByHash, getLastChangeByActor, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta, isolatedActor, isolateAnchors,
   getChangesByHash, topoHistoryTraversal, stats, diff, clockDiff, localPatches, markEvent, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
 }

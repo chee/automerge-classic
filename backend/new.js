@@ -2372,12 +2372,13 @@ function appendChange(columns, change, actorIndexById, changeIndexByHash) {
 function changeMeta(buffer) {
   const change = decodeChangeColumns(buffer)
   const actionColumn = change.columns.find(column => column.columnId === CHANGE_COLUMNS[actionIdx].columnId)
-  if (!actionColumn) throw new RangeError('change is missing action column')
-  const actions = decoderByColumnId(actionColumn.columnId, actionColumn.buffer)
   let numOps = 0
-  while (!actions.done) {
-    actions.readValue()
-    numOps++
+  if (actionColumn) {
+    const actions = decoderByColumnId(actionColumn.columnId, actionColumn.buffer)
+    while (!actions.done) {
+      actions.readValue()
+      numOps++
+    }
   }
   return {
     actor: change.actor,
@@ -2435,9 +2436,9 @@ function blockInserts(block, actorIds, objectId, counter, actor) {
     if (op[objCtrIdx] !== counter || op[objActorIdx] !== actor || !op[insertIdx]) continue
     const id = `${op[idCtrIdx]}@${actorIds[op[idActorIdx]]}`
     const ref = op[keyCtrIdx] === 0 ? '_head' : `${op[keyCtrIdx]}@${actorIds[op[keyActorIdx]]}`
-    const mark = ACTIONS[op[actionIdx]] !== 'mark' ? null : op[markNameIdx] === null
-      ? {begin: false, expand: !!op[expandIdx]}
-      : {begin: true, name: op[markNameIdx], value: decodeValue(op[valLenIdx], op[valRawIdx]).value, expand: !!op[expandIdx]}
+    const value = ACTIONS[op[actionIdx]] === 'mark' && op[markNameIdx] !== null && decodeValue(op[valLenIdx], op[valRawIdx])
+    const mark = !value ? (ACTIONS[op[actionIdx]] === 'mark' ? {begin: false, expand: !!op[expandIdx]} : null)
+      : {begin: true, name: op[markNameIdx], value: value.datatype === 'timestamp' ? new Date(value.value) : value.value, expand: !!op[expandIdx]}
     entries.push({id, ref, mark, counter: op[idCtrIdx], actor: op[idActorIdx]})
   }
   byObject.set(objectId, entries)
@@ -3223,7 +3224,57 @@ function markEvent(events, objectId, marks, index, length) {
   }
 }
 
+function trailingInsertShift(ctx, rows, type, events, first) {
+  let last = -1
+  for (let i = 0; i < rows.length; i++) if (!rows[i].skip && rows[i][insertIdx] && covers(ctx.before, rows[i])) last = i
+  if (last < 0) return
+  let end = last + 1
+  while (end < rows.length && !rows[end].skip && !rows[end][insertIdx]) end++
+  const group = rows.slice(last, end), ids = new Set(group.map(row => `${row[idCtrIdx]}@${row[idActorIdx]}`))
+  function compare(a, b) { return a[0] - b[0] || ctx.actorRank[a[1]] - ctx.actorRank[b[1]] }
+  let maxDoc = null, update = null
+  for (const row of group) {
+    const id = [row[idCtrIdx], row[idActorIdx]]
+    if (covers(ctx.before, row)) {
+      if (!maxDoc || compare(id, maxDoc) > 0) maxDoc = id
+      for (let i = 0; i < row[succNumIdx]; i++) {
+        const succ = [row[succCtrIdx][i], row[succActorIdx][i]]
+        if (!ids.has(`${succ[0]}@${succ[1]}`) && ctx.after && succ[0] <= ctx.after[succ[1]] && !(ctx.before && succ[0] <= ctx.before[succ[1]]) &&
+            (!update || compare(succ, update.id) > 0)) update = {id: succ, visible: false}
+      }
+    } else if (covers(ctx.after, row) && (!update || compare(id, update.id) > 0)) {
+      update = {id, visible: row[actionIdx] !== INC_ACTION && visibleAt(row, ctx.after, null)}
+    }
+  }
+  if (!update || update.visible || compare(update.id, maxDoc) < 0) return
+  const top = group.find(row => row[actionIdx] !== MARK_ACTION && visibleAt(row, ctx.after, groupIncrements(group, 0, group.length)))
+  if (!top) return
+  const width = type === 'text' ? textWidth(top) : 1
+  let trailing = 0
+  for (let i = end; i < rows.length;) {
+    let next = i + 1
+    while (next < rows.length && !rows[next].skip && !rows[next][insertIdx]) next++
+    const visible = rows.slice(i, next).find(row => !row.skip && row[actionIdx] !== MARK_ACTION && visibleAt(row, ctx.after, groupIncrements(rows, i, next)))
+    if (visible) trailing += type === 'text' ? textWidth(visible) : 1
+    i = next
+  }
+  for (let i = events.length - 1; i >= first && trailing > 0; i--) {
+    const event = events[i]
+    if (event.kind !== 'insert' && event.kind !== 'splice') continue
+    trailing -= event.kind === 'splice' ? event.text.length : 1
+    event.prop -= width
+  }
+}
+
 function objectEvents(ctx, objectId, events) {
+  const first = events.length
+  objectEventsInner(ctx, objectId, events)
+  if (ctx.batch && objectType(ctx, objectId) !== 'map' && events.slice(first).some(event => event.kind === 'insert' || event.kind === 'splice')) {
+    trailingInsertShift(ctx, diffRows(ctx, objectId, true), objectType(ctx, objectId), events, first)
+  }
+}
+
+function objectEventsInner(ctx, objectId, events) {
   const type = objectType(ctx, objectId), rows = diffRows(ctx, objectId, true), children = new Set(), skipped = []
   ctx.children.set(objectId, children)
   ctx.skipped.set(objectId, skipped)
@@ -3490,7 +3541,7 @@ class BackendDoc {
    * authoring time means the wire format alone determines placement, and the apply side can use
    * plain RGA ordering. Mutates `change.ops` in place. Only runs for objects that contain marks.
    */
-  adjustInsertAnchors(change) {
+  adjustInsertAnchors(change, clock) {
     const marked = new Set(this.objectsWithMarks)
     for (const op of change.ops) if (op.action === 'markBegin') marked.add(op.obj)
     if (!change.ops.some(op => op.insert && marked.has(op.obj))) return
@@ -3499,7 +3550,7 @@ class BackendDoc {
     for (const op of change.ops) {
       const count = op.values ? op.values.length : op.multiOp || 1
       if (marked.has(op.obj) && op.elemId !== undefined) {
-        if (!sequences.has(op.obj)) sequences.set(op.obj, this.sequenceElements(op.obj))
+        if (!sequences.has(op.obj)) sequences.set(op.obj, this.sequenceElements(op.obj, clock))
         const elems = sequences.get(op.obj)
         if (op.insert) {
           op.elemId = insertAnchor(elems, op.elemId)
@@ -3520,7 +3571,7 @@ class BackendDoc {
     }
   }
 
-  sequenceElements(objectId) {
+  sequenceElements(objectId, clock) {
     const {counter, actorId} = parseOpId(objectId), elems = [], counters = []
     const actor = this.actorIndexById.get(actorId)
     if (actor === undefined) return elems
@@ -3530,7 +3581,7 @@ class BackendDoc {
       let next = 0
       for (const op of columnOperationCache(block.columns).operations) {
         if (op[objCtrIdx] !== counter || op[objActorIdx] !== actor || op[keyStrIdx] !== null) continue
-        const action = ACTIONS[op[actionIdx]], visible = visibleRow(op, op[succNumIdx], counters)
+        const action = ACTIONS[op[actionIdx]], visible = clock ? visibleAt(op, clock, null) : visibleRow(op, op[succNumIdx], counters)
         if (op[insertIdx]) {
           const mark = action !== 'mark' ? null : op[markNameIdx] === null ? 'end' : 'begin'
           elems.push({id: entries[next++].id, mark, expand: !!op[expandIdx], visible})
@@ -3568,6 +3619,7 @@ class BackendDoc {
     copy.visibleMapOps = new Map(this.visibleMapOps)
     copy.cursorIndex = this.cursorIndex
     copy.objectsWithMarks = new Set(this.objectsWithMarks)
+    copy.anchorSource = this.anchorSource
     copy.queue = this.queue // immutable, no copying needed
     copy.saveCursor = this.saveCursor
     copy.changesEncoders = this.changesEncoders &&
@@ -3972,6 +4024,25 @@ class BackendDoc {
       }
     }
     return {clock, heads: [...new Set(heads)].filter(hash => !covered.has(hash)).sort(), hashes: [...ancestors]}
+  }
+
+  isolatedActor(actor, heads) {
+    const visible = this.clockAt(heads).clock
+    const maxOp = (actorId, seq) => (seq === 0 ? 0 : changeMeta(this.changes[this.changeIndexByHash[this.hashesByActor[actorId][seq - 1]]]).maxOp)
+    for (let level = 0; ; level++) {
+      let candidate = actor
+      if (level > 0) {
+        let leb = ''
+        for (let n = level; ; n >>>= 7) {
+          const byte = n & 0x7f
+          if (n < 0x80) { leb += byte.toString(16).padStart(2, '0'); break }
+          leb += (byte | 0x80).toString(16).padStart(2, '0')
+        }
+        candidate = '13b22309' + leb + actor
+      }
+      const seq = this.clock[candidate] || 0, max = maxOp(candidate, seq)
+      if (max === 0 || maxOp(candidate, visible[candidate] || 0) >= max) return {actor: candidate, seq: seq + 1}
+    }
   }
 
   opClock(clock) {

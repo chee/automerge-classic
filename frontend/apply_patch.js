@@ -22,6 +22,8 @@ function getValue(patch, object, updated, textV2) {
     return new Date(patch.value)
   } else if (patch.datatype === 'counter') {
     return new Counter(patch.value)
+  } else if (patch.datatype === 'uint') {
+    return BigInt(patch.value)
   } else {
     // Primitive value (int, uint, float64, string, boolean, or null)
     return patch.value

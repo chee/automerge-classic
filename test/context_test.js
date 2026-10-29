@@ -348,13 +348,13 @@ describe('Proxying context', () => {
       assert(applyPatch.calledOnce)
       assert.deepStrictEqual(applyPatch.firstCall.args[0], {objectId: '_root', type: 'map', props: {
         birds: {'1@actor1': {objectId: listId, type: 'list', edits: [
-          {action: 'remove', index: 0, count: 1},
-          {action: 'multi-insert', index: 0, elemId: `2@${context.actorId}`, values: ['starling', 'goldfinch']}
+          {action: 'multi-insert', index: 0, elemId: `1@${context.actorId}`, values: ['starling', 'goldfinch']},
+          {action: 'remove', index: 2, count: 1}
         ]}}
       }})
       assert.deepStrictEqual(context.ops, [
-        {obj: listId, action: 'del', elemId: '1@xxx', insert: false, pred: ['1@xxx']},
-        {obj: listId, action: 'set', elemId: '_head', insert: true, values: ['starling', 'goldfinch'], pred: []}
+        {obj: listId, action: 'set', elemId: '_head', insert: true, values: ['starling', 'goldfinch'], pred: []},
+        {obj: listId, action: 'del', elemId: '1@xxx', insert: false, pred: ['1@xxx']}
       ])
     })
   })

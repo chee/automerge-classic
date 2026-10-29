@@ -5,6 +5,7 @@ import { cloneMapObject, interpretPatch, lamportCompare, reorderNewKeys } from '
 import { rootObjectProxy } from './proxies.js'
 import { Context } from './context.js'
 import { Text } from './text.js'
+import { isImmutableString } from '../src/immutable_string.js'
 import { Counter } from './counter.js'
 import { Float64, Int, Uint } from './numbers.js'
 const MAX_CACHE_LAYER = 64
@@ -369,7 +370,9 @@ function setActorId(doc, actorId) {
 }
 
 function readonlyConflict(value, proxies) {
-  if (!isObject(value) || !value[OBJECT_ID] || value instanceof Text) return value
+  if (isImmutableString(value)) return value.val
+  if (value instanceof Text) return value.toJSON()
+  if (!isObject(value) || !value[OBJECT_ID]) return value
   if (proxies.has(value)) return proxies.get(value)
   const proxy = new Proxy(value, {
     get(target, key) {
@@ -410,7 +413,7 @@ function getConflicts(object, key) {
       const path = object[PROXY_PATH].concat([{key, objectId: value[OBJECT_ID]}])
       conflicts[opId] = context.instantiateObject(path, value[OBJECT_ID])
     } else {
-      conflicts[opId] = value
+      conflicts[opId] = isImmutableString(value) ? value.val : value
     }
   }
   return conflicts

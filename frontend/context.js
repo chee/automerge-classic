@@ -3,7 +3,7 @@ import { interpretPatch, lamportCompare } from './apply_patch.js'
 import { Text, elemAt, textOffset } from './text.js'
 import { Counter, getWriteableCounter } from './counter.js'
 import { Float64, Int, Uint } from './numbers.js'
-import { compareUtf8, createArrayOfNulls, equalBytes, isObject, parseOpId, wellFormedString } from '../src/common.js'
+import { compareUtf8, equalBytes, isObject, parseOpId, wellFormedString } from '../src/common.js'
 import { isImmutableString } from '../src/immutable_string.js'
 /**
  * An instance of this class is passed to `rootObjectProxy()`. The methods are
@@ -51,6 +51,9 @@ class Context {
    * Takes a value and returns an object describing the value (in the format used by patches).
    */
   getValueDescription(value, hydrate = false) {
+    if (typeof value === 'bigint' && value >= Number.MIN_SAFE_INTEGER && value <= Number.MAX_SAFE_INTEGER) {
+      return {type: 'value', value: Number(value), datatype: 'int'}
+    }
     if (!['object', 'boolean', 'number', 'string'].includes(typeof value)) {
       throw new TypeError(`Unsupported type of value: ${typeof value}`)
     }
@@ -244,12 +247,13 @@ class Context {
   setValue(objectId, key, value, insert, pred, elemId, stringValue = false) {
     if (typeof value === 'string') value = wellFormedString(value)
     if (typeof value === 'string' && this.textV2 && !stringValue) value = new Text(value)
-    if (isObject(value) && !isScalarObject(value)) {
+    const hydrate = this.hydrating || insert && !this.plainInsert
+    if (isObject(value) && !isScalarObject(value, hydrate)) {
       // Nested object (map, list, text, or table)
       return this.createNestedObjects(objectId, key, value, insert, pred, elemId)
     }
     // Date or counter object, or primitive value (number, string, boolean, or null)
-    const description = this.getValueDescription(value, insert || this.hydrating)
+    const description = this.getValueDescription(value, hydrate)
     const op = {action: 'set', obj: objectId, insert, value: description.value, pred}
     if (elemId) op.elemId = elemId; else op.key = key
     if (description.datatype) op.datatype = description.datatype
@@ -342,7 +346,7 @@ class Context {
     let at = isText && !newObject ? textOffset(list, index) : index
     const stringValues = isText || !this.textV2
     const allPrimitive = values.length > 1 && values.every(v => stringValues && typeof v === 'string' ||
-      typeof v === 'number' || typeof v === 'boolean' || v === null || isScalarObject(v))
+      typeof v === 'number' || typeof v === 'boolean' || v === null || isScalarObject(v, true))
     const descriptions = allPrimitive ? values.map(v => this.getValueDescription(v, true)) : []
     const datatype = allPrimitive && descriptions[0].datatype
 
@@ -388,11 +392,14 @@ class Context {
     const objectId = pathObjectId(path)
     const list = this.getObject(objectId)
 
-    // Assignment past the end of the list => insert nulls followed by new value
-    if (index >= list.length) {
-      const insertions = createArrayOfNulls(index - list.length)
-      insertions.push(value)
-      return this.splice(path, list.length, 0, insertions)
+    if (index > list.length) throw new RangeError(`index ${index} is out of bounds`)
+    if (index === list.length) {
+      this.plainInsert = true
+      try {
+        return this.splice(path, index, 0, [value])
+      } finally {
+        this.plainInsert = false
+      }
     }
 
     // If the assigned list element value is the same as the existing value, and
@@ -422,12 +429,17 @@ class Context {
   splice(path, start, deletions, insertions) {
     const objectId = pathObjectId(path)
     const list = this.getObject(objectId)
-    if (start < 0 || deletions < 0 || start > list.length - deletions) {
-      throw new RangeError(`${deletions} deletions starting at index ${start} are out of bounds for list of length ${list.length}`)
+    if (deletions < 0) {
+      if (start + deletions < 0) throw new RangeError(`index ${start} is out of bounds`)
+      start += deletions
+      deletions = -deletions
     }
+    if (insertions.length > 0 && start > list.length) throw new RangeError(`index ${start} is out of bounds`)
+    deletions = Math.max(0, Math.min(deletions, list.length - start))
     if (deletions === 0 && insertions.length === 0) return
 
     this.applyAtPath(path, subpatch => {
+      if (insertions.length > 0) this.insertListItems(subpatch, start, insertions, false)
       if (deletions > 0) {
         let op, lastElemParsed, lastPredParsed
         for (let i = 0; i < deletions; i++) {
@@ -452,16 +464,21 @@ class Context {
           lastPredParsed = thisPredParsed
         }
         this.addOp(op)
-        subpatch.edits.push({action: 'remove', index: start, count: deletions})
+        subpatch.edits.push({action: 'remove', index: start + insertions.length, count: deletions})
         if (list instanceof Text) {
           const at = textOffset(list, start)
-          this.events.push({objectId, kind: 'del', prop: at, length: textOffset(list, start + deletions) - at})
+          const inserted = insertions.reduce((width, value) => width + (typeof value === 'string' ? value.length : 1), 0)
+          this.events.push({objectId, kind: 'del', prop: at + inserted, length: textOffset(list, start + deletions) - at})
         } else {
-          this.events.push({objectId, kind: 'del', prop: start, length: deletions})
+          this.events.push({objectId, kind: 'del', prop: start + insertions.length, length: deletions})
         }
       }
-      if (insertions.length > 0) this.insertListItems(subpatch, start, insertions, false)
     })
+  }
+
+  deleteListIndex(path, index) {
+    if (index >= this.getObject(pathObjectId(path)).length) throw new RangeError(`index ${index} is out of bounds`)
+    this.splice(path, index, 1, [])
   }
 
   /**
@@ -531,9 +548,9 @@ function pathObjectId(path) {
   return path.length === 0 ? '_root' : path[path.length - 1].objectId
 }
 
-function isScalarObject(value) {
+function isScalarObject(value, hydrate = false) {
   return isImmutableString(value) || ArrayBuffer.isView(value) || value instanceof Date || value instanceof Counter ||
-    value instanceof Int || value instanceof Uint || value instanceof Float64
+    !hydrate && (value instanceof Int || value instanceof Uint || value instanceof Float64)
 }
 
 function assignment(object, key, value, textV2) {
@@ -547,6 +564,10 @@ function winner(opIds) {
 
 function sameValue(a, b) {
   if (a === b) return true
+  if (typeof a === 'bigint' && b instanceof Uint) return a === BigInt(b.value)
+  if (typeof a === 'number' && typeof b === 'bigint') return a === Number(b)
+  if (typeof a === 'number' && b instanceof Int) return a === b.value
+  if (typeof a === 'number' && b instanceof Float64) return a === b.value && !Number.isInteger(a)
   if (isImmutableString(a) && isImmutableString(b)) return a.val === b.val
   if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime()
   if (a instanceof Counter && b instanceof Counter) return a.value === b.value

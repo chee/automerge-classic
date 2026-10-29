@@ -336,10 +336,9 @@ function makeFuzz(seed) {
     const history = Automerge.getHistory(peer.doc)
     if (history.length < 2) return
     const heads = [history[int(history.length - 1)].change.hash]
-    const doc = peer.doc
-    peer.doc = withPatches(peer, push => Automerge.changeAt(doc, heads, {time: 0, patchCallback: push}, draft => {
-      editValues(draft)
-    }).newDoc)
+    peer.doc = Automerge.changeAt(peer.doc, heads, {time: 0}, draft => { editValues(draft) }).newDoc
+    peer.shadow = {}
+    absorb(peer, Automerge.diff(peer.doc, [], Automerge.getHeads(peer.doc)))
   }
 
   function sendChanges(from, to, partial) {

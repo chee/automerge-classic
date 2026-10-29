@@ -77,16 +77,14 @@ describe('TypeScript support', () => {
       assert.strictEqual(Object.isFrozen(s2.birds), true)
     })
 
-    it('should allow the length of the array to be increased', () => {
+    it('should reject increasing the length of the array', () => {
       let s1: Doc<BirdList> = Automerge.from({ birds: []})
-      let s2 = Automerge.change(s1, doc => doc.birds.length = 1)
-      assert.deepStrictEqual(s2.birds, [null])
+      assert.throws(() => Automerge.change(s1, doc => { doc.birds.length = 1 }), /^RangeError: list index must be a number$/)
     })
 
-    it('should allow the length of the array to be decreased', () => {
+    it('should reject decreasing the length of the array', () => {
       let s1: Doc<BirdList> = Automerge.from({ birds: ['1234']})
-      let s2 = Automerge.change(s1, doc => doc.birds.length = 0)
-      assert.deepStrictEqual(s2.birds, [])
+      assert.throws(() => Automerge.change(s1, doc => { doc.birds.length = 0 }), /^RangeError: list index must be a number$/)
     })
 
     it('should throw error if length is invalid', () => {

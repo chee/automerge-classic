@@ -1,27 +1,32 @@
 import { CHANGE, OBJECT_ID, PROXY_PATH, STATE } from './constants.js'
-import { createArrayOfNulls, isObject } from '../src/common.js'
+import { isObject } from '../src/common.js'
 import { Text } from './text.js'
+import { Counter } from './counter.js'
 function parseListIndex(key) {
   if (typeof key === 'string' && /^[0-9]+$/.test(key)) key = parseInt(key, 10)
-  if (typeof key !== 'number') {
-    throw new TypeError('A list index must be a number, but you passed ' + JSON.stringify(key))
-  }
-  if (key < 0 || isNaN(key) || key === Infinity) {
+  if (typeof key !== 'number') return key
+  if (key < 0 || isNaN(key) || key === Infinity || key === -Infinity) {
     throw new RangeError('A list index must be positive, but you passed ' + key)
   }
   return key
 }
 
+function seqIndex(value) {
+  const index = Math.trunc(Number(value))
+  return index > 0 ? index : 0
+}
+
 function listMethods(context, listId, path) {
   const methods = {
     deleteAt(index, numDelete) {
-      context.splice(path, parseListIndex(index), numDelete || 1, [])
+      if (typeof numDelete === 'number') context.splice(path, seqIndex(index), Math.trunc(numDelete) || 0, [])
+      else context.deleteListIndex(path, seqIndex(index))
       return this
     },
 
     fill(value, start, end) {
-      let list = context.getObject(listId)
-      for (let index = parseListIndex(start || 0); index < parseListIndex(end || list.length); index++) {
+      const length = context.getObject(listId).length
+      for (let index = parseListIndex(start || 0); index < Math.min(parseListIndex(end || length), length); index++) {
         context.setListIndex(path, index, value)
       }
       return this
@@ -43,7 +48,7 @@ function listMethods(context, listId, path) {
     },
 
     insertAt(index, ...values) {
-      context.splice(path, parseListIndex(index), 0, values)
+      this.splice(index, 0, ...values)
       return this
     },
 
@@ -51,7 +56,7 @@ function listMethods(context, listId, path) {
       const list = context.getObject(listId)
       if (list.length == 0) return
       const last = context.getObjectField(path, listId, list.length - 1)
-      context.splice(path, list.length - 1, 1, [])
+      context.deleteListIndex(path, list.length - 1)
       return last
     },
 
@@ -65,21 +70,20 @@ function listMethods(context, listId, path) {
     shift() {
       if (context.getObject(listId).length == 0) return
       const first = context.getObjectField(path, listId, 0)
-      context.splice(path, 0, 1, [])
+      context.deleteListIndex(path, 0)
       return first
     },
 
     splice(start, deleteCount, ...values) {
       const list = context.getObject(listId)
       start = parseListIndex(start)
-      if (deleteCount === undefined || deleteCount > list.length - start) {
-        deleteCount = list.length - start
-      }
+      if (typeof deleteCount !== 'number') deleteCount = list.length - start
+      deleteCount = parseListIndex(deleteCount)
       const deleted = []
-      for (let n = 0; n < deleteCount; n++) {
+      for (let n = 0; n < deleteCount && start + n < list.length; n++) {
         deleted.push(context.getObjectField(path, listId, start + n))
       }
-      context.splice(path, start, deleteCount, values)
+      context.splice(path, seqIndex(start), deleteCount, values)
       return deleted
     },
 
@@ -159,26 +163,20 @@ const ListHandler = {
   },
 
   set (target, key, value) {
-    const [context, objectId, path] = target
-    if (key === 'length') {
-      if (typeof value !== 'number') {
-        throw new RangeError("Invalid array length")
-      }
-      const length = context.getObject(objectId).length
-      if (length > value) {
-        context.splice(path, value, length - value, [])
-      } else {
-        context.splice(path, length, 0, createArrayOfNulls(value - length))
-      }
-    } else {
-      context.setListIndex(path, parseListIndex(key), value)
-    }
+    const [context, /* objectId */, path] = target
+    const index = parseListIndex(key)
+    if (typeof index !== 'number') throw new RangeError('list index must be a number')
+    context.setListIndex(path, index, value)
     return true
   },
 
   deleteProperty (target, key) {
-    const [context, /* objectId */, path] = target
-    context.splice(path, parseListIndex(key), 1, [])
+    const [context, objectId, path] = target
+    const index = parseListIndex(key)
+    if (context.getObject(objectId)[index] instanceof Counter) {
+      throw new TypeError('Unsupported operation: deleting a counter from a list')
+    }
+    context.deleteListIndex(path, index)
     return true
   },
 

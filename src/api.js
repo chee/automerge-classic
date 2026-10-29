@@ -1,6 +1,6 @@
 import * as Frontend from '../frontend/index.js'
 import { CHANGE, OPTIONS, STATE } from '../frontend/constants.js'
-import { decodeChange, decodeChangeColumns, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
+import { decodeChange, decodeChangeColumns, decodeChangeMeta, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
 import { compareUtf8, isObject, parseOpId, wellFormedString } from './common.js'
 import { ImmutableString, isImmutableString } from './immutable_string.js'
 import { graphemes, myersDiff, replaceHook } from './text_diff.js'
@@ -485,20 +485,80 @@ export function changeAt(doc, heads, options, callback) {
     callback = options
     options = undefined
   }
-  const branch = clone(view(doc, heads))
+  const current = getHeads(doc)
+  if (heads.length === current.length && heads.every((hash, i) => hash === current[i])) {
+    const newDoc = changeWithSource(doc, options, callback, 'changeAt')
+    return {newDoc, newHeads: newDoc === doc ? null : getHeads(newDoc)}
+  }
+  const isolated = backend.isolatedActor(Frontend.getBackendState(doc, 'changeAt'), Frontend.getActorId(doc), heads)
+  const branch = clone(view(doc, heads), {actor: isolated.actor})
   // The Rust implementation numbers the operations of the isolated change
   // above every operation in the document, not just those it can see, so that
   // successive changes at the same heads are ordered by the order they were
   // made.
   branch[STATE].maxOp = Math.max(branch[STATE].maxOp, doc[STATE].maxOp)
-  const branchOptions = isObject(options) ? Object.assign({}, options, {patchCallback: undefined}) : options
+  backend.isolateAnchors(Frontend.getBackendState(branch, 'changeAt'), Frontend.getBackendState(doc, 'changeAt'), heads)
+  let branchPatches = []
+  const branchOptions = Object.assign(typeof options === 'string' ? {message: options} : Object.assign({}, options),
+    {patchCallback: patches => { branchPatches = patches }})
   const changed = changeWithSource(branch, branchOptions, callback, 'changeAt')
   if (changed === branch) return {newDoc: doc, newHeads: null}
-  const newHeads = getHeads(changed)
-  const oldState = Frontend.getBackendState(doc, 'changeAt')
-  const changedState = Frontend.getBackendState(changed, 'changeAt', 'second')
-  const changes = backend.getChangesAdded(oldState, changedState)
-  return {newDoc: applyChangesWithSource(doc, changes, options || {}, 'changeAt', heads), newHeads}
+  const change = decodeChange(getLastLocalChange(changed), true)
+  const ops = Frontend.getBackendState(changed, 'changeAt').state.anchorSource.ops
+  const bytes = encodeChangeRaw(Object.assign(change, {seq: isolated.seq, deps: heads.slice().sort(), ops}))
+  const [newState, patch] = backend.applyChanges(Frontend.getBackendState(doc, 'changeAt'), [bytes])
+  const newDoc = Frontend.applyPatch(doc, patch, newState), newHeads = [decodeChange(bytes).hash]
+  progress(doc, newDoc, isObject(options) && options.patchCallback || doc[OPTIONS].patchCallback, 'changeAt', heads, () => {
+    const objectIds = new Map(diff(doc, current, heads).concat(branchPatches)
+      .map(patch => Object.assign({}, patch, patch.values && {values: patch.values.slice()}))
+      .map(patch => [patch, patchObjectId(changed, patch)]))
+    const isolatedPatches = [...objectIds.keys()].filter(patch => objectIds.get(patch))
+      .sort((left, right) => compareObjectIds(objectIds.get(left), objectIds.get(right)))
+    const merged = []
+    for (const patch of isolatedPatches) {
+      const last = merged[merged.length - 1]
+      if (!last || objectIds.get(last) !== objectIds.get(patch) || !mergePatch(last, patch)) merged.push(patch)
+    }
+    return merged.filter(patch => patch.action !== 'splice' || patch.value !== '').concat(diff(newDoc, newHeads, getHeads(newDoc)))
+  })
+  return {newDoc, newHeads}
+}
+
+function patchObjectId(doc, patch) {
+  let object = doc
+  for (const key of patch.action === 'mark' ? patch.path : patch.path.slice(0, -1)) {
+    if (!isObject(object)) return undefined
+    const index = object instanceof Frontend.Text && textCursorIndex(object, key)
+    object = object instanceof Frontend.Text ? index < object.length && object.get(index) : valueAt(object, key)
+  }
+  return Frontend.getObjectId(object)
+}
+
+function mergePatch(last, patch) {
+  const at = patch.path[patch.path.length - 1] - last.path[last.path.length - 1]
+  const size = last.action === 'splice' ? last.value.length : last.action === 'insert' ? last.values.length : 0
+  if (patch.action === 'splice' && last.action === 'splice' && at >= 0 && at <= size &&
+      JSON.stringify(patch.marks) === JSON.stringify(last.marks)) {
+    last.value = last.value.slice(0, at) + patch.value + last.value.slice(at)
+  } else if (patch.action === 'insert' && last.action === 'insert' && at >= 0 && at <= size && !patch.conflicts && !last.conflicts) {
+    last.values.splice(at, 0, ...patch.values)
+  } else if (patch.action === 'del' && (last.action === 'splice' || last.action === 'insert') && at >= 0 && at + (patch.length || 1) <= size) {
+    if (last.action === 'splice') last.value = last.value.slice(0, at) + last.value.slice(at + (patch.length || 1))
+    else last.values.splice(at, patch.length || 1)
+  } else if (patch.action === 'del' && last.action === 'del' && at === 0 && typeof patch.path[patch.path.length - 1] === 'number') {
+    last.length = (last.length || 1) + (patch.length || 1)
+  } else {
+    return false
+  }
+  return true
+}
+
+function compareObjectIds(left, right) {
+  if (left === right) return 0
+  if (left === '_root') return -1
+  if (right === '_root') return 1
+  const l = parseOpId(left), r = parseOpId(right)
+  return l.counter - r.counter || (l.actorId < r.actorId ? -1 : 1)
 }
 
 export function toJS(value) {
@@ -529,7 +589,11 @@ export function isCounter(value) {
 }
 
 export function getLastLocalChange(doc) {
-  return Frontend.getLastLocalChange(doc) || undefined
+  const actor = Frontend.getActorId(doc), seq = doc[STATE].clock[actor]
+  if (!seq) return undefined
+  const local = Frontend.getLastLocalChange(doc)
+  if (local && decodeChangeMeta(local).seq === seq) return local
+  return backend.getLastChangeByActor(Frontend.getBackendState(doc, 'getLastLocalChange'), actor)
 }
 
 export function insertAt(list, index, ...values) {
@@ -563,6 +627,57 @@ function valueAtPath(doc, path, name) {
 
 function valueAt(object, key) {
   return Frontend.getText(object, key) || object[key]
+}
+
+function seqIndex(value) {
+  const index = Math.trunc(Number(value))
+  return index > 0 ? index : 0
+}
+
+function hasKey(map, key) {
+  const context = map[CHANGE]
+  return Object.prototype.hasOwnProperty.call(context ? context.getObject(Frontend.getObjectId(map)) : map, key)
+}
+
+function objectType(value) {
+  if (value instanceof Frontend.Text) return 'text'
+  if (Array.isArray(value)) return 'list'
+  return 'map'
+}
+
+function resolvePath(doc, path, prefix) {
+  if (!Array.isArray(path)) throw new TypeError('path.unshift is not a function')
+  const objectId = Frontend.getObjectId(doc)
+  if (!objectId) throw new RangeError(`invalid object for ${prefix}`)
+  const full = [objectId].concat(path).join('/')
+  const parts = full.split('/').slice(1)
+  let parent = null, key = null, value = doc
+  for (let i = 0; i < parts.length && parts[i] !== ''; i++) {
+    const prop = parts[i]
+    const type = objectType(value)
+    let next
+    if (type === 'map') {
+      if (hasKey(value, prop)) next = valueAt(value, prop)
+    } else if (!/^\+?[0-9]+$/.test(prop)) {
+      throw new RangeError(`${prefix}invalid path ${full}: path component ${i} (${prop}) should be an integer to index a sequence`)
+    } else if (type === 'list') {
+      const index = parseInt(prop, 10)
+      if (index < value.length) next = valueAt(value, index)
+    } else if (parseInt(prop, 10) < textLength(value)) {
+      next = value.get(textCursorIndex(value, parseInt(prop, 10)))
+    }
+    if (next === undefined) {
+      throw new RangeError(`${prefix}invalid path ${full}: path component ${i} (${prop}) referenced a nonexistent object`)
+    }
+    if (!(next instanceof Frontend.Text) && !Frontend.getObjectId(next) &&
+        !(typeof next === 'string' && type !== 'text' && i === parts.length - 1)) {
+      throw new RangeError(`${prefix}invalid path ${full}: path did not refer to an object`)
+    }
+    parent = value
+    key = type === 'map' ? prop : parseInt(prop, 10)
+    value = next
+  }
+  return {parent, key, value, type: typeof value === 'string' ? 'string' : objectType(value)}
 }
 
 function textElementWidth(value) {
@@ -602,32 +717,44 @@ function textCursorIndex(text, offset) {
   return index
 }
 
-export function splice(doc, path, index, del, newText = '') {
-  const target = valueAtPath(doc, path, 'splice')
-  if (typeof index === 'string') index = getCursorPosition(doc, path, index)
-  if (!Number.isInteger(index) || !Number.isInteger(del)) {
-    throw new RangeError('splice() index and delete count must be integers')
+export function splice(doc, path, index, del, newText) {
+  if (!doc || !doc[CHANGE]) throw new RangeError('object cannot be modified outside of a change block')
+  if (typeof index === 'string') {
+    if (!/^-?[0-9]+@[0-9a-zA-Z]+$|^[se]$/.test(index)) throw new RangeError('index must be a number or cursor')
+    index = getCursorPosition(doc, path, index)
   }
-  if (typeof newText !== 'string') throw new TypeError('splice() text must be a string')
-  newText = wellFormedString(newText)
+  const target = resolvePath(doc, path, 'Cannot splice: RangeError: invalid object ID: ')
+  index = seqIndex(index)
+  del = Math.trunc(Number(del)) || 0
+  let values = typeof newText === 'string' ? wellFormedString(newText) : Array.isArray(newText) ? newText : ''
+  if (Array.isArray(values)) {
+    const bad = values.findIndex(value => !(value === null || ['boolean', 'string', 'number', 'bigint'].includes(typeof value) ||
+      value instanceof Date || value instanceof Uint8Array))
+    if (bad >= 0) throw new RangeError('Cannot splice: RangeError: invalid import: ' + jsValueDebug(values[bad]))
+    values = target.type === 'list' ? values.map(value => (typeof value === 'string' ? new ImmutableString(value) : value)) : values.join('')
+  } else if (target.type === 'list') {
+    values = [...values].map(char => new ImmutableString(char))
+  }
+  const text = target.value
+  if (target.type === 'map') {
+    if (values.length > 0) throw new RangeError('Cannot splice: RangeError: invalid op for object of type `map`')
+    return
+  }
   if (del < 0) {
+    if (index + del < 0) throw new RangeError(`Cannot splice: RangeError: index ${index} is out of bounds`)
     index += del
     del = -del
   }
-  const text = target.value
-  if (typeof text !== 'string' && !(text instanceof Frontend.Text) && !Array.isArray(text)) {
-    throw new RangeError('splice() path does not resolve to a string, Text, or list')
-  }
   const length = text instanceof Frontend.Text ? textLength(text) : text.length
-  if (index < 0 || index > length && newText !== '') throw new RangeError('splice() index is out of bounds')
+  if (index > length && values.length > 0) throw new RangeError(`Cannot splice: RangeError: index ${index} is out of bounds`)
   if (index > length) return
   del = Math.min(del, length - index)
   if (text instanceof Frontend.Text) {
-    spliceText(text, index, del, newText)
+    spliceText(text, index, del, values)
   } else if (Array.isArray(text)) {
-    text.splice(index, del, ...newText)
+    text.splice(index, del, ...values)
   } else {
-    target.parent[target.key] = text.slice(0, index) + newText + text.slice(index + del)
+    target.parent[target.key] = text.slice(0, index) + values + text.slice(index + del)
   }
 }
 
@@ -660,10 +787,8 @@ function textEdits(text, newText) {
 export function updateText(doc, path, newText) {
   if (typeof newText !== 'string') throw new TypeError('updateText() text must be a string')
   newText = wellFormedString(newText)
-  const text = valueAtPath(doc, path, 'updateText').value
-  if (!(text instanceof Frontend.Text) && !Array.isArray(text)) {
-    throw new RangeError('updateText() path does not resolve to a string, Text, or list')
-  }
+  const text = resolvePath(doc, path, 'Cannot updateText: RangeError: invalid object ID: ').value
+  if (!(text instanceof Frontend.Text)) throw new RangeError('Cannot updateText: RangeError: object was not a text object')
   for (const edit of textEdits(text, newText)) splice(doc, path, edit.index, edit.del, edit.text)
 }
 
@@ -796,6 +921,13 @@ function markEqual(left, right) {
     sameValue(left.value, right.value)
 }
 
+function spliceString(doc, path, index, del, text) {
+  if (Frontend.getObjectId(doc)) return splice(doc, path, index, del, text)
+  const target = valueAtPath(doc, path, 'applyPatch')
+  if (typeof target.value !== 'string') throw new RangeError('target is not a string for patch')
+  target.parent[target.key] = target.value.slice(0, index) + text + target.value.slice(index + del)
+}
+
 export function applyPatch(doc, patch) {
   if (!patch || !Array.isArray(patch.path)) throw new TypeError('applyPatch() requires a patch with a path')
   if (patch.action === 'put') {
@@ -814,14 +946,14 @@ export function applyPatch(doc, patch) {
     } else if (target.parent instanceof Frontend.Text && typeof target.key === 'number') {
       target.parent.deleteAt(target.key, patch.length || 1)
     } else if (typeof target.parent === 'string' && typeof target.key === 'number') {
-      splice(doc, patch.path.slice(0, -1), target.key, patch.length || 1)
+      spliceString(doc, patch.path.slice(0, -1), target.key, patch.length || 1, '')
     } else {
       delete target.parent[target.key]
     }
   } else if (patch.action === 'splice') {
     const index = patch.path[patch.path.length - 1]
     if (typeof index !== 'number') throw new RangeError('splice patch target is not a string index')
-    splice(doc, patch.path.slice(0, -1), index, 0, patch.value)
+    spliceString(doc, patch.path.slice(0, -1), index, 0, patch.value)
   } else if (patch.action === 'inc') {
     const target = valueAtPath(doc, patch.path, 'applyPatch')
     if (target.value && typeof target.value.increment === 'function') {
@@ -855,11 +987,19 @@ export function applyPatches(doc, patches) {
   for (const patch of patches) applyPatch(doc, patch)
 }
 
-export function getCursor(doc, path, position, move = 'after') {
-  const value = valueAtPath(doc, path, 'getCursor').value
-  if (!(value instanceof Frontend.Text)) {
-    throw new RangeError('getCursor() path does not resolve to a string or Text')
+function cursorTarget(doc, path, name) {
+  let target
+  try {
+    target = resolvePath(doc, path, '')
+  } catch (error) {
+    target = {type: 'map'}
   }
+  if (target.type !== 'text') throw new RangeError(`Cannot ${name}: RangeError: cursors only valid on text - obj type: ${target.type}`)
+  return target.value
+}
+
+export function getCursor(doc, path, position, move = 'after') {
+  const value = cursorTarget(doc, path, 'getCursor')
   const length = textLength(value)
   if (!['before', 'after'].includes(move)) throw new RangeError('getCursor() move must be before or after')
   if (position === 'start' || (typeof position === 'number' && position < 0)) return 's'
@@ -887,10 +1027,7 @@ function updateCursorPosition(before, after, position, move) {
 const cursorOffsets = new WeakMap()
 
 export function getCursorPosition(doc, path, cursor) {
-  const value = valueAtPath(doc, path, 'getCursorPosition').value
-  if (!(value instanceof Frontend.Text)) {
-    throw new RangeError('getCursorPosition() path does not resolve to a string or Text')
-  }
+  const value = cursorTarget(doc, path, 'getCursorPosition')
   if (cursor === 's') return 0
   if (cursor === 'e') return textLength(value)
   const opId = /^(-?)(\d+)@(.+)$/.exec(cursor)
@@ -911,7 +1048,7 @@ export function getCursorPosition(doc, path, cursor) {
     return offsets[Math.min(index, value.length)]
   }
   const match = /^classic:(before|after):(\d+)(?::(.*))?$/.exec(cursor)
-  if (!match) throw new RangeError('getCursorPosition() received an invalid cursor')
+  if (!match) throw new RangeError('Cannot getCursorPosition: RangeError: cursor format is invalid')
   const length = textLength(value)
   const position = parseInt(match[2], 10)
   if (match[3] === undefined) return Math.min(position, length)
@@ -919,39 +1056,61 @@ export function getCursorPosition(doc, path, cursor) {
   try {
     before = [...decodeURIComponent(match[3])]
   } catch (error) {
-    throw new RangeError('getCursorPosition() received an invalid cursor')
+    throw new RangeError('Cannot getCursorPosition: RangeError: cursor format is invalid')
   }
   const after = [...value.toString()]
   return Math.min(updateCursorPosition(before, after, position, match[1]), length)
 }
 
 export function mark(doc, path, range, name, value) {
-  const text = valueAtPath(doc, path, 'mark').value
-  if (!(text instanceof Frontend.Text) || !text.context) {
-    throw new RangeError('mark() path must resolve to Text inside a change block')
+  markText(doc, path, range, name, value, 'mark')
+}
+
+function jsValueDebug(value) {
+  if (value === undefined) return 'JsValue(undefined)'
+  return Array.isArray(value) ? `JsValue(${JSON.stringify(value)})` : `JsValue(Object(${JSON.stringify(value)}))`
+}
+
+function markText(doc, path, range, name, value, label) {
+  if (!doc || !doc[CHANGE]) throw new RangeError('object cannot be modified outside of a change block')
+  const prefix = `Cannot ${label}: RangeError: `
+  const target = resolvePath(doc, path, prefix + 'invalid object id: ')
+  const text = target.value
+  if (!isObject(range)) throw new RangeError(prefix + 'range must be an object')
+  if (typeof range.start !== 'number') throw new RangeError(prefix + 'start must be a number')
+  if (typeof range.end !== 'number') throw new RangeError(prefix + 'end must be a number')
+  const expand = range.expand === undefined ? 'after' : range.expand
+  if (!['before', 'after', 'both', 'none'].includes(expand)) {
+    throw new RangeError(prefix + "expand must be 'left', 'right', 'both', or 'none' - is 'right' by default")
   }
-  if (!range || !Number.isInteger(range.start) || !Number.isInteger(range.end) ||
-      range.start < 0 || range.end < 0) {
-    throw new RangeError('mark() range is invalid')
+  if (typeof name !== 'string') throw new RangeError(prefix + 'Invalid mark name')
+  let datatype
+  if (value instanceof Date) {
+    value = value.getTime()
+    datatype = 'timestamp'
+  } else if (typeof value === 'bigint') {
+    value = Number(value)
+  } else if (!(value === null || ['boolean', 'string', 'number'].includes(typeof value) || value instanceof Uint8Array)) {
+    throw new RangeError(prefix + 'Invalid mark value: invalid import: ' + jsValueDebug(value))
   }
-  if (typeof name !== 'string') throw new TypeError('mark() name must be a string')
-  const expand = range.expand || 'after'
-  if (!['before', 'after', 'both', 'none'].includes(expand)) throw new RangeError('mark() expand is invalid')
+  if (target.type !== 'text') throw new RangeError(prefix + `invalid op for object of type \`${target.type}\``)
+  const startOffset = seqIndex(range.start), endOffset = seqIndex(range.end)
   // A zero-width non-expanding mark can never cover anything; the Rust
   // implementation ignores it without emitting any operations
-  if (range.start === range.end && expand === 'none') return
+  if (startOffset === endOffset && expand === 'none') return
   const length = textLength(text)
-  if (range.start > length || range.end > length) throw new RangeError('mark() range is invalid')
+  if (startOffset > length) throw new RangeError(prefix + `index ${startOffset} is out of bounds`)
+  if (endOffset > length) throw new RangeError(prefix + `index ${endOffset} is out of bounds`)
   const objectId = Frontend.getObjectId(text)
-  const startIndex = textElementIndex(text, range.start)
-  const endIndex = textElementIndex(text, range.end)
+  const startIndex = textElementIndex(text, startOffset)
+  const endIndex = textElementIndex(text, endOffset)
   const start = startIndex === 0 ? '_head' : text.getElemId(startIndex - 1)
   const expandBefore = expand === 'before' || expand === 'both'
   const beginOpId = text.context.nextOpId()
-  text.context.addOp({
+  text.context.addOp(Object.assign({
     action: 'markBegin', obj: objectId, elemId: start, insert: true, name, value,
     expand: expandBefore, pred: []
-  })
+  }, datatype && {datatype}))
   // The mark boundaries are elements of the text sequence. If the range is
   // empty and the begin boundary is sticky (expanding), the end boundary is
   // inserted immediately after it, so its reference element is the begin
@@ -975,13 +1134,13 @@ export function mark(doc, path, range, name, value) {
 }
 
 export function unmark(doc, path, range, name) {
-  mark(doc, path, range, name, null)
+  markText(doc, path, range, name, null, 'unmark')
 }
 
-function markRanges(doc, path) {
-  const text = valueAtPath(doc, path, 'marks').value
-  if (!(text instanceof Frontend.Text)) throw new RangeError('marks() path must resolve to Text')
-  return markRangesForText(doc, text)
+function markRanges(doc, path, prefix) {
+  const target = resolvePath(doc, path, prefix)
+  if (target.type !== 'text') return null
+  return markRangesForText(target.value.context ? target.value.context.cache._root : doc, target.value)
 }
 
 const NO_MARKS = Object.freeze({})
@@ -1016,7 +1175,7 @@ function markRangesForText(doc, text, clock) {
       if (op.obj !== objectId) continue
       if (op.action === 'markBegin') {
         inserts.set(opId, op.elemId)
-        markers.set(opId, {begin: true, name: op.name, value: op.value, expand: !!op.expand})
+        markers.set(opId, {begin: true, name: op.name, value: op.datatype === 'timestamp' ? new Date(op.value) : op.value, expand: !!op.expand})
       } else if (op.action === 'markEnd') {
         inserts.set(opId, op.elemId)
         markers.set(opId, {begin: false, expand: !!op.expand})
@@ -1044,7 +1203,10 @@ function markRangesForText(doc, text, clock) {
     }
     const size = text.context.ops.reduce((total, op) =>
       total + (op.values ? op.values.length : (op.multiOp || 1)), 0)
-    scanOps(text.context.ops, text.context.actorId, text.context.nextOpNum - size)
+    const ops = text.context.ops.map(op => Object.assign({}, op))
+    const startOp = text.context.nextOpNum - size
+    ;(state.source || state.state).adjustInsertAnchors({ops, startOp, actor: text.context.actorId})
+    scanOps(ops, text.context.actorId, startOp)
   }
 
   // Without mark boundaries there is nothing for the sequence walk to resolve
@@ -1165,18 +1327,21 @@ function markRangesFromValues(values, text) {
 }
 
 export function marks(doc, path) {
-  const state = markRanges(doc, path)
+  const state = markRanges(doc, path, 'Cannot call marks(): invalid object ID: ')
+  if (!state) return []
   return markRangesFromValues(state.values, state.text).map(range => Object.assign({}, range))
 }
 
 export function marksAt(doc, path, index) {
-  const state = markRanges(doc, path)
+  const state = markRanges(doc, path, 'Cannot call marksAt(): invalid object ID: ')
+  if (!state) return {}
   if (!Number.isInteger(index) || index < 0) throw new RangeError('marksAt() index is invalid')
   return index < state.text.length ? Object.assign({}, state.values[index]) : {}
 }
 
 export function spans(doc, path) {
-  const state = markRanges(doc, path)
+  const state = markRanges(doc, path, 'Cannot splice: RangeError: invalid object id: ')
+  if (!state) return objectSpans(resolvePath(doc, path, '').value)
   const result = []
   let value = '', active = null
   function flush() {
@@ -1202,66 +1367,116 @@ export function spans(doc, path) {
   return result
 }
 
-function blockKeys(value) {
-  return Object.keys(value).sort((left, right) => (left === 'type' ? -1 : right === 'type' ? 1 : left.localeCompare(right)))
-}
-
-function richTextValue(value, block = false) {
-  if (typeof value === 'string') return new Frontend.Text(value)
-  if (Array.isArray(value)) return value.map(item => richTextValue(item))
-  if (!isRecord(value)) return value
-  // The Rust implementation generates the operations of a block marker with
-  // the `type` property first.
-  const keys = block ? blockKeys(value) : Object.keys(value)
-  const result = {}
-  for (const key of keys) result[key] = richTextValue(value[key])
+function objectSpans(object) {
+  const result = []
+  const keys = Array.isArray(object) ? object.map((value, index) => index) : Object.keys(object).sort(compareUtf8)
+  for (const key of keys) {
+    const value = valueAt(object, key)
+    if (isRecord(value)) {
+      result.push({type: 'block', value: toJS(value)})
+      continue
+    }
+    const char = isImmutableString(value) ? value.val : '\ufffc'
+    const last = result[result.length - 1]
+    if (last && last.type === 'text') last.value += char
+    else result.push({type: 'text', value: char})
+  }
   return result
 }
 
+function isHydrateScalar(value) {
+  return value === null || typeof value !== 'object' || value instanceof Date || value instanceof Uint8Array ||
+    value instanceof Frontend.Counter || isImmutableString(value)
+}
+
+function hydrateNumber(value) {
+  return typeof value === 'number' && !(Number.isInteger(value) && value >= 1) ? new Frontend.Float64(value) : value
+}
+
+function createValue(parent, key, value, insert) {
+  function put(item) {
+    if (insert) parent.insertAt(key, item)
+    else parent[key] = item
+  }
+  if (typeof value === 'string') {
+    put('')
+    spliceText(valueAt(parent, key), 0, 0, wellFormedString(value))
+  } else if (Array.isArray(value)) {
+    put([])
+    const list = valueAt(parent, key)
+    value.forEach((item, index) => createValue(list, index, item, true))
+  } else if (!isHydrateScalar(value)) {
+    put({})
+    updateRecord(valueAt(parent, key), value)
+  } else {
+    put(insert ? value : hydrateNumber(value))
+  }
+}
+
+const RICH_TEXT_ERRORS = {
+  block: 'Cannot get block: RangeError: ',
+  splitBlock: 'Cannot splice: RangeError: ',
+  joinBlock: 'Cannot joinBlock: ',
+  updateBlock: 'Cannot updateBlock: RangeError: ',
+  updateSpans: 'Cannot updateSpans: RangeError: '
+}
+
 function richTextTarget(doc, path, index, name, convert) {
-  const target = valueAtPath(doc, path, name)
+  const prefix = RICH_TEXT_ERRORS[name]
+  const target = resolvePath(doc, path, prefix + (name === 'updateSpans' ? 'invalid object ID: ' : 'invalid object id: '))
   let text = target.value
   if (typeof text === 'string' && convert) {
     target.parent[target.key] = new Frontend.Text(text)
     text = valueAt(target.parent, target.key)
   }
-  if (!(text instanceof Frontend.Text)) throw new RangeError(`${name}() path must resolve to Text`)
-  if (typeof index === 'string') index = getCursorPosition(doc, path, index)
-  if (!Number.isInteger(index) || index < 0 || index > textLength(text)) {
-    throw new RangeError(`${name}() index is invalid`)
+  if (name === 'block' && target.type === 'list') return {element: seqIndex(index) < text.length ? valueAt(text, seqIndex(index)) : null}
+  if (!(text instanceof Frontend.Text)) {
+    throw new RangeError(prefix + (name === 'updateSpans' ? 'object was not a text object' : `invalid op for object of type \`${target.type}\``))
   }
-  return {text, index: textElementIndex(text, index)}
+  if (typeof index === 'string') {
+    if (!/^-?[0-9]+@[0-9a-zA-Z]+$|^[se]$/.test(index)) throw new RangeError('index must be a number or cursor')
+    index = getCursorPosition(doc, path, index)
+  }
+  const offset = seqIndex(index), length = textLength(text)
+  if (name === 'block' && offset >= length) return null
+  if (offset > length || offset === length && (name === 'joinBlock' || name === 'updateBlock')) {
+    throw new RangeError(prefix + `index ${offset} is out of bounds`)
+  }
+  return {text, offset, index: name === 'splitBlock' ? textElementIndex(text, offset) : textCursorIndex(text, offset)}
 }
 
 export function block(doc, path, index) {
   const target = richTextTarget(doc, path, index, 'block', false)
-  if (target.index === target.text.length) return null
-  const value = target.text.get(target.index)
+  if (!target) return null
+  const value = 'element' in target ? target.element : target.text.get(target.index)
   return isRecord(value) ? toJS(value) : null
 }
 
 export function splitBlock(doc, path, index, value) {
   if (!isRecord(value)) throw new TypeError('splitBlock() block must be an object')
-  const target = richTextTarget(doc, path, index, 'splitBlock', true)
-  target.text.insertAt(target.index, richTextValue(value, true))
+  const name = 'splitBlock', target = richTextTarget(doc, path, index, name, true)
+  target.text.insertAt(target.index, {})
+  updateRecord(richTextTarget(doc, path, 0, name, false).text.get(target.index), value)
 }
 
 export function joinBlock(doc, path, index) {
   const target = richTextTarget(doc, path, index, 'joinBlock', true)
-  if (target.index < target.text.length) target.text.deleteAt(target.index)
+  target.text.deleteAt(target.index)
 }
 
 export function updateBlock(doc, path, index, value) {
   if (!isRecord(value)) throw new TypeError('updateBlock() block must be an object')
-  const target = richTextTarget(doc, path, index, 'updateBlock', true)
-  if (target.index === target.text.length) throw new RangeError('updateBlock() index is invalid')
+  const name = 'updateBlock', target = richTextTarget(doc, path, index, name, true)
   // The Rust implementation deletes the existing block marker and inserts a
   // replacement built with its properties in sorted order, rather than
   // overwriting the element in place.
-  const sorted = {}
-  for (const key of Object.keys(value).sort(compareUtf8)) sorted[key] = value[key]
   target.text.deleteAt(target.index)
-  target.text.insertAt(target.index, richTextValue(sorted))
+  if (target.offset > textLength(richTextTarget(doc, path, 0, name, false).text)) {
+    throw new RangeError(RICH_TEXT_ERRORS[name] + `index ${target.offset} is out of bounds`)
+  }
+  const split = richTextTarget(doc, path, target.offset, 'splitBlock', false)
+  split.text.insertAt(split.index, {})
+  updateRecord(richTextTarget(doc, path, 0, name, false).text.get(split.index), value)
 }
 
 // updateSpans reconciles a block marker with its replacement in place, like
@@ -1273,26 +1488,29 @@ function updateValue(parent, key, value) {
       spliceText(valueAt(parent, key), edit.index, edit.del, edit.text)
     }
   } else if (Array.isArray(current) && Array.isArray(value)) {
-    while (current.length > value.length) current.pop()
-    for (let index = 0; index < value.length; index++) {
-      if (index < current.length) updateValue(current, index, value[index])
-      else current.push(richTextValue(value[index]))
+    const length = current.length
+    let deletions = 0
+    for (let index = 0; index < Math.max(length, value.length); index++) {
+      if (index < length && index < value.length) updateValue(current, index, value[index])
+      else if (index < length) deletions++
+      else createValue(current, index, value[index], true)
     }
-  } else if (isRecord(current) && isRecord(value) && !isImmutableString(current) && !isImmutableString(value)) {
+    for (let index = deletions - 1; index >= 0; index--) current.deleteAt(index)
+  } else if (isRecord(current) && typeof value !== 'string' && !Array.isArray(value) && !isHydrateScalar(value)) {
     updateRecord(current, value)
+  } else if (isObject(current) && Frontend.getObjectId(current) || typeof value === 'string' || !isHydrateScalar(value)) {
+    createValue(parent, key, value, false)
   } else if (!sameValue(current, value)) {
-    parent[key] = richTextValue(value)
+    parent[key] = hydrateNumber(value)
   }
 }
 
 function updateRecord(current, value) {
-  for (const name of Object.keys(current)) {
-    if (!Object.prototype.hasOwnProperty.call(value, name)) delete current[name]
-  }
-  for (const name of Object.keys(value).sort(compareUtf8)) {
-    if (Object.prototype.hasOwnProperty.call(current, name)) updateValue(current, name, value[name])
-    else current[name] = richTextValue(value[name])
-  }
+  const keys = Object.keys(current).sort(compareUtf8)
+  const has = Object.prototype.hasOwnProperty
+  for (const name of keys) if (has.call(value, name)) updateValue(current, name, value[name])
+  for (const name of Object.keys(value).sort(compareUtf8)) if (!has.call(current, name)) createValue(current, name, value[name], false)
+  for (const name of keys) if (!has.call(value, name)) delete current[name]
 }
 
 export function updateSpans(doc, path, newSpans, config = {}) {
@@ -1323,11 +1541,24 @@ export function updateSpans(doc, path, newSpans, config = {}) {
   }
   const old = []
   {
-    let run = ''
-    for (const item of [...target.text]) {
-      if (typeof item === 'string') { run += item; continue }
-      if (run.length > 0) { old.push(...graphemes(run)); run = '' }
-      old.push({block: item})
+    const values = markRangesForText(target.text.context.cache._root, target.text).values
+    let run = '', active = null
+    for (let i = 0; i < target.text.length; i++) {
+      const item = target.text.get(i)
+      if (typeof item === 'string' && (active === null || sameValue(active, values[i]))) {
+        run += item
+        active = values[i]
+        continue
+      }
+      if (run.length > 0) old.push(...graphemes(run))
+      run = ''
+      active = null
+      if (typeof item === 'string') {
+        run = item
+        active = values[i]
+      } else {
+        old.push({block: item})
+      }
     }
     if (run.length > 0) old.push(...graphemes(run))
   }
@@ -1346,7 +1577,7 @@ export function updateSpans(doc, path, newSpans, config = {}) {
     }
   }
   function deleteItem(item) {
-    if (typeof item === 'string') splice(doc, path, at, item.length)
+    if (typeof item === 'string') splice(doc, path, at, 1)
     else joinBlock(doc, path, at)
   }
   const hook = {

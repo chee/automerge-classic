@@ -122,17 +122,9 @@ describe('Automerge.Frontend', () => {
       })
     })
 
-    it('should insert nulls when indexing out of upper-bound range', () => {
+    it('should reject assignment past the end of a list', () => {
       const [doc1] = Frontend.change(Frontend.init(), doc => doc.birds = ['chaffinch'])
-      const [doc2, change2] = Frontend.change(doc1, doc => doc.birds[3] = 'greenfinch')
-      const birds = Frontend.getObjectId(doc2.birds), actor = Frontend.getActorId(doc2)
-      assert.deepStrictEqual(doc1, {birds: ['chaffinch']})
-      assert.deepStrictEqual(doc2, {birds: ['chaffinch', null, null, 'greenfinch']})
-      assert.deepStrictEqual(change2, {
-        actor, seq: 2, startOp: 3, deps: [], time: change2.time, message: '',  ops: [
-          {action: 'set', obj: birds, elemId: `2@${actor}`, insert: true, values: [null, null, 'greenfinch'], pred: []}
-        ]
-      })
+      assert.throws(() => Frontend.change(doc1, doc => doc.birds[3] = 'greenfinch'), /^RangeError: index 3 is out of bounds$/)
     })
 
     it('should delete list elements', () => {

@@ -116,8 +116,8 @@ describe('modern Rust/WASM interoperability', () => {
     assert.strictEqual(choices['4@cc'], 2)
     assert.deepStrictEqual([...byteValues['5@bb']], [1, 2])
     assert.deepStrictEqual([...byteValues['5@cc']], [3, 4])
-    assert.deepStrictEqual(labels['6@bb'], raw('left'))
-    assert.deepStrictEqual(labels['6@cc'], raw('right'))
+    assert.strictEqual(labels['6@bb'], 'left')
+    assert.strictEqual(labels['6@cc'], 'right')
     assert.deepStrictEqual(Automerge.getHeads(doc), fixtures.conflicts.heads)
   })
 
