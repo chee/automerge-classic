@@ -108,7 +108,15 @@ class Text {
     let str = strings.get(this.chunks)
     if (str !== undefined) return str
     str = ''
-    for (const value of this) str += typeof value === 'string' ? value : '\ufffc'
+    for (const chunk of this.chunks) {
+      let part = strings.get(chunk)
+      if (part === undefined) {
+        part = ''
+        for (const {value} of chunk) part += typeof value === 'string' ? value : '\ufffc'
+        strings.set(chunk, part)
+      }
+      str += part
+    }
     strings.set(this.chunks, str)
     return str
   }
@@ -181,6 +189,7 @@ function localElems(text) {
     throw new TypeError('Automerge.Text object cannot be modified outside of a change block')
   }
   strings.delete(text.chunks)
+  strings.delete(text.chunks[0])
   widths.delete(text.chunks[0])
   return text.chunks[0]
 }

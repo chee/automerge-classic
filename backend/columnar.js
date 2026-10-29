@@ -1,4 +1,5 @@
-import { deflateSync as deflateRaw, inflateSync as inflateRaw } from 'fflate'
+import { inflateSync as inflateRaw } from 'fflate'
+import { deflate } from './deflate.js'
 import { copyObject, equalBytes, parseOpId } from '../src/common.js'
 import { BooleanDecoder, BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, Encoder, RLEDecoder, RLEEncoder, bytesToHexString, hexStringToBytes, stringToUtf8, utf8ToString } from './encoding.js'
 // Maybe we should be using the platform's built-in hash implementation?
@@ -26,6 +27,7 @@ const CHUNK_TYPE_DEFLATE = 2 // like CHUNK_TYPE_CHANGE but with DEFLATE compress
 // Minimum number of bytes in a value before we enable DEFLATE compression (there is no point
 // compressing very short values since compression may actually make them bigger)
 const DEFLATE_MIN_SIZE = 256
+const DEFLATED_COLUMNS = new Map()
 
 // The least-significant 3 bits of a columnId indicate its datatype
 const COLUMN_TYPE = {
@@ -815,7 +817,7 @@ function encodeChangeContainer(change, actorIds, extraBytes, opColumns) {
   if (extraBytes && extraBytes.byteLength > 0) decoded.extraBytes = extraBytes
   decoded.columns = columns
   decoded.hash = bytesToHexString(hash)
-  decoded.buffer = (bytes.byteLength >= DEFLATE_MIN_SIZE) ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, deflateRaw) : bytes
+  decoded.buffer = (bytes.byteLength >= DEFLATE_MIN_SIZE) ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, data => deflate(data).output) : bytes
   return decoded
 }
 
@@ -903,6 +905,10 @@ function recodeChange(buffer, chunkType, transform) {
   encoder.appendUint53(data.byteLength)
   encoder.appendRawBytes(data)
   return encoder.buffer
+}
+
+function decompressChange(buffer) {
+  return buffer[8] === CHUNK_TYPE_DEFLATE ? recodeChange(buffer, CHUNK_TYPE_CHANGE, inflateRaw) : buffer
 }
 
 /**
@@ -1081,7 +1087,7 @@ function decodeDocumentChanges(changes, expectedHeads) {
 
 function encodeDocumentHeader(doc) {
   const { changesColumns, opsColumns, actorIds, heads, headsIndexes, extraBytes } = doc
-  for (let column of changesColumns.concat(opsColumns)) deflateColumn(column)
+  changesColumns.concat(opsColumns).forEach((column, index) => deflateColumn(column, index))
 
   return encodeContainer(CHUNK_TYPE_DOCUMENT, encoder => {
     encoder.appendUint53(actorIds.length)
@@ -1320,9 +1326,11 @@ function documentChanges(buffer) {
 /**
  * DEFLATE-compresses the given column if it is large enough to make the compression worthwhile.
  */
-function deflateColumn(column) {
+function deflateColumn(column, cacheKey) {
   if (column.encoder.buffer.byteLength >= DEFLATE_MIN_SIZE) {
-    column.encoder = {buffer: deflateRaw(column.encoder.buffer)}
+    const deflated = deflate(column.encoder.buffer, DEFLATED_COLUMNS.get(cacheKey))
+    if (cacheKey !== undefined) DEFLATED_COLUMNS.set(cacheKey, deflated)
+    column.encoder = {buffer: deflated.output}
     column.columnId |= COLUMN_TYPE_DEFLATE
   }
 }
@@ -1341,6 +1349,6 @@ export {
   COLUMN_TYPE, VALUE_TYPE, ACTIONS, OBJECT_TYPE, DOC_OPS_COLUMNS, CHANGE_COLUMNS, DOCUMENT_COLUMNS,
   encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue, decodeColumns, decodeOps, encodeOp,
   encodeColumnInfo, decodeColumnInfo, encodeContainer, decodeContainerHeader, deflateColumn, inflateColumn,
-  splitContainers, encodeChange, encodeChangeColumns, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
+  splitContainers, decompressChange, encodeChange, encodeChangeColumns, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
   encodeDocumentHeader, decodeDocumentHeader, documentChanges
 }

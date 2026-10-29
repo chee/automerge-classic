@@ -102,7 +102,7 @@ export function free(doc) {
 
 export function load(data, options = {}) {
   const state = backend.load(data)
-  if ((!isObject(options) || !options.allowMissingChanges) && backend.getMissingDeps(state).length > 0) {
+  if ((!isObject(options) || !options.allowMissingChanges) && data[8] !== 0 && backend.getMissingDeps(state).length > 0) {
     throw new RangeError("change's deps should already be in the document")
   }
   let doc = applyBackendPatch(init(options), backend.getPatch(state), state, options, 'loadIncremental')

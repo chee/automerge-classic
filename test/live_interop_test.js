@@ -352,6 +352,26 @@ describeLive('live Rust/WASM interoperability', () => {
     }
   })
 
+  it('saves and loads queued orphan changes like the Rust implementation', () => {
+    let doc = Modern.from({x: 0, text: ''}, ACTOR_A)
+    for (let i = 1; i <= 4; i++) {
+      doc = Modern.change(doc, {time: 0}, d => { d.x = i; Modern.splice(d, ['text'], 0, 0, i === 3 ? 'long '.repeat(100) : 'ab') })
+    }
+    const changes = Modern.getAllChanges(doc), partial = [changes[0], changes[3], changes[2]]
+    const [modern] = Modern.applyChanges(Modern.init(), partial)
+    const [classic] = Classic.applyChanges(Classic.init(), partial)
+    const saved = Modern.save(modern)
+    assert.deepStrictEqual(Classic.save(classic), saved)
+    const loaded = Classic.load(saved)
+    assert.deepStrictEqual(Classic.getMissingDeps(loaded, []), Modern.getMissingDeps(Modern.load(saved), []))
+    assert.deepStrictEqual(Classic.save(loaded), saved)
+    const [complete] = Classic.applyChanges(loaded, [changes[1]])
+    const [modernComplete] = Modern.applyChanges(Modern.load(saved), [changes[1]])
+    assert.deepStrictEqual(Classic.getMissingDeps(complete, []), [])
+    assert.deepStrictEqual(Classic.getHeads(complete), Modern.getHeads(modernComplete))
+    assert.deepStrictEqual(plain(Classic.toJS(complete)), plain(Modern.toJS(modernComplete)))
+  })
+
   it('exposes exactly the exports of the modern package', () => {
     const unimplemented = new Set([
       'anonymize', 'getActorsForAuthor', 'getAuthor', 'getAuthorForActor', 'getAuthors', 'releaseInfo'

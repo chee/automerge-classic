@@ -1,6 +1,6 @@
-import { documentChanges, encodeChangeColumns, splitContainers } from './columnar.js'
+import { decompressChange, documentChanges, encodeChangeColumns, splitContainers } from './columnar.js'
 import { decodeBundle, encodeBundle, encodeDocumentBundle } from './bundle.js'
-import { BackendDoc, markEvent } from './new.js'
+import { BackendDoc, concatBuffers, markEvent } from './new.js'
 import { documentOps } from './fragments.js'
 import { backendState } from './util.js'
 /**
@@ -88,7 +88,9 @@ function applyLocalChange(backend, change) {
 function save(backend) {
   const state = backendState(backend, true)
   const doc = state.save()
-  return state.marksInOrder() ? doc : state.saveSince([])
+  const saved = state.marksInOrder() ? doc : state.saveSince([])
+  if (state.queue.length === 0) return saved
+  return concatBuffers([saved, ...state.queue.map(change => decompressChange(change.buffer))])
 }
 
 function saveIncremental(backend) {

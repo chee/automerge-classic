@@ -1,6 +1,7 @@
 import { compareUtf8, copyObject, parseOpId } from '../src/common.js'
 import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, decodeChangeColumns, decodeChangeMeta, decodeDocumentHeader, decodeValue, decoderByColumnId, documentChanges, encodeDocumentHeader, encoderByColumnId, makeDecoders } from './columnar.js'
 import * as ColumnData from './column_data.js'
+import { Decoder, Encoder } from './encoding.js'
 const MAX_BLOCK_SIZE = 600 // operations
 const MAX_MAP_BLOCK_SIZE = 100
 const BLOOM_BITS_PER_ENTRY = 10, BLOOM_NUM_PROBES = 7 // 1% false positive rate
@@ -17,6 +18,7 @@ const PRED_COLUMN_IDS = CHANGE_COLUMNS
 
 const COLUMN_OPERATIONS = new WeakMap()
 const COLUMN_DATA = new WeakMap()
+const DOCUMENT_DECODERS = new WeakMap()
 const COLUMN_SPLICES = new WeakMap()
 const SEQUENCE_INSERTS = new WeakMap()
 const BLOCK_OBJECTS = new WeakMap()
@@ -25,6 +27,7 @@ const HEADS_CLOCKS = new Map()
 const CHANGE_TARGETS = new WeakMap()
 const MAX_TOUCHED_ELEMENTS = 16
 const COLUMN_SLAB_OPTIONS = {slabRows: 24}
+const CONCAT_SNAPSHOT_INTERVAL = 8
 
 function operationValueCount(column, value) {
   if ((column.columnId & 7) === COLUMN_TYPE.VALUE_RAW) return value ? value.byteLength : 0
@@ -47,26 +50,39 @@ function columnOperationCache(columns) {
 
 function readDocumentRows(decoders) {
   const rows = []
-  while (!decoders[actionIdx].done) {
-    const row = new Array(DOC_OPS_COLUMNS.length)
-    for (let i = 0; i < valLenIdx; i++) row[i] = decoders[i].readValue()
-    row[valLenIdx] = decoders[valLenIdx].readValue()
-    row[valRawIdx] = decoders[valRawIdx].readRawBytes(row[valLenIdx] >>> 4)
-    row[11] = decoders[11].readValue()
-    row[12] = decoders[12].readValue()
-    const count = decoders[succNumIdx].readValue() || 0, actors = [], counters = []
-    for (let i = 0; i < count; i++) {
-      actors.push(decoders[succActorIdx].readValue())
-      counters.push(decoders[succCtrIdx].readValue())
-    }
-    row[succNumIdx] = count
-    row[succActorIdx] = actors
-    row[succCtrIdx] = counters
-    row[expandIdx] = decoders[expandIdx].readValue()
-    row[markNameIdx] = decoders[markNameIdx].readValue()
-    rows.push(row)
-  }
+  while (!decoders[actionIdx].done) rows.push(readDocumentRow(decoders))
   return rows
+}
+
+function documentDecoders(columns) {
+  let decoders = DOCUMENT_DECODERS.get(columns)
+  if (decoders === undefined) {
+    decoders = columns.length === DOC_OPS_COLUMNS.length &&
+      columns.every((column, index) => column.columnId === DOC_OPS_COLUMNS[index].columnId)
+      ? columns.map(column => column.decoder) : null
+    DOCUMENT_DECODERS.set(columns, decoders)
+  }
+  return decoders
+}
+
+function readDocumentRow(decoders) {
+  const row = new Array(DOC_OPS_COLUMNS.length)
+  for (let i = 0; i < valLenIdx; i++) row[i] = decoders[i].readValue()
+  row[valLenIdx] = decoders[valLenIdx].readValue()
+  row[valRawIdx] = decoders[valRawIdx].readRawBytes(row[valLenIdx] >>> 4)
+  row[11] = decoders[11].readValue()
+  row[12] = decoders[12].readValue()
+  const count = decoders[succNumIdx].readValue() || 0, actors = [], counters = []
+  for (let i = 0; i < count; i++) {
+    actors.push(decoders[succActorIdx].readValue())
+    counters.push(decoders[succCtrIdx].readValue())
+  }
+  row[succNumIdx] = count
+  row[succActorIdx] = actors
+  row[succCtrIdx] = counters
+  row[expandIdx] = decoders[expandIdx].readValue()
+  row[markNameIdx] = decoders[markNameIdx].readValue()
+  return row
 }
 
 function columnDataType(columnId) {
@@ -805,20 +821,120 @@ function splitBlock(block, maxBlockSize, operations) {
 function remapActorColumns(columns, remap) {
   return columns.map(column => {
     if ((column.columnId & 7) !== COLUMN_TYPE.ACTOR_ID) return column
-    const decoder = decoderByColumnId(column.columnId, column.encoder.buffer)
-    const encoder = encoderByColumnId(column.columnId)
-    while (!decoder.done) {
-      const value = decoder.readValue()
-      encoder.appendValue(value === null ? null : remap[value])
+    const input = column.encoder.buffer
+    const output = new Uint8Array(input.byteLength * Math.max(1, Math.ceil(Math.log2(remap.length) / 7)))
+    let i = 0, o = 0
+    while (i < input.byteLength) {
+      let count = 0, scale = 1, byte
+      do {
+        byte = input[i++]
+        output[o++] = byte
+        count += (byte & 0x7f) * scale
+        scale *= 128
+      } while (byte & 0x80)
+      if (byte & 0x40) count -= scale
+      if (count === 0) {
+        do {
+          byte = input[i++]
+          output[o++] = byte
+        } while (byte & 0x80)
+      }
+      for (let values = count > 0 ? 1 : -count; values > 0; values--) {
+        let value = 0
+        scale = 1
+        do {
+          byte = input[i++]
+          value += (byte & 0x7f) * scale
+          scale *= 128
+        } while (byte & 0x80)
+        value = remap[value]
+        while (value >= 128) {
+          output[o++] = (value & 0x7f) | 0x80
+          value >>>= 7
+        }
+        output[o++] = value
+      }
     }
-    return {columnId: column.columnId, encoder}
+    return {columnId: column.columnId, encoder: {buffer: output.subarray(0, o)}}
   })
 }
 
-function concatBlocks(blocks) {
-  const encoders = columnEncoders(blocks[0].columns)
+function encoderState(encoder) {
+  return {state: Object.assign(Object.create(Object.getPrototypeOf(encoder)), encoder), literalLength: encoder.literal && encoder.literal.length}
+}
 
-  for (let block of blocks) {
+function resumeColumn(encoder, {state, literalLength}, buffer) {
+  for (const key of Object.keys(encoder)) {
+    if (key !== 'buf' && key !== 'offset' && key !== 'literal' && key !== 'count' && encoder[key] !== state[key]) return null
+  }
+  if (encoder.state === 'nulls' && (encoder.offset === 0) !== (state.offset === 0)) return null
+  const tail = buffer.subarray(state.offset)
+  if (tail.byteLength === 0) return encoder.offset === 0 && state.offset === 0 ? {bytes: tail, headerShift: 0, count: 0} : null
+  if (encoder.state === 'literal' || encoder.state === 'loneValue') {
+    if (encoder.state === 'literal') {
+      if (encoder.literal.length !== literalLength) return null
+      for (let i = 0; i < literalLength; i++) if (encoder.literal[i] !== state.literal[i]) return null
+    }
+    return {bytes: tail, headerShift: 0, count: 0}
+  }
+  const count = encoder.count === undefined ? 0 : encoder.count - state.count
+  if (count === 0) return {bytes: tail, headerShift: 0, count}
+  const decoder = new Decoder(tail), header = new Encoder()
+  if (encoder.state === 'nulls') {
+    decoder.readInt53()
+    header.appendInt53(0)
+    header.appendUint53(decoder.readUint53() + count)
+  } else if (encoder.state === 'repetition') {
+    header.appendInt53(decoder.readInt53() + count)
+  } else {
+    header.appendUint53(decoder.readUint53() + count)
+  }
+  return {bytes: concatBuffers([header.buf.subarray(0, header.offset), tail.subarray(decoder.offset)]), headerShift: header.offset - decoder.offset, count}
+}
+
+function concatBlocks(blocks, previous) {
+  const columnIds = blocks[0].columns.map(column => column.columnId).join()
+  const reuse = previous && previous.columnIds === columnIds
+  let first = 0, last = 0
+  if (reuse) {
+    const limit = Math.min(blocks.length, previous.columns.length)
+    while (first < limit && blocks[first].columns === previous.columns[first]) first++
+    while (last < limit - first &&
+      blocks[blocks.length - 1 - last].columns === previous.columns[previous.columns.length - 1 - last]) last++
+  }
+  const shift = reuse ? blocks.length - previous.columns.length : 0
+  const snapshots = reuse ? previous.snapshots.filter(([index]) => index <= first) : []
+  const start = snapshots.length > 0 ? snapshots[snapshots.length - 1] : null
+  const encoders = start
+    ? start[1].map(({state, literalLength}, index) => {
+      const encoder = Object.assign(Object.create(Object.getPrototypeOf(state)), state)
+      encoder.buf = new Uint8Array(Math.max(16, previous.buffers[index].byteLength))
+      encoder.buf.set(previous.buffers[index].subarray(0, state.offset))
+      if (literalLength !== undefined) encoder.literal = state.literal.slice(0, literalLength)
+      return {columnId: blocks[0].columns[index].columnId, encoder}
+    })
+    : columnEncoders(blocks[0].columns)
+  const oldSnapshots = reuse ? new Map(previous.snapshots) : null
+  let tail = null
+
+  for (let blockIndex = start ? start[0] : 0; blockIndex < blocks.length; blockIndex++) {
+    const old = blockIndex >= blocks.length - last && oldSnapshots.get(blockIndex - shift)
+    if (old) {
+      const resumed = []
+      for (let index = 0; index < encoders.length; index++) {
+        const column = resumeColumn(encoders[index].encoder, old[index], previous.buffers[index])
+        if (!column) break
+        resumed.push(column)
+      }
+      if (resumed.length === encoders.length) {
+        tail = {blockIndex, old, resumed}
+        break
+      }
+    }
+    if (blockIndex > (start ? start[0] : 0) && blockIndex % CONCAT_SNAPSHOT_INTERVAL === 0) {
+      snapshots.push([blockIndex, encoders.map(({encoder}) => encoderState(encoder))])
+    }
+    const block = blocks[blockIndex]
     const cache = COLUMN_DATA.has(block.columns) ? null : COLUMN_OPERATIONS.get(block.columns)
     if (cache) {
       for (let index = 0; index < encoders.length; index++) {
@@ -838,7 +954,29 @@ function concatBlocks(blocks) {
       copyColumns(encoders, block.columns, block.numOps)
     }
   }
-  return encoders
+  let buffers
+  if (tail) {
+    buffers = encoders.map(({encoder}, index) =>
+      concatBuffers([encoder.buf.subarray(0, encoder.offset), tail.resumed[index].bytes]))
+    for (const [index, states] of previous.snapshots) {
+      if (index + shift < tail.blockIndex) continue
+      snapshots.push([index + shift, states.map(({state, literalLength}, column) => {
+        const from = tail.old[column].state, {headerShift, count} = tail.resumed[column]
+        const offset = encoders[column].encoder.offset
+        const pending = state.offset === from.offset
+        const moved = Object.assign(Object.create(Object.getPrototypeOf(state)), state,
+          {offset: pending ? offset : state.offset - from.offset + offset + headerShift})
+        if (pending && count !== 0) moved.count += count
+        return {state: moved, literalLength}
+      })])
+    }
+  } else {
+    buffers = encoders.map(column => column.encoder.buffer)
+  }
+  return {
+    encoders: encoders.map(({columnId}, index) => ({columnId, encoder: {buffer: buffers[index]}})),
+    cache: {columnIds, columns: blocks.map(block => block.columns), snapshots, buffers}
+  }
 }
 
 function appendColumnData(encoder, column) {
@@ -1042,7 +1180,8 @@ function readNextDocOp(docState, blockIndex) {
       blockIndex += 1
       for (const column of docState.blocks[blockIndex].columns) column.decoder.reset()
     }
-    return {docOp: readOperation(docState.blocks[blockIndex].columns), blockIndex}
+    const columns = docState.blocks[blockIndex].columns, decoders = documentDecoders(columns)
+    return {docOp: decoders ? readDocumentRow(decoders) : readOperation(columns), blockIndex}
   }
   let row = docState.readBlockIndex === blockIndex ? docState.readRow : 0
   while (blockIndex < docState.blocks.length) {
@@ -2101,6 +2240,14 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
   return [applied, enqueued]
 }
 
+function lastPropState() {
+  let lastKey, lastValue
+  return {
+    get: key => (key === lastKey ? lastValue : undefined),
+    set: (key, value) => { lastKey = key; lastValue = value }
+  }
+}
+
 /**
  * Scans the operations in a document and generates a patch that can be sent to the frontend to
  * instantiate the current state of the document. `objectMeta` is mutated to contain information
@@ -2109,7 +2256,7 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
 function documentPatch(docState, clock) {
   docState.readFromColumns = true
   for (let col of docState.blocks[0].columns) col.decoder.reset()
-  let propState = new Map(), docOp = null, blockIndex = 0
+  let propState = lastPropState(), docOp = null, blockIndex = 0
   let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
   let lastObjActor = null, lastObjCtr = null, objectId = '_root', elemVisible = false, listIndex = 0
   const counters = []
@@ -2134,7 +2281,7 @@ function documentPatch(docState, clock) {
       objectId = `${docOp[objCtrIdx]}@${docState.actorIds[docOp[objActorIdx]]}`
       lastObjActor = docOp[objActorIdx]
       lastObjCtr = docOp[objCtrIdx]
-      propState = new Map()
+      propState = lastPropState()
       listIndex = 0
       elemVisible = false
     }
@@ -3427,6 +3574,7 @@ class BackendDoc {
       this.changesEncoders.map(col => ({columnId: col.columnId, encoder: col.encoder.clone()}))
     copy.changesColumns = this.changesColumns
     copy.binaryDoc = this.binaryDoc
+    copy.concatCache = this.concatCache
     copy.initPatch = this.initPatch
     copy.extraBytes = this.extraBytes
     return copy
@@ -3935,7 +4083,9 @@ class BackendDoc {
     // Getting the byte array for the changes columns finalises their encoders, after which we can
     // no longer append values to them. We therefore copy their data over to fresh encoders.
     let changesColumns = this.changesEncoders.map(col => ({columnId: col.columnId, encoder: col.encoder.clone()}))
-    let opsColumns = concatBlocks(this.blocks).filter(({columnId, encoder}) => {
+    const concatenated = concatBlocks(this.blocks, this.concatCache)
+    this.concatCache = concatenated.cache
+    let opsColumns = concatenated.encoders.filter(({columnId, encoder}) => {
       if (columnId !== (9 << 4 | COLUMN_TYPE.BOOLEAN) || encoder.buffer.byteLength === 0) return true
       const decoder = decoderByColumnId(columnId, encoder.buffer)
       decoder.readRecord()
@@ -3992,4 +4142,4 @@ class BackendDoc {
   }
 }
 
-export { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, bloomFilterContains, markEvent }
+export { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, concatBuffers, bloomFilterContains, markEvent }
