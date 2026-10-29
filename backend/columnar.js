@@ -15,7 +15,7 @@ import { BooleanDecoder, BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, En
 // - It does not need a secure source of random bits and does not need to be
 //   constant-time;
 // - I have reviewed the source code and it seems pretty reasonable.
-import { Hash } from 'fast-sha256'
+import { sha256 } from './sha256.js'
 import { decodeBundle } from './bundle.js'
 // These bytes don't mean anything, they were generated randomly
 const MAGIC_BYTES = new Uint8Array([0x85, 0x6f, 0x4a, 0x83])
@@ -724,10 +724,7 @@ function encodeContainer(chunkType, encodeContentsCallback) {
 
   // Compute the hash over chunkType, length, and body
   const headerBuf = header.buffer
-  const sha256 = new Hash()
-  sha256.update(headerBuf)
-  sha256.update(bodyBuf.subarray(HEADER_SPACE))
-  const hash = sha256.digest(), checksum = hash.subarray(0, CHECKSUM_SIZE)
+  const hash = sha256(headerBuf, bodyBuf.subarray(HEADER_SPACE)), checksum = hash.subarray(0, CHECKSUM_SIZE)
 
   // Copy header into the body buffer so that they are contiguous
   bodyBuf.set(MAGIC_BYTES, HEADER_SPACE - headerBuf.byteLength - CHECKSUM_SIZE - MAGIC_BYTES.byteLength)
@@ -747,9 +744,7 @@ function decodeContainerHeader(decoder, computeHash) {
   const header = {chunkType, chunkLength, chunkData: decoder.readRawBytes(chunkLength)}
 
   if (computeHash) {
-    const sha256 = new Hash()
-    sha256.update(decoder.buf.subarray(hashStartOffset, decoder.offset))
-    const binaryHash = sha256.digest()
+    const binaryHash = sha256(decoder.buf.subarray(hashStartOffset, decoder.offset))
     if (!equalBytes(binaryHash.subarray(0, 4), expectedHash)) {
       throw new RangeError('checksum does not match data')
     }
@@ -1232,8 +1227,16 @@ function documentChanges(buffer) {
 
   const opColumnSpecs = CHANGE_COLUMNS.filter(({columnName}) => columnName !== 'idActor' && columnName !== 'idCtr')
   const hashes = [], headSet = new Set(), result = []
+  const encoders = opColumnSpecs.map(({columnId}) => encoderByColumnId(columnId))
+  const opColumns = opColumnSpecs.map(({columnId}, index) => ({columnId, encoder: encoders[index]}))
+  const [objActorE, objCtrE, keyActorE, keyCtrE, keyStrE, insertE, actionE, valLenE, valRawE,
+    chldActorE, chldCtrE, predNumE, predActorE, predCtrE, expandE, markNameE] = encoders
   for (let i = 0; i < changes.length; i++) {
-    const change = changes[i], actor = actorIds[change.actorNum], slots = []
+    const change = changes[i], actor = actorIds[change.actorNum]
+    let length = 0
+    for (const op of change.ops) length = Math.max(length, change.maxOp - op.idCtr + 1)
+    for (const {counter} of change.succs) length = Math.max(length, change.maxOp - counter + 1)
+    const slots = new Array(length).fill(null)
     for (const op of change.ops) {
       if (slots[change.maxOp - op.idCtr]) throw new RangeError(`Duplicate opId ${op.idCtr}@${actor}`)
       slots[change.maxOp - op.idCtr] = op
@@ -1265,9 +1268,7 @@ function documentChanges(buffer) {
     used.delete(change.actorNum)
     const changeActors = [change.actorNum].concat([...used].sort((a, b) => (actorIds[a] < actorIds[b] ? -1 : 1)))
     const actorIndex = new Map(changeActors.map((actorNum, index) => [actorNum, index]))
-    const encoders = opColumnSpecs.map(({columnId}) => encoderByColumnId(columnId))
-    const [objActorE, objCtrE, keyActorE, keyCtrE, keyStrE, insertE, actionE, valLenE, valRawE,
-      chldActorE, chldCtrE, predNumE, predActorE, predCtrE, expandE, markNameE] = encoders
+    for (const encoder of encoders) encoder.reset()
     for (let j = numOps - 1; j >= 0; j--) {
       const op = slots[j]
       objActorE.appendValue(op.objCtr === null ? null : actorIndex.get(op.objActor))
@@ -1301,7 +1302,6 @@ function documentChanges(buffer) {
         predCtrE.appendValue(counter)
       }
     }
-    const opColumns = opColumnSpecs.map(({columnId}, index) => ({columnId, encoder: encoders[index]}))
     const deps = change.depsIndex.map(index => {
       if (!(index >= 0 && index < i)) throw new RangeError(`No hash for index ${index} while processing index ${i}`)
       headSet.delete(hashes[index])

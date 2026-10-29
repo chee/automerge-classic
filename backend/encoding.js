@@ -34,14 +34,18 @@ function utf8ToString(buffer) {
  */
 function hexStringToBytes(value) {
   if (typeof value !== 'string') throw new TypeError('value is not a string')
-  if (value.length % 2 !== 0 || !/^[0-9a-f]*$/.test(value)) throw new RangeError('value is not hexadecimal')
+  if (value.length % 2 !== 0) throw new RangeError('value is not hexadecimal')
   const bytes = new Uint8Array(value.length >> 1)
   for (let i = 0; i < bytes.length; i++) {
-    const high = value.charCodeAt(2 * i), low = value.charCodeAt(2 * i + 1)
-    bytes[i] = (high > 57 ? high - 87 : high - 48) << 4 | (low > 57 ? low - 87 : low - 48)
+    const high = HEX_TO_NIBBLE[value.charCodeAt(2 * i)], low = HEX_TO_NIBBLE[value.charCodeAt(2 * i + 1)]
+    if (!(high < 16 && low < 16)) throw new RangeError('value is not hexadecimal')
+    bytes[i] = high << 4 | low
   }
   return bytes
 }
+
+const HEX_TO_NIBBLE = new Uint8Array(128).fill(255)
+for (let i = 0; i < 16; i++) HEX_TO_NIBBLE['0123456789abcdef'.charCodeAt(i)] = i
 
 const BYTE_TO_HEX = Array.from({length: 256}, (_, i) => i.toString(16).padStart(2, '0'))
 
@@ -61,6 +65,10 @@ function bytesToHexString(bytes) {
 class Encoder {
   constructor() {
     this.buf = new Uint8Array(16)
+    this.offset = 0
+  }
+
+  reset() {
     this.offset = 0
   }
 
@@ -562,6 +570,14 @@ class RLEEncoder extends Encoder {
     this.literal = []
   }
 
+  reset() {
+    super.reset()
+    this.state = 'empty'
+    this.lastValue = undefined
+    this.count = 0
+    this.literal = []
+  }
+
   /**
    * Appends a new value to the sequence. If `repetitions` is given, the value is repeated
    * `repetitions` times.
@@ -881,6 +897,11 @@ class DeltaEncoder extends RLEEncoder {
     this.absoluteValue = 0
   }
 
+  reset() {
+    super.reset()
+    this.absoluteValue = 0
+  }
+
   /**
    * Appends a new integer value to the sequence. If `repetitions` is given, the value is repeated
    * `repetitions` times.
@@ -1004,6 +1025,12 @@ class DeltaDecoder extends RLEDecoder {
 class BooleanEncoder extends Encoder {
   constructor() {
     super()
+    this.lastValue = false
+    this.count = 0
+  }
+
+  reset() {
+    super.reset()
     this.lastValue = false
     this.count = 0
   }
