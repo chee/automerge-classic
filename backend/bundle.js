@@ -39,7 +39,8 @@ const BUNDLE_OPS_COLUMNS = [
 ]
 
 function appendColumns(encoder, columns) {
-  for (const col of columns) deflateColumn(col)
+  const vec = {len: 0, cap: 0}
+  for (const col of columns) deflateColumn(col, undefined, vec)
   encodeColumnInfo(encoder, columns)
   for (const col of columns) encoder.appendRawBytes(col.encoder.buffer)
 }

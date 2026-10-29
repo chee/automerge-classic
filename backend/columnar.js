@@ -1,5 +1,5 @@
 import { inflateSync as inflateRaw } from 'fflate'
-import { deflate } from './deflate.js'
+import { deflate, extendVec } from './deflate.js'
 import { copyObject, equalBytes, parseOpId } from '../src/common.js'
 import { BooleanDecoder, BooleanEncoder, Decoder, DeltaDecoder, DeltaEncoder, Encoder, RLEDecoder, RLEEncoder, bytesToHexString, hexStringToBytes, stringToUtf8, utf8ToString } from './encoding.js'
 // Maybe we should be using the platform's built-in hash implementation?
@@ -812,7 +812,7 @@ function encodeChangeContainer(change, actorIds, extraBytes, opColumns) {
   if (extraBytes && extraBytes.byteLength > 0) decoded.extraBytes = extraBytes
   decoded.columns = columns
   decoded.hash = bytesToHexString(hash)
-  decoded.buffer = (bytes.byteLength >= DEFLATE_MIN_SIZE) ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, data => deflate(data).output) : bytes
+  decoded.buffer = (bytes.byteLength > DEFLATE_MIN_SIZE) ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, data => deflate(data, {len: 0, cap: 0}).output) : bytes
   return decoded
 }
 
@@ -1082,7 +1082,8 @@ function decodeDocumentChanges(changes, expectedHeads) {
 
 function encodeDocumentHeader(doc) {
   const { changesColumns, opsColumns, actorIds, heads, headsIndexes, extraBytes } = doc
-  changesColumns.concat(opsColumns).forEach((column, index) => deflateColumn(column, index))
+  const vec = {len: 0, cap: 0}
+  changesColumns.concat(opsColumns).forEach((column, index) => deflateColumn(column, index, vec))
 
   return encodeContainer(CHUNK_TYPE_DOCUMENT, encoder => {
     encoder.appendUint53(actorIds.length)
@@ -1326,12 +1327,14 @@ function documentChanges(buffer) {
 /**
  * DEFLATE-compresses the given column if it is large enough to make the compression worthwhile.
  */
-function deflateColumn(column, cacheKey) {
+function deflateColumn(column, cacheKey, vec) {
   if (column.encoder.buffer.byteLength >= DEFLATE_MIN_SIZE) {
-    const deflated = deflate(column.encoder.buffer, DEFLATED_COLUMNS.get(cacheKey))
+    const deflated = deflate(column.encoder.buffer, vec, DEFLATED_COLUMNS.get(cacheKey))
     if (cacheKey !== undefined) DEFLATED_COLUMNS.set(cacheKey, deflated)
     column.encoder = {buffer: deflated.output}
     column.columnId |= COLUMN_TYPE_DEFLATE
+  } else {
+    extendVec(vec, column.encoder.buffer.byteLength)
   }
 }
 
