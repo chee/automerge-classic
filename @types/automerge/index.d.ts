@@ -274,6 +274,9 @@ declare namespace Automerge {
     theirNeed: Heads | null
     theirHave: SyncHave[] | null
     sentHashes: {[hash: string]: boolean}
+    inFlight?: boolean
+    haveResponded?: boolean
+    theirCapabilities?: string[] | null
     readOnly?: boolean
     peerReadOnly?: boolean
   }

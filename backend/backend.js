@@ -1,4 +1,4 @@
-import { encodeChangeColumns, splitContainers } from './columnar.js'
+import { documentChanges, encodeChangeColumns, splitContainers } from './columnar.js'
 import { decodeBundle, encodeBundle, encodeDocumentBundle } from './bundle.js'
 import { BackendDoc, markEvent } from './new.js'
 import { documentOps } from './fragments.js'
@@ -133,13 +133,11 @@ function loadIncremental(backend, data) {
 
   let state = current, replaced = false, changes = []
   for (let chunk of chunks) {
-    if (chunk[8] === 0 && current.changes.length === 0 && current.heads.length === 0 && changes.length === 0) {
+    if (chunk[8] === 0 && current.changes.length === 0 && current.heads.length === 0 && current.queue.length === 0 && changes.length === 0) {
       state = new BackendDoc(chunk)
       replaced = true
     } else if (chunk[8] === 0) {
-      const loaded = new BackendDoc(chunk)
-      loaded.computeHashGraph()
-      changes.push(...loaded.changes)
+      for (const change of documentChanges(chunk)) changes.push(change.bytes)
     } else if (chunk[8] === 1 || chunk[8] === 2) {
       changes.push(chunk)
     } else if (chunk[8] === 3) {

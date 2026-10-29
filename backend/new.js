@@ -2214,7 +2214,7 @@ function appendChange(columns, change, actorIndexById, changeIndexByHash) {
     change.seq, // seq
     change.maxOp, // maxOp
     change.time, // time
-    change.message, // message
+    change.message || null, // message
     change.deps.length, // depsNum
     change.deps.map(dep => changeIndexByHash[dep]), // depsIndex
     change.extraBytes ? (change.extraBytes.byteLength << 4 | VALUE_TYPE.BYTES) : VALUE_TYPE.BYTES, // extraLen
@@ -3624,16 +3624,22 @@ class BackendDoc {
    * the Rust implementation.
    */
   getChanges(haveDeps) {
+    return this.changeIndexesSince(haveDeps).map(index => this.changes[index])
+  }
+
+  changeIndexesSince(haveDeps) {
+    if (this.heads.length > 0 && this.heads.every(hash => haveDeps.includes(hash))) return []
     if (!this.haveHashGraph) this.computeHashGraph()
     haveDeps = haveDeps.filter(hash => this.dependentsByHash[hash])
 
     // If the other replica has nothing, return all changes in history order
     if (haveDeps.length === 0) {
-      return this.changes.slice()
+      return this.changes.map((change, index) => index)
     }
 
     // Fast path for the common case where all new changes depend only on haveDeps
     let stack = [], seenHashes = {}, toReturn = [], aborted = false
+    const have = new Set(haveDeps)
     for (let hash of haveDeps) {
       seenHashes[hash] = true
       const successors = this.dependentsByHash[hash]
@@ -3644,6 +3650,10 @@ class BackendDoc {
     // Depth-first traversal of the hash graph to find all changes that depend on `haveDeps`
     while (stack.length > 0) {
       const hash = stack.pop()
+      if (have.has(hash)) {
+        aborted = true
+        break
+      }
       if (seenHashes[hash]) continue
       seenHashes[hash] = true
       toReturn.push(hash)
@@ -3663,7 +3673,7 @@ class BackendDoc {
     // If the traversal above has encountered all the heads, and was not aborted early due to
     // a missing dependency, then the set of changes it has found is complete, so we can return it
     if (!aborted && stack.length === 0 && this.heads.every(head => seenHashes[head])) {
-      return toReturn.map(hash => this.changeIndexByHash[hash]).sort((a, b) => a - b).map(index => this.changes[index])
+      return toReturn.map(hash => this.changeIndexByHash[hash]).sort((a, b) => a - b)
     }
 
     // If we haven't encountered all of the heads, we have to search harder. This will happen if
@@ -3680,7 +3690,11 @@ class BackendDoc {
       }
     }
 
-    return this.changes.filter((change, index) => !seenHashes[this.historyHashes[index]])
+    const indexes = []
+    for (let index = 0; index < this.historyHashes.length; index++) {
+      if (!seenHashes[this.historyHashes[index]]) indexes.push(index)
+    }
+    return indexes
   }
 
   /**
@@ -3921,7 +3935,12 @@ class BackendDoc {
     // Getting the byte array for the changes columns finalises their encoders, after which we can
     // no longer append values to them. We therefore copy their data over to fresh encoders.
     let changesColumns = this.changesEncoders.map(col => ({columnId: col.columnId, encoder: col.encoder.clone()}))
-    let opsColumns = concatBlocks(this.blocks)
+    let opsColumns = concatBlocks(this.blocks).filter(({columnId, encoder}) => {
+      if (columnId !== (9 << 4 | COLUMN_TYPE.BOOLEAN) || encoder.buffer.byteLength === 0) return true
+      const decoder = decoderByColumnId(columnId, encoder.buffer)
+      decoder.readRecord()
+      return decoder.offset < encoder.buffer.byteLength
+    })
     let actorIds = this.actorIds
 
     // The document format requires the actor table to be lexicographically
