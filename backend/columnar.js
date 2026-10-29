@@ -1152,8 +1152,293 @@ function decodeDocument(buffer) {
   return changes
 }
 
-function documentChanges(buffer) {
-  const { changesColumns, opsColumns, actorIds, heads } = decodeDocumentHeader(buffer)
+const NO_SUCC = Object.freeze([]), NO_BYTES = new Uint8Array(0)
+const ASCII_BYTES = Array.from({length: 128}, (_, byte) => new Uint8Array([byte]))
+
+function columnReader(buf, type, at = 0, end = buf.byteLength) {
+  return {buf, at, end, count: 0, literal: false, value: type === COLUMN_TYPE.BOOLEAN, absolute: 0, type}
+}
+
+function readUleb(reader) {
+  const buf = reader.buf
+  let byte = buf[reader.at++]
+  if (byte < 0x80) return byte
+  let result = byte & 0x7f, scale = 0x80
+  do {
+    byte = buf[reader.at++]
+    result += (byte & 0x7f) * scale
+    scale *= 0x80
+  } while (byte & 0x80)
+  return result
+}
+
+function readSleb(reader) {
+  const buf = reader.buf
+  let byte = buf[reader.at++]
+  if (byte < 0x80) return byte & 0x40 ? byte - 0x80 : byte
+  let result = byte & 0x7f, scale = 0x80
+  do {
+    byte = buf[reader.at++]
+    result += (byte & 0x7f) * scale
+    scale *= 0x80
+  } while (byte & 0x80)
+  return byte & 0x40 ? result - scale : result
+}
+
+function readRaw(reader) {
+  if (reader.type === COLUMN_TYPE.STRING_RLE) {
+    const length = readUleb(reader)
+    reader.at += length
+    return utf8ToString(reader.buf.subarray(reader.at - length, reader.at))
+  }
+  return reader.type === COLUMN_TYPE.INT_DELTA ? readSleb(reader) : readUleb(reader)
+}
+
+function readNext(reader) {
+  const boolean = reader.type === COLUMN_TYPE.BOOLEAN
+  while (reader.count === 0) {
+    if (reader.at >= reader.end) return boolean ? false : null
+    if (boolean) {
+      reader.count = readUleb(reader) || 0
+      reader.value = !reader.value
+    } else {
+      const count = readSleb(reader) || 0
+      reader.literal = count < 0
+      if (count > 0) {
+        reader.count = count
+        reader.value = readRaw(reader)
+      } else if (count < 0) {
+        reader.count = -count
+      } else {
+        reader.count = readUleb(reader) || 0
+        reader.value = null
+      }
+    }
+  }
+  reader.count--
+  if (boolean) return reader.value
+  const value = reader.literal ? readRaw(reader) : reader.value
+  return reader.type === COLUMN_TYPE.INT_DELTA && value !== null ? (reader.absolute += value) : value
+}
+
+let lastActorBytes = NO_BYTES, lastActorHex = ''
+
+function readActorHex(reader) {
+  const length = readUleb(reader), bytes = reader.buf.subarray(reader.at, reader.at + length)
+  reader.at += length
+  if (!equalBytes(bytes, lastActorBytes)) {
+    lastActorBytes = bytes.slice()
+    lastActorHex = bytesToHexString(bytes)
+  }
+  return lastActorHex
+}
+
+function changeColumnReaders(buffer, columnSpecs) {
+  if (buffer[8] === CHUNK_TYPE_DEFLATE) buffer = recodeChange(buffer, CHUNK_TYPE_CHANGE, inflateRaw)
+  const reader = {buf: buffer, at: 9}
+  readUleb(reader)
+  const numDeps = readUleb(reader)
+  reader.at += 32 * numDeps
+  const actorIds = [readActorHex(reader)]
+  readUleb(reader)
+  const startOp = readUleb(reader)
+  readSleb(reader)
+  const messageLength = readUleb(reader)
+  reader.at += messageLength
+  for (let n = readUleb(reader); n > 0; n--) actorIds.push(readActorHex(reader))
+  const info = []
+  for (let n = readUleb(reader); n > 0; n--) info.push(readUleb(reader), readUleb(reader))
+  const readers = columnSpecs.map(({columnId}) => columnReader(NO_BYTES, columnId & 7))
+  for (let i = 0, start = reader.at; i < info.length; start += info[i + 1], i += 2) {
+    const index = columnSpecs.findIndex(({columnId}) => columnId === (info[i] & ~COLUMN_TYPE_DEFLATE))
+    if (index < 0) continue
+    if (info[i] & COLUMN_TYPE_DEFLATE) {
+      readers[index] = columnReader(inflateRaw(buffer.subarray(start, start + info[i + 1])), info[i] & 7)
+    } else {
+      readers[index] = columnReader(buffer, info[i] & 7, start, start + info[i + 1])
+    }
+  }
+  return {startOp, actorIds, readers}
+}
+
+function documentRows(buffers) {
+  const decoders = buffers.map((buf, index) => decoderByColumnId(DOC_OPS_COLUMNS[index].columnId, buf))
+  const [objActorD, objCtrD, keyActorD, keyCtrD, keyStrD, idActorD, idCtrD, insertD, actionD, valLenD, valRawD,
+    chldActorD, chldCtrD, succNumD, succActorD, succCtrD, expandD, markNameD] = decoders
+  const rows = []
+  while (!actionD.done) {
+    const objActor = objActorD.readValue(), objCtr = objCtrD.readValue(), keyActor = keyActorD.readValue(), keyCtr = keyCtrD.readValue()
+    const keyStr = keyStrD.readValue(), idActor = idActorD.readValue(), idCtr = idCtrD.readValue(), insert = insertD.readValue()
+    const action = actionD.readValue(), valLen = valLenD.readValue(), rawLength = valLen >>> 4
+    const value = rawLength === 0 ? NO_BYTES : valLen === (16 | VALUE_TYPE.UTF8) && valRawD.buf[valRawD.offset] < 0x80
+      ? ASCII_BYTES[valRawD.buf[valRawD.offset++]] : valRawD.readRawBytes(rawLength)
+    const chldActor = chldActorD.readValue(), chldCtr = chldCtrD.readValue(), count = succNumD.readValue() || 0
+    let actors = NO_SUCC, counters = NO_SUCC
+    if (count > 0) {
+      actors = []
+      counters = []
+      for (let i = 0; i < count; i++) {
+        actors.push(succActorD.readValue())
+        counters.push(succCtrD.readValue())
+      }
+    }
+    rows.push([objActor, objCtr, keyActor, keyCtr, keyStr, idActor, idCtr, insert, action, valLen, value,
+      chldActor, chldCtr, count, actors, counters, expandD.readValue(), markNameD.readValue()])
+  }
+  return rows
+}
+
+const RLE_EMPTY = 0, RLE_LONE = 1, RLE_REPEAT = 2, RLE_LITERAL = 3, RLE_NULLS = 4
+const CHANGE_OP_COLUMNS = CHANGE_COLUMNS.filter(({columnName}) => columnName !== 'idActor' && columnName !== 'idCtr')
+
+function changeWriter(columnId) {
+  return {columnId, type: columnId & 7, buf: new Uint8Array(64), offset: 0, state: RLE_EMPTY, last: false, count: 0, literal: [], literals: 0, absolute: 0}
+}
+
+function resetWriter(writer) {
+  writer.offset = 0
+  writer.state = RLE_EMPTY
+  writer.last = false
+  writer.count = 0
+  writer.literals = 0
+  writer.absolute = 0
+}
+
+function reserve(writer, length) {
+  if (writer.offset + length > writer.buf.byteLength) {
+    const buf = new Uint8Array(Math.max(2 * writer.buf.byteLength, writer.offset + length))
+    buf.set(writer.buf.subarray(0, writer.offset))
+    writer.buf = buf
+  }
+}
+
+function putUleb(writer, value) {
+  reserve(writer, 10)
+  const buf = writer.buf
+  if (value < 0x80) {
+    buf[writer.offset++] = value
+    return
+  }
+  while (value > 0x7f) {
+    buf[writer.offset++] = value % 0x80 | 0x80
+    value = Math.floor(value / 0x80)
+  }
+  buf[writer.offset++] = value
+}
+
+function putSleb(writer, value) {
+  reserve(writer, 10)
+  const buf = writer.buf
+  if (value >= -0x40 && value < 0x40) {
+    buf[writer.offset++] = value & 0x7f
+    return
+  }
+  for (;;) {
+    const byte = (value % 0x80 + 0x80) % 0x80
+    value = (value - byte) / 0x80
+    if (value === 0 && !(byte & 0x40) || value === -1 && byte & 0x40) {
+      buf[writer.offset++] = byte
+      return
+    }
+    buf[writer.offset++] = byte | 0x80
+  }
+}
+
+function ulebLength(value) {
+  let length = 1
+  for (; value > 0x7f; value = Math.floor(value / 0x80)) length++
+  return length
+}
+
+function putBytes(writer, bytes) {
+  reserve(writer, bytes.byteLength)
+  if (bytes.byteLength === 1) writer.buf[writer.offset] = bytes[0]
+  else writer.buf.set(bytes, writer.offset)
+  writer.offset += bytes.byteLength
+}
+
+function putPrefixed(writer, bytes) {
+  putUleb(writer, bytes.byteLength)
+  putBytes(writer, bytes)
+}
+
+function rleRaw(writer, value) {
+  if (writer.type === COLUMN_TYPE.STRING_RLE) putPrefixed(writer, stringToUtf8(value))
+  else if (writer.type === COLUMN_TYPE.INT_DELTA) putSleb(writer, value)
+  else putUleb(writer, value)
+}
+
+function rleFlush(writer) {
+  const state = writer.state
+  if (state === RLE_LONE) {
+    putSleb(writer, -1)
+    rleRaw(writer, writer.last)
+  } else if (state === RLE_REPEAT) {
+    putSleb(writer, writer.count)
+    rleRaw(writer, writer.last)
+  } else if (state === RLE_LITERAL) {
+    putSleb(writer, -writer.literals)
+    for (let i = 0; i < writer.literals; i++) rleRaw(writer, writer.literal[i])
+  } else if (state === RLE_NULLS) {
+    putSleb(writer, 0)
+    putUleb(writer, writer.count)
+  }
+  writer.state = RLE_EMPTY
+}
+
+function rleAppend(writer, value) {
+  const state = writer.state, open = state === RLE_LONE || state === RLE_LITERAL
+  if (value === null ? state === RLE_NULLS : state === RLE_REPEAT && value === writer.last) {
+    writer.count++
+  } else if (open && value === writer.last) {
+    if (state === RLE_LITERAL) rleFlush(writer)
+    writer.state = RLE_REPEAT
+    writer.count = 2
+  } else if (open && value !== null) {
+    if (state === RLE_LONE) writer.literals = 0
+    writer.literal[writer.literals++] = writer.last
+    writer.state = RLE_LITERAL
+    writer.last = value
+  } else {
+    if (state === RLE_LITERAL) writer.literal[writer.literals++] = writer.last
+    rleFlush(writer)
+    writer.state = value === null ? RLE_NULLS : RLE_LONE
+    writer.last = value
+    writer.count = 1
+  }
+}
+
+function deltaAppend(writer, value) {
+  if (value === null) {
+    rleAppend(writer, null)
+  } else {
+    rleAppend(writer, value - writer.absolute)
+    writer.absolute = value
+  }
+}
+
+function booleanAppend(writer, value) {
+  if (value === writer.last) {
+    writer.count++
+  } else {
+    putUleb(writer, writer.count)
+    writer.last = value
+    writer.count = 1
+  }
+}
+
+function writerFinish(writer) {
+  if (writer.type === COLUMN_TYPE.BOOLEAN) {
+    if (writer.count > 0) putUleb(writer, writer.count)
+    writer.count = 0
+  } else if (writer.type !== COLUMN_TYPE.VALUE_RAW) {
+    if (writer.state === RLE_LITERAL) writer.literal[writer.literals++] = writer.last
+    if (writer.state !== RLE_NULLS || writer.offset > 0) rleFlush(writer)
+  }
+}
+
+function documentChanges(buffer, rows, header = decodeDocumentHeader(buffer)) {
+  const { changesColumns, opsColumns, actorIds, heads } = header
   if (!changesColumns.every(column => DOCUMENT_COLUMNS.some(spec => spec.columnId === column.columnId)) ||
       !opsColumns.every(column => DOC_OPS_COLUMNS.some(spec => spec.columnId === column.columnId))) {
     return decodeDocument(buffer).map(change => ({
@@ -1162,170 +1447,55 @@ function documentChanges(buffer) {
     }))
   }
 
-  function readActor(decoder) {
-    const actorNum = decoder.readValue()
-    if (actorNum !== null && !actorIds[actorNum]) throw new RangeError(`No actor index ${actorNum}`)
-    return actorNum
-  }
-
-  const [actorD, seqD, maxOpD, timeD, messageD, depsNumD, depsIndexD, extraLenD, extraRawD] =
-    makeDecoders(changesColumns, DOCUMENT_COLUMNS).map(column => column.decoder)
+  const [actorR, seqR, maxOpR, timeR, messageR, depsNumR, depsIndexR, extraLenR, extraRawR] =
+    makeDecoders(changesColumns, DOCUMENT_COLUMNS).map(({columnId, decoder}) => columnReader(decoder.buf, columnId & 7))
   const changes = [], changesByActor = []
-  while (!actorD.done) {
-    const actorNum = readActor(actorD), seq = seqD.readValue(), maxOp = maxOpD.readValue()
-    const time = timeD.readValue(), message = messageD.readValue(), depsIndex = []
-    for (let i = depsNumD.readValue() || 0; i > 0; i--) depsIndex.push(depsIndexD.readValue())
-    const sizeTag = extraLenD.readValue()
-    const { value: extraBytes, datatype } = decodeValue(sizeTag, extraRawD.readRawBytes(sizeTag >> 4))
+  while (actorR.count > 0 || actorR.at < actorR.end) {
+    const actorNum = readNext(actorR), seq = readNext(seqR), maxOp = readNext(maxOpR)
+    if (actorNum !== null && !actorIds[actorNum]) throw new RangeError(`No actor index ${actorNum}`)
+    const time = readNext(timeR), message = readNext(messageR), depsIndex = []
+    for (let i = readNext(depsNumR) || 0; i > 0; i--) depsIndex.push(readNext(depsIndexR))
+    const sizeTag = readNext(extraLenR), extraLength = sizeTag >> 4
+    if (extraRawR.at + extraLength > extraRawR.end) throw new RangeError('subarray exceeds buffer size')
+    const { value: extraBytes, datatype } = decodeValue(sizeTag, extraRawR.buf.subarray(extraRawR.at, extraRawR.at + extraLength))
+    extraRawR.at += extraLength
     if (datatype !== VALUE_TYPE.BYTES) throw new RangeError(`Bad datatype for extra bytes: ${VALUE_TYPE.BYTES}`)
     const actorChanges = changesByActor[actorNum] || (changesByActor[actorNum] = [])
     if (seq !== actorChanges.length + 1) {
       throw new RangeError(`Expected seq = ${actorChanges.length + 1}, got ${seq}`)
     }
     if (seq > 1 && actorChanges[seq - 2].maxOp > maxOp) throw new RangeError('maxOp must increase monotonically per actor')
-    const change = {actorNum, seq, maxOp, time, message, depsIndex, extraBytes, ops: [], succs: []}
+    const change = {actorNum, seq, maxOp, time, message, depsIndex, extraBytes}
     actorChanges.push(change)
     changes.push(change)
   }
 
-  function changeOf(actorNum, counter) {
-    const actorChanges = changesByActor[actorNum] || []
-    let left = 0, right = actorChanges.length
-    while (left < right) {
-      const index = (left + right) >> 1
-      if (actorChanges[index].maxOp < counter) left = index + 1
-      else right = index
-    }
-    if (left >= actorChanges.length) {
-      throw new RangeError(`Operation ID ${counter}@${actorIds[actorNum]} outside of allowed range`)
-    }
-    return actorChanges[left]
+  if (changes.some(change => !Number.isInteger(change.maxOp) || !Number.isInteger(change.time))) {
+    throw new RangeError('value is not an integer')
   }
-
-  const [objActorD, objCtrD, keyActorD, keyCtrD, keyStrD, idActorD, idCtrD, insertD, actionD, valLenD, valRawD,
-    chldActorD, chldCtrD, succNumD, succActorD, succCtrD, expandD, markNameD] =
-    makeDecoders(opsColumns, DOC_OPS_COLUMNS).map(column => column.decoder)
-  while (!idCtrD.done) {
-    const objActor = readActor(objActorD), objCtr = objCtrD.readValue()
-    const keyActor = readActor(keyActorD), keyCtr = keyCtrD.readValue(), keyStr = keyStrD.readValue()
-    const idActor = readActor(idActorD), idCtr = idCtrD.readValue()
-    const insert = !!insertD.readValue(), action = actionD.readValue()
-    const sizeTag = valLenD.readValue(), rawValue = sizeTag >> 4 ? valRawD.readRawBytes(sizeTag >> 4) : null
-    const chldActor = readActor(chldActorD), chldCtr = chldCtrD.readValue()
-    const succNum = succNumD.readValue() || 0
-    if (action === 3) throw new RangeError('document should not contain del operations')
-    if (!!chldCtr !== (chldActor !== null)) throw new RangeError(`Mismatched child columns: ${chldCtr} and ${chldActor}`)
-    const op = {
-      idCtr, objActor, objCtr, keyActor, keyCtr, keyStr, insert, action, sizeTag, rawValue,
-      chldActor, chldCtr, expand: false, markName: null, pred: null
-    }
-    changeOf(idActor, idCtr).ops.push(op)
-    let lastActor = null, lastCtr = null
-    for (let i = 0; i < succNum; i++) {
-      const succActor = readActor(succActorD), succCtr = succCtrD.readValue()
-      if (lastCtr !== null && (lastCtr > succCtr || lastCtr === succCtr && actorIds[lastActor] >= actorIds[succActor])) {
-        throw new RangeError('operation IDs are not in ascending order')
-      }
-      lastActor = succActor
-      lastCtr = succCtr
-      changeOf(succActor, succCtr).succs.push({counter: succCtr, pred: {actorNum: idActor, counter: idCtr}, op})
-    }
-    const expand = expandD.readValue(), markName = markNameD.readValue()
-    if (action === 7) {
-      op.expand = !!expand
-      op.markName = markName
-    }
-  }
-
-  const opColumnSpecs = CHANGE_COLUMNS.filter(({columnName}) => columnName !== 'idActor' && columnName !== 'idCtr')
-  const hashes = [], headSet = new Set(), result = []
-  const encoders = opColumnSpecs.map(({columnId}) => encoderByColumnId(columnId))
-  const opColumns = opColumnSpecs.map(({columnId}, index) => ({columnId, encoder: encoders[index]}))
-  const [objActorE, objCtrE, keyActorE, keyCtrE, keyStrE, insertE, actionE, valLenE, valRawE,
-    chldActorE, chldCtrE, predNumE, predActorE, predCtrE, expandE, markNameE] = encoders
+  const ops = opIndex(rows || documentRows(makeDecoders(opsColumns, DOC_OPS_COLUMNS).map(column => column.decoder.buf)),
+    actorIds, changesByActor)
+  const encoder = changeEncoder(actorIds), lastMaxOp = new Array(actorIds.length).fill(0)
+  const hashes = [], hashBytes = new Map(), headSet = new Set(), result = []
   for (let i = 0; i < changes.length; i++) {
-    const change = changes[i], actor = actorIds[change.actorNum]
-    let length = 0
-    for (const op of change.ops) length = Math.max(length, change.maxOp - op.idCtr + 1)
-    for (const {counter} of change.succs) length = Math.max(length, change.maxOp - counter + 1)
-    const slots = new Array(length).fill(null)
-    for (const op of change.ops) {
-      if (slots[change.maxOp - op.idCtr]) throw new RangeError(`Duplicate opId ${op.idCtr}@${actor}`)
-      slots[change.maxOp - op.idCtr] = op
-    }
-    for (const {counter, pred, op} of change.succs) {
-      const index = change.maxOp - counter
-      if (!slots[index]) {
-        const elem = op.keyStr === null && op.insert
-        slots[index] = {
-          idCtr: counter, objActor: op.objActor, objCtr: op.objCtr, keyActor: elem ? pred.actorNum : op.keyActor,
-          keyCtr: elem ? op.idCtr : op.keyCtr, keyStr: op.keyStr, insert: false, action: 3, sizeTag: VALUE_TYPE.NULL,
-          rawValue: null, chldActor: null, chldCtr: null, expand: false, markName: null, pred: null
-        }
-      }
-      if (slots[index].pred) slots[index].pred.push(pred)
-      else slots[index].pred = [pred]
-    }
-    const numOps = slots.length, startOp = change.maxOp - numOps + 1, used = new Set([change.actorNum])
-    let expand = false
-    for (let j = numOps - 1; j >= 0; j--) {
-      const op = slots[j]
-      if (!op) throw new RangeError(`Expected opId ${change.maxOp - j}@${actor}`)
-      if (op.objCtr !== null) used.add(op.objActor)
-      if (op.keyStr === null && op.keyCtr !== 0) used.add(op.keyActor)
-      if (op.chldCtr) used.add(op.chldActor)
-      if (op.pred) for (const pred of op.pred) used.add(pred.actorNum)
-      if (op.expand) expand = true
-    }
-    used.delete(change.actorNum)
-    const changeActors = [change.actorNum].concat([...used].sort((a, b) => (actorIds[a] < actorIds[b] ? -1 : 1)))
-    const actorIndex = new Map(changeActors.map((actorNum, index) => [actorNum, index]))
-    for (const encoder of encoders) encoder.reset()
-    for (let j = numOps - 1; j >= 0; j--) {
-      const op = slots[j]
-      objActorE.appendValue(op.objCtr === null ? null : actorIndex.get(op.objActor))
-      objCtrE.appendValue(op.objCtr)
-      if (op.keyStr !== null) {
-        keyActorE.appendValue(null)
-        keyCtrE.appendValue(null)
-      } else if (op.keyCtr === 0 && op.insert) {
-        keyActorE.appendValue(null)
-        keyCtrE.appendValue(0)
-      } else if (op.keyCtr > 0) {
-        keyActorE.appendValue(actorIndex.get(op.keyActor))
-        keyCtrE.appendValue(op.keyCtr)
-      } else {
-        throw new RangeError(`Unexpected operation key: ${op.keyCtr}@${actorIds[op.keyActor]}`)
-      }
-      keyStrE.appendValue(op.keyStr)
-      insertE.appendValue(op.insert)
-      actionE.appendValue(op.action)
-      valLenE.appendValue(op.sizeTag)
-      if (op.rawValue) valRawE.appendRawBytes(op.rawValue)
-      if (expand) expandE.appendValue(op.expand)
-      markNameE.appendValue(op.markName)
-      chldActorE.appendValue(op.chldCtr ? actorIndex.get(op.chldActor) : null)
-      chldCtrE.appendValue(op.chldCtr || null)
-      const pred = op.pred || []
-      predNumE.appendValue(pred.length)
-      if (pred.length > 1) pred.sort((a, b) => a.counter - b.counter || (actorIds[a.actorNum] < actorIds[b.actorNum] ? -1 : 1))
-      for (const {actorNum, counter} of pred) {
-        predActorE.appendValue(actorIndex.get(actorNum))
-        predCtrE.appendValue(counter)
-      }
-    }
-    const deps = change.depsIndex.map(index => {
+    const change = changes[i], actorNum = change.actorNum, maxOp = change.maxOp
+    const startOp = firstOp(ops, actorNum, lastMaxOp[actorNum] + 1, maxOp)
+    lastMaxOp[actorNum] = maxOp
+    encodeChangeOps(encoder, ops, actorNum, startOp, maxOp, i + 1)
+    for (const index of change.depsIndex) {
       if (!(index >= 0 && index < i)) throw new RangeError(`No hash for index ${index} while processing index ${i}`)
       headSet.delete(hashes[index])
-      return hashes[index]
-    }).sort()
-    const { hash, buffer } = encodeChangeContainer(
-      {actor, seq: change.seq, startOp, time: change.time, message: change.message, deps},
-      changeActors.map(actorNum => actorIds[actorNum]), change.extraBytes, opColumns
-    )
-    hashes.push(hash)
-    headSet.add(hash)
-    result.push({actor, seq: change.seq, deps, hash, numOps, bytes: buffer})
+    }
+    const deps = change.depsIndex.map(index => hashes[index]).sort()
+    const {hash, bytes} = writeChangeChunk(encoder, change, startOp, deps.map(dep => hashBytes.get(dep)))
+    const hex = bytesToHexString(hash)
+    hashes.push(hex)
+    hashBytes.set(hex, hash)
+    headSet.add(hex)
+    result.push({
+      actor: actorIds[actorNum], seq: change.seq, deps, hash: hex, numOps: maxOp - startOp + 1,
+      bytes: bytes.byteLength > DEFLATE_MIN_SIZE ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, data => deflate(data, {len: 0, cap: 0}).output) : bytes
+    })
   }
 
   const actualHeads = [...headSet].sort()
@@ -1333,6 +1503,224 @@ function documentChanges(buffer) {
     throw new RangeError(`Mismatched heads hashes: expected ${heads.join(', ')}, got ${actualHeads.join(', ')}`)
   }
   return result
+}
+
+function opSlots(table, actorIds, actor, counter) {
+  if (!(actor < actorIds.length)) throw new RangeError(`No actor index ${actor}`)
+  if (!(counter > 0 && counter < table[actor].length)) {
+    throw new RangeError(`Operation ID ${counter}@${actorIds[actor]} outside of allowed range`)
+  }
+  return table[actor]
+}
+
+function addPreds(ops, r, row) {
+  const succActors = row[14], succCtrs = row[15], actorIds = ops.actorIds
+  for (let i = 0; i < row[13]; i++) {
+    const succActor = succActors[i], succCtr = succCtrs[i]
+    if (i > 0 && (succCtrs[i - 1] > succCtr || succCtrs[i - 1] === succCtr && actorIds[succActors[i - 1]] >= actorIds[succActor])) {
+      throw new RangeError('operation IDs are not in ascending order')
+    }
+    const preds = opSlots(ops.predAt, actorIds, succActor, succCtr)
+    ops.predRow.push(r)
+    ops.predNext.push(preds[succCtr])
+    preds[succCtr] = ops.predRow.length - 1
+  }
+}
+
+function opIndex(rows, actorIds, changesByActor) {
+  let maxCounter = rows.length
+  for (let r = 0; r < rows.length; r++) maxCounter += rows[r][13]
+  const ops = {rows, actorIds, rowAt: [], predAt: [], predRow: [0], predNext: [0]}
+  for (let actor = 0; actor < actorIds.length; actor++) {
+    const actorChanges = changesByActor[actor], size = actorChanges ? actorChanges[actorChanges.length - 1].maxOp + 1 : 1
+    if (size > maxCounter + 1) throw new RangeError(`Operation ID ${size - 1}@${actorIds[actor]} outside of allowed range`)
+    ops.rowAt.push(new Int32Array(size))
+    ops.predAt.push(new Int32Array(size))
+  }
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r], idActor = row[5], idCtr = row[6]
+    if (row[8] === 3) throw new RangeError('document should not contain del operations')
+    if (!!row[12] !== (row[11] !== null)) throw new RangeError(`Mismatched child columns: ${row[12]} and ${row[11]}`)
+    const slots = ops.rowAt[idActor]
+    if (!(slots && idCtr > 0 && idCtr < slots.length)) opSlots(ops.rowAt, actorIds, idActor, idCtr)
+    if (slots[idCtr]) throw new RangeError(`Duplicate opId ${idCtr}@${actorIds[idActor]}`)
+    slots[idCtr] = r + 1
+    if (row[13] > 0) addPreds(ops, r, row)
+  }
+  return ops
+}
+
+function firstOp(ops, actorNum, startOp, maxOp) {
+  const slots = ops.rowAt[actorNum], predSlots = ops.predAt[actorNum]
+  while (startOp <= maxOp && !slots[startOp] && !predSlots[startOp]) startOp++
+  for (let counter = startOp; counter <= maxOp; counter++) {
+    if (!slots[counter] && !predSlots[counter]) throw new RangeError(`Expected opId ${counter}@${ops.actorIds[actorNum]}`)
+  }
+  return startOp
+}
+
+function deletedRow(ops, slot) {
+  while (ops.predNext[slot]) slot = ops.predNext[slot]
+  return ops.rows[ops.predRow[slot]]
+}
+
+function changeEncoder(actorIds) {
+  const writers = CHANGE_OP_COLUMNS.map(({columnId}) => changeWriter(columnId))
+  return {
+    actorIds, actorBytes: actorIds.map(hexStringToBytes), stamp: new Int32Array(actorIds.length),
+    localOf: new Int32Array(actorIds.length), others: [], current: 0, expand: false, head: changeWriter(0), writers,
+    columns: Object.fromEntries(CHANGE_OP_COLUMNS.map(({columnName}, index) => [columnName, writers[index]])),
+    output: new Uint8Array(0), outputUsed: 0
+  }
+}
+
+function useActor(encoder, actor) {
+  if (!(actor < encoder.actorIds.length)) throw new RangeError(`No actor index ${actor}`)
+  if (encoder.stamp[actor] !== encoder.current) {
+    encoder.stamp[actor] = encoder.current
+    encoder.others.push(actor)
+  }
+}
+
+function useOpActors(encoder, ops, slots, predSlots, counter) {
+  const r = slots[counter] - 1
+  if (r >= 0) {
+    const row = ops.rows[r]
+    if (row[1] !== null) useActor(encoder, row[0])
+    if (row[4] === null && row[3] !== 0) useActor(encoder, row[2])
+    if (row[12]) useActor(encoder, row[11])
+    if (row[8] === 7 && row[16]) encoder.expand = true
+  } else {
+    const row = deletedRow(ops, predSlots[counter])
+    if (row[1] !== null) useActor(encoder, row[0])
+    if (row[4] === null) useActor(encoder, row[7] ? row[5] : row[2])
+  }
+  for (let k = predSlots[counter]; k; k = ops.predNext[k]) useActor(encoder, ops.rows[ops.predRow[k]][5])
+}
+
+function encodeChangeOps(encoder, ops, actorNum, startOp, maxOp, current) {
+  const slots = ops.rowAt[actorNum], predSlots = ops.predAt[actorNum], {actorIds, localOf, writers} = encoder
+  encoder.current = current
+  encoder.stamp[actorNum] = current
+  encoder.others = []
+  encoder.expand = false
+  for (let counter = startOp; counter <= maxOp; counter++) useOpActors(encoder, ops, slots, predSlots, counter)
+  encoder.others.sort((a, b) => (actorIds[a] < actorIds[b] ? -1 : 1))
+  localOf[actorNum] = 0
+  for (let k = 0; k < encoder.others.length; k++) localOf[encoder.others[k]] = k + 1
+  for (let w = 0; w < writers.length; w++) resetWriter(writers[w])
+  for (let counter = startOp; counter <= maxOp; counter++) encodeChangeOp(encoder, ops, slots, predSlots, counter)
+}
+
+function encodeChangeOp(encoder, ops, slots, predSlots, counter) {
+  const {objActor: objActorW, objCtr: objCtrW, keyActor: keyActorW, keyCtr: keyCtrW, keyStr: keyStrW, insert: insertW,
+    action: actionW, valLen: valLenW, valRaw: valRawW, chldActor: chldActorW, chldCtr: chldCtrW, predNum: predNumW,
+    predActor: predActorW, predCtr: predCtrW, expand: expandW, markName: markNameW} = encoder.columns
+  const localOf = encoder.localOf, r = slots[counter] - 1
+  let objActor, objCtr, keyActor, keyCtr, keyStr, insert = false, action = 3, valLen = VALUE_TYPE.NULL,
+    valRaw = null, chldActor = null, chldCtr = null, expand = false, markName = null
+  if (r >= 0) {
+    const row = ops.rows[r]
+    objActor = row[0]; objCtr = row[1]; keyActor = row[2]; keyCtr = row[3]; keyStr = row[4]
+    insert = row[7]; action = row[8]; valLen = row[9]; valRaw = row[10]; chldActor = row[11]; chldCtr = row[12]
+    if (action === 7) {
+      expand = !!row[16]
+      markName = row[17]
+    }
+  } else {
+    const row = deletedRow(ops, predSlots[counter]), elem = row[4] === null && row[7]
+    objActor = row[0]; objCtr = row[1]; keyStr = row[4]
+    keyActor = elem ? row[5] : row[2]
+    keyCtr = elem ? row[6] : row[3]
+  }
+  rleAppend(objActorW, objCtr === null ? null : localOf[objActor])
+  rleAppend(objCtrW, objCtr)
+  if (keyStr !== null) {
+    rleAppend(keyActorW, null)
+    deltaAppend(keyCtrW, null)
+  } else if (keyCtr === 0 && insert) {
+    rleAppend(keyActorW, null)
+    deltaAppend(keyCtrW, 0)
+  } else if (keyCtr > 0) {
+    rleAppend(keyActorW, localOf[keyActor])
+    deltaAppend(keyCtrW, keyCtr)
+  } else {
+    throw new RangeError(`Unexpected operation key: ${keyCtr}@${encoder.actorIds[keyActor]}`)
+  }
+  rleAppend(keyStrW, keyStr)
+  booleanAppend(insertW, insert)
+  rleAppend(actionW, action)
+  rleAppend(valLenW, valLen)
+  if (valRaw) putBytes(valRawW, valRaw)
+  if (encoder.expand) booleanAppend(expandW, expand)
+  rleAppend(markNameW, markName)
+  rleAppend(chldActorW, chldCtr ? localOf[chldActor] : null)
+  deltaAppend(chldCtrW, chldCtr || null)
+  const preds = []
+  for (let k = predSlots[counter]; k; k = ops.predNext[k]) preds.push(ops.rows[ops.predRow[k]])
+  if (preds.length > 1) preds.sort((a, b) => a[6] - b[6] || (encoder.actorIds[a[5]] < encoder.actorIds[b[5]] ? -1 : 1))
+  rleAppend(predNumW, preds.length)
+  for (let k = 0; k < preds.length; k++) {
+    rleAppend(predActorW, localOf[preds[k][5]])
+    deltaAppend(predCtrW, preds[k][6])
+  }
+}
+
+function copyWriter(output, at, writer) {
+  const buf = writer.buf
+  for (let j = 0; j < writer.offset; j++) output[at + j] = buf[j]
+  return at + writer.offset
+}
+
+function writeChangeChunk(encoder, change, startOp, deps) {
+  const {head, writers, others, actorBytes} = encoder
+  head.offset = 0
+  putUleb(head, deps.length)
+  for (let k = 0; k < deps.length; k++) putBytes(head, deps[k])
+  putPrefixed(head, actorBytes[change.actorNum])
+  putUleb(head, change.seq)
+  putUleb(head, startOp)
+  putSleb(head, change.time)
+  putPrefixed(head, change.message ? stringToUtf8(change.message) : NO_BYTES)
+  putUleb(head, others.length)
+  for (let k = 0; k < others.length; k++) putPrefixed(head, actorBytes[others[k]])
+  let numColumns = 0, bodyLength = change.extraBytes.byteLength
+  for (let w = 0; w < writers.length; w++) {
+    writerFinish(writers[w])
+    if (writers[w].offset > 0) numColumns++
+  }
+  putUleb(head, numColumns)
+  for (let w = 0; w < writers.length; w++) {
+    if (writers[w].offset > 0) {
+      putUleb(head, writers[w].columnId)
+      putUleb(head, writers[w].offset)
+      bodyLength += writers[w].offset
+    }
+  }
+  bodyLength += head.offset
+  const total = 9 + ulebLength(bodyLength) + bodyLength
+  if (encoder.outputUsed + total > encoder.output.byteLength) {
+    encoder.output = new Uint8Array(Math.max(total, 1 << 18))
+    encoder.outputUsed = 0
+  }
+  const output = encoder.output, start = encoder.outputUsed
+  output.set(MAGIC_BYTES, start)
+  output[start + 8] = CHUNK_TYPE_CHANGE
+  let at = start + 9
+  for (let length = bodyLength; ; length = Math.floor(length / 128)) {
+    if (length < 128) {
+      output[at++] = length
+      break
+    }
+    output[at++] = length % 128 | 0x80
+  }
+  at = copyWriter(output, at, head)
+  for (let w = 0; w < writers.length; w++) at = copyWriter(output, at, writers[w])
+  output.set(change.extraBytes, at)
+  encoder.outputUsed = start + total
+  const hash = sha256(output.subarray(start + 8, start + total))
+  for (let j = 0; j < 4; j++) output[start + 4 + j] = hash[j]
+  return {hash, bytes: output.subarray(start, start + total)}
 }
 
 /**
@@ -1364,5 +1752,5 @@ export {
   encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue, decodeColumns, decodeOps, encodeOp,
   encodeColumnInfo, decodeColumnInfo, encodeContainer, decodeContainerHeader, deflateColumn, inflateColumn,
   splitContainers, decompressChange, encodeChange, encodeChangeColumns, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
-  encodeDocumentHeader, decodeDocumentHeader, documentChanges
+  encodeDocumentHeader, decodeDocumentHeader, documentChanges, documentRows, columnReader, readNext, changeColumnReaders, NO_SUCC, NO_BYTES
 }

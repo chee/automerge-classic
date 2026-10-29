@@ -48,11 +48,19 @@ const HEX_TO_NIBBLE = new Uint8Array(128).fill(255)
 for (let i = 0; i < 16; i++) HEX_TO_NIBBLE['0123456789abcdef'.charCodeAt(i)] = i
 
 const BYTE_TO_HEX = Array.from({length: 256}, (_, i) => i.toString(16).padStart(2, '0'))
+const HEX_CODES = new Uint16Array(64)
 
 /**
  * Converts a Uint8Array into the equivalent hexadecimal string.
  */
 function bytesToHexString(bytes) {
+  if (bytes.byteLength === 32) {
+    for (let i = 0; i < 32; i++) {
+      HEX_CODES[2 * i] = BYTE_TO_HEX[bytes[i]].charCodeAt(0)
+      HEX_CODES[2 * i + 1] = BYTE_TO_HEX[bytes[i]].charCodeAt(1)
+    }
+    return String.fromCharCode.apply(null, HEX_CODES)
+  }
   let hex = ''
   for (let i = 0; i < bytes.byteLength; i++) hex += BYTE_TO_HEX[bytes[i]]
   return hex

@@ -1,5 +1,5 @@
 import { PanicError, addInt, compareUtf8, copyObject, parseOpId, wellFormedString } from '../src/common.js'
-import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, decodeChangeColumns, decodeChangeMeta, decodeDocumentHeader, decodeValue, decoderByColumnId, documentChanges, encodeDocumentHeader, encoderByColumnId, makeDecoders } from './columnar.js'
+import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, changeColumnReaders, decodeChangeColumns, decodeChangeMeta, decodeDocumentHeader, decodeValue, decoderByColumnId, documentChanges, documentRows, encodeDocumentHeader, encoderByColumnId, makeDecoders, readNext } from './columnar.js'
 import * as ColumnData from './column_data.js'
 import { Decoder, Encoder } from './encoding.js'
 const MAX_BLOCK_SIZE = 300 // operations
@@ -19,18 +19,18 @@ const PRED_COLUMN_IDS = CHANGE_COLUMNS
 
 const COLUMN_OPERATIONS = new WeakMap()
 const COLUMN_DATA = new WeakMap()
-const DOCUMENT_DECODERS = new WeakMap()
 const COLUMN_SPLICES = new WeakMap()
 const ENCODED_COLUMNS = new WeakMap()
 const COLUMN_TAILS = new WeakMap()
 const SEQUENCE_INSERTS = new WeakMap()
 const SEQUENCE_ELEMENTS = new WeakMap()
-const NO_SUCC = Object.freeze([]), NO_BYTES = new Uint8Array(0)
 const BLOCK_OBJECTS = new WeakMap()
 const BLOCK_MARKS = new WeakMap()
 const HEADS_CLOCKS = new Map()
 const CHANGE_TARGETS = new WeakMap()
+const LOADED_DOCUMENTS = new WeakMap()
 const MAX_TOUCHED_ELEMENTS = 16
+const TARGET_COLUMNS = [objActorIdx, objCtrIdx, keyActorIdx, keyCtrIdx, keyStrIdx, insertIdx, actionIdx].map(index => CHANGE_COLUMNS[index])
 const COLUMN_SLAB_OPTIONS = {slabRows: 24}
 const CONCAT_SNAPSHOT_INTERVAL = 8
 
@@ -43,51 +43,14 @@ function columnOperationCache(columns) {
   let cache = COLUMN_OPERATIONS.get(columns)
   if (cache) return cache
   for (const column of columns) column.decoder.reset()
-  const operations = columns.length === DOC_OPS_COLUMNS.length &&
+  const documentColumns = columns.length === DOC_OPS_COLUMNS.length &&
     columns.every((column, index) => column.columnId === DOC_OPS_COLUMNS[index].columnId)
-    ? readDocumentRows(columns.map(column => column.decoder)) : []
-  while (!columns[actionIdx].decoder.done) operations.push(readOperation(columns))
+  const operations = documentColumns ? documentRows(columns.map(column => column.decoder.buf)) : []
+  if (!documentColumns) while (!columns[actionIdx].decoder.done) operations.push(readOperation(columns))
   for (const column of columns) column.decoder.reset()
   cache = {operations}
   COLUMN_OPERATIONS.set(columns, cache)
   return cache
-}
-
-function readDocumentRows(decoders) {
-  const rows = []
-  while (!decoders[actionIdx].done) rows.push(readDocumentRow(decoders, true))
-  return rows
-}
-
-function documentDecoders(columns) {
-  let decoders = DOCUMENT_DECODERS.get(columns)
-  if (decoders === undefined) {
-    decoders = columns.length === DOC_OPS_COLUMNS.length &&
-      columns.every((column, index) => column.columnId === DOC_OPS_COLUMNS[index].columnId)
-      ? columns.map(column => column.decoder) : null
-    DOCUMENT_DECODERS.set(columns, decoders)
-  }
-  return decoders
-}
-
-function readDocumentRow(decoders, shared) {
-  const row = new Array(DOC_OPS_COLUMNS.length)
-  for (let i = 0; i < valLenIdx; i++) row[i] = decoders[i].readValue()
-  row[valLenIdx] = decoders[valLenIdx].readValue()
-  row[valRawIdx] = row[valLenIdx] >>> 4 || !shared ? decoders[valRawIdx].readRawBytes(row[valLenIdx] >>> 4) : NO_BYTES
-  row[11] = decoders[11].readValue()
-  row[12] = decoders[12].readValue()
-  const count = decoders[succNumIdx].readValue() || 0, actors = count || !shared ? [] : NO_SUCC, counters = count || !shared ? [] : NO_SUCC
-  for (let i = 0; i < count; i++) {
-    actors.push(decoders[succActorIdx].readValue())
-    counters.push(decoders[succCtrIdx].readValue())
-  }
-  row[succNumIdx] = count
-  row[succActorIdx] = actors
-  row[succCtrIdx] = counters
-  row[expandIdx] = decoders[expandIdx].readValue()
-  row[markNameIdx] = decoders[markNameIdx].readValue()
-  return row
 }
 
 function columnDataType(columnId) {
@@ -654,8 +617,10 @@ function bloomFilterContains(bloom, elemIdActor, elemIdCtr) {
     if ((bloom[x >>> 3] & (1 << (x & 7))) === 0) {
       return false
     }
-    x = (x + y) % modulo
-    y = (y + z) % modulo
+    x += y
+    if (x >= modulo) x -= modulo
+    y += z
+    if (y >= modulo) y -= modulo
   }
   return true
 }
@@ -1319,15 +1284,6 @@ function appendOperation(outCols, inCols, operation) {
  * we reach the end of the current block). `docOp` is null if there are no more operations.
  */
 function readNextDocOp(docState, blockIndex) {
-  if (docState.readFromColumns) {
-    if (docState.blocks[blockIndex].columns[actionIdx].decoder.done) {
-      if (blockIndex === docState.blocks.length - 1) return {docOp: null, blockIndex}
-      blockIndex += 1
-      for (const column of docState.blocks[blockIndex].columns) column.decoder.reset()
-    }
-    const columns = docState.blocks[blockIndex].columns, decoders = documentDecoders(columns)
-    return {docOp: decoders ? readDocumentRow(decoders) : readOperation(columns), blockIndex}
-  }
   let row = docState.readBlockIndex === blockIndex ? docState.readRow : 0
   while (blockIndex < docState.blocks.length) {
     const operations = columnOperationCache(docState.blocks[blockIndex].columns).operations
@@ -2051,7 +2007,6 @@ function applyOps(patches, changeState, docState) {
   const {blockIndex, skipCount, visibleCount} = position
   const block = docState.blocks[blockIndex]
   const firstWrite = keyStr !== null && !block.hasListOps && changeState.nextOp[predNumIdx] === 0 && changeState.changes.length === 1
-  docState.readFromColumns = false
   docState.readBlockIndex = blockIndex
   docState.readRow = skipCount
 
@@ -2387,18 +2342,25 @@ function lastPropState() {
  * about the parent and children of each object in the document.
  */
 function documentPatch(docState, clock) {
-  docState.readFromColumns = true
-  for (let col of docState.blocks[0].columns) col.decoder.reset()
-  let propState = lastPropState(), docOp = null, blockIndex = 0
+  let propState = lastPropState(), blockIndex = 0, rows = columnOperationCache(docState.blocks[0].columns).operations, row = 0
   let patches = {_root: {objectId: '_root', type: 'map', props: {}}}
   let lastObjActor = null, lastObjCtr = null, objectId = '_root', elemVisible = false, listIndex = 0
   let run = null, runActor = null, runCtr = null
-  const counters = [], metadataCounters = []
+  const counters = [], loadBlocks = docState.loadVisibleMapOps ? splitLoadedBlock(docState.blocks[0], rows) : null
+  let loadBlock = -1, metadataCounters = []
 
   while (true) {
-    ({ docOp, blockIndex } = readNextDocOp(docState, blockIndex))
-    if (docOp === null) break
-    if (docState.loadVisibleMapOps) addOperationMetadata(docState.blocks[0], docOp, docState.loadVisibleMapOps, metadataCounters)
+    while (row === rows.length && blockIndex < docState.blocks.length - 1) {
+      rows = columnOperationCache(docState.blocks[++blockIndex].columns).operations
+      row = 0
+    }
+    if (row === rows.length) break
+    if (loadBlocks && row === loadBlocks[loadBlock + 1]?.start) {
+      loadBlock++
+      metadataCounters = []
+    }
+    let docOp = rows[row++]
+    if (loadBlocks) addOperationMetadata(loadBlocks[loadBlock].block, docOp, docState.loadVisibleMapOps, metadataCounters)
     if (clock) {
       if (!(docOp[idCtrIdx] <= clock[docOp[idActorIdx]])) continue
       const succCtr = [], succActor = []
@@ -2408,6 +2370,7 @@ function documentPatch(docState, clock) {
           succActor.push(docOp[succActorIdx][i])
         }
       }
+      docOp = docOp.slice()
       docOp[succNumIdx] = succCtr.length
       docOp[succCtrIdx] = succCtr
       docOp[succActorIdx] = succActor
@@ -2455,7 +2418,22 @@ function documentPatch(docState, clock) {
     }
     updatePatchProperty(patches, null, objectId, docOp, docState, propState, listIndex, docOp[succNumIdx])
   }
+  if (loadBlocks) docState.blocks = loadBlocks.map(({block}) => block)
   return patches[docState.patchObject || '_root']
+}
+
+function splitLoadedBlock(block, rows) {
+  if (rows.length <= MAX_BLOCK_SIZE) return [{start: 0, block}]
+  const parts = [], size = Math.ceil(rows.length / Math.ceil(rows.length / (0.8 * MAX_BLOCK_SIZE)))
+  for (let start = 0; start < rows.length;) {
+    let end = Math.min(start + size, rows.length)
+    while (end < rows.length && rows[end][keyStrIdx] === null && !rows[end][insertIdx]) end++
+    const part = {columns: columnsFromOperations(block.columns, rows.slice(start, end))}
+    resetBlockMetadata(part)
+    parts.push({start, block: part})
+    start = end
+  }
+  return parts
 }
 
 /**
@@ -2602,17 +2580,16 @@ function blockInserts(block, actorIds, objectId, counter, actor) {
 }
 
 function appendBlockElements(block, actorIds, objectId, counter, actor, elems, counters, clock) {
-  const entries = blockInserts(block, actorIds, objectId, counter, actor)
-  let next = 0, leading = false
+  let leading = false, inserted = false
   for (const op of columnOperationCache(block.columns).operations) {
     if (op[objCtrIdx] !== counter || op[objActorIdx] !== actor || op[keyStrIdx] !== null) continue
-    const action = ACTIONS[op[actionIdx]], visible = clock ? visibleAt(op, clock, null) : visibleRow(op, op[succNumIdx], counters)
+    const visible = clock ? visibleAt(op, clock, null) : visibleRow(op, op[succNumIdx], counters)
     if (op[insertIdx]) {
-      const mark = action !== 'mark' ? null : op[markNameIdx] === null ? 'end' : 'begin'
-      const entry = entries[next++]
-      elems.push({id: entry.id, counter: entry.counter, mark, expand: !!op[expandIdx], visible})
+      inserted = true
+      const mark = op[actionIdx] !== MARK_ACTION ? null : op[markNameIdx] === null ? 'end' : 'begin'
+      elems.push({id: `${op[idCtrIdx]}@${actorIds[op[idActorIdx]]}`, counter: op[idCtrIdx], mark, expand: !!op[expandIdx], visible})
     } else {
-      if (next === 0) leading = true
+      if (!inserted) leading = true
       if (visible && elems.length > 0) elems[elems.length - 1].visible = true
     }
   }
@@ -2695,33 +2672,35 @@ function changeTargets(buffer) {
 }
 
 function decodeTargets(buffer) {
-  const targets = []
-  const change = decodeChangeColumns(buffer, false)
-  const columns = makeDecoders(change.columns, CHANGE_COLUMNS).map(column => column.decoder)
-  function read(index) {
-    return columns[index].done ? null : columns[index].readValue()
-  }
-  let lastActor, lastCtr, objectId
-  for (let counter = change.startOp; !columns[actionIdx].done; counter++) {
-    const action = read(actionIdx), objActor = read(objActorIdx), objCtr = read(objCtrIdx), keyActor = read(keyActorIdx)
-    const keyCtr = read(keyCtrIdx), keyStr = read(keyStrIdx), insert = read(insertIdx)
-    const element = insert ? [change.actorIds[0], counter] : keyStr === null && keyCtr ? [change.actorIds[keyActor], keyCtr] : null
+  const targets = new Map(), {startOp, actorIds, readers} = changeColumnReaders(buffer, TARGET_COLUMNS)
+  const [objActors, objCtrs, keyActors, keyCtrs, keyStrs, inserts, actions] = readers
+  let lastActor, lastCtr, target
+  for (let counter = startOp; actions.count > 0 || actions.at < actions.end; counter++) {
+    const action = readNext(actions), objActor = readNext(objActors), objCtr = readNext(objCtrs)
+    const keyActor = readNext(keyActors), keyCtr = readNext(keyCtrs), keyStr = readNext(keyStrs), insert = readNext(inserts)
     if (objActor !== lastActor || objCtr !== lastCtr) {
-      objectId = objCtr === null ? '_root' : `${objCtr}@${change.actorIds[objActor]}`
+      const objectId = objCtr === null ? '_root' : `${objCtr}@${actorIds[objActor]}`
+      target = targets.get(objectId)
+      if (!target) targets.set(objectId, target = {objectId, mark: false, elements: []})
       lastActor = objActor
       lastCtr = objCtr
     }
-    targets.push({objectId, mark: action === MARK_ACTION, element})
+    if (action === MARK_ACTION) target.mark = true
+    if (target.elements.length > MAX_TOUCHED_ELEMENTS) continue
+    if (insert) target.elements.push([actorIds[0], counter])
+    else if (keyStr === null && keyCtr) target.elements.push([actorIds[keyActor], keyCtr])
   }
-  return targets
+  return [...targets.values()]
 }
 
 function changeObjects(targets, objects, actorIndexById) {
-  for (const {objectId, mark, element} of targets) {
+  for (const {objectId, mark, elements} of targets) {
     let touched = objects.get(objectId)
     if (!touched) objects.set(objectId, touched = {elements: [], marks: false})
     if (mark) touched.marks = true
-    if (element && touched.elements.length <= MAX_TOUCHED_ELEMENTS) touched.elements.push([actorIndexById.get(element[0]), element[1]])
+    for (let i = 0; i < elements.length && touched.elements.length <= MAX_TOUCHED_ELEMENTS; i++) {
+      touched.elements.push([actorIndexById.get(elements[i][0]), elements[i][1]])
+    }
   }
 }
 
@@ -2828,10 +2807,10 @@ function touchesBlock(doc, block, key, touched) {
   if (!touched.elements.some(([actor, counter]) => bloomFilterContains(block.bloom, actor, counter))) return false
   const segment = blockObjects(block).get(key)
   if (!segment) return false
-  const rows = columnOperationCache(block.columns).operations
+  const rows = columnOperationCache(block.columns).operations, elements = touched.elements
   for (let i = segment.start; i < segment.end; i++) {
     const row = rows[i], actor = row[insertIdx] ? row[idActorIdx] : row[keyActorIdx], counter = row[insertIdx] ? row[idCtrIdx] : row[keyCtrIdx]
-    if (touched.elements.some(element => element[0] === actor && element[1] === counter)) return true
+    for (let k = 0; k < elements.length; k++) if (elements[k][1] === counter && elements[k][0] === actor) return true
   }
   return false
 }
@@ -2860,19 +2839,20 @@ function objectRows(doc, objectId, type, before, after, touched) {
     if (segment) parts.push({segment, operations: columnOperationCache(block.columns).operations})
     if (compareBlockObject(block, doc.actorIds, actorId, counter) > 0) break
   }
-  const rows = []
+  const pieces = []
   for (let k = 0; k < parts.length; k++) {
     const {segment, operations} = parts[k]
     if (before !== null && startsGroup(parts[k], type, parts[k - 1]) &&
         (k === parts.length - 1 ? !truncated : startsGroup(parts[k + 1], type, parts[k]))) {
       const summary = segmentSummary(segment, operations, type)
       if (settledAt(summary, before, after)) {
-        rows.push({skip: true, summary, length: type === 'text' ? segment.end - segment.start : 0})
+        pieces.push([{skip: true, summary, length: type === 'text' ? segment.end - segment.start : 0}])
         if (type !== 'text') continue
       }
     }
-    for (let i = segment.start; i < segment.end; i++) rows.push(operations[i])
+    pieces.push(operations.slice(segment.start, segment.end))
   }
+  const rows = [].concat(...pieces)
   rows.truncated = truncated
   return rows
 }
@@ -3064,10 +3044,15 @@ function markBelow(state, index, name) {
   return null
 }
 
+function markAbove(state, index, name) {
+  for (let i = index; i < state.length; i++) if (state[i].name === name) return true
+  return false
+}
+
 function markBegin(machine, id, name, value) {
   const {found, index} = findMark(machine.state, id)
   if (found) return
-  if (!machine.state.slice(index).some(mark => mark.name === name)) {
+  if (!markAbove(machine.state, index, name)) {
     const below = markBelow(machine.state, index, name)
     if (!below || !sameScalar(below.value, value)) machine.current = new Map(machine.current).set(name, value)
   }
@@ -3078,7 +3063,7 @@ function markEnd(machine, id) {
   const {found, index} = findMark(machine.state, [id[0] - 1, id[1]])
   if (!found) return
   const [mark] = machine.state.splice(index, 1)
-  if (machine.state.slice(index).some(other => other.name === mark.name)) return
+  if (markAbove(machine.state, index, mark.name)) return
   const below = markBelow(machine.state, index, mark.name)
   if (below && sameScalar(below.value, mark.value)) return
   machine.current = new Map(machine.current)
@@ -3121,7 +3106,7 @@ function addedMarks(marks, raw) {
   return [...marks.after].filter(([, value]) => raw || value.value !== null).sort((left, right) => compareUtf8(left[0], right[0]))
 }
 
-function textSpans(rows, before, after, actorRank, addedKey, until = Infinity) {
+function textSpans(rows, before, after, actorRank, addedKey) {
   const spans = [], shared = {state: [], current: NO_MARKS}, machines = {before: shared, after: shared}
   let index = 0, next = null, marks = NO_MARK_DIFF
   function flush() {
@@ -3147,13 +3132,15 @@ function textSpans(rows, before, after, actorRank, addedKey, until = Infinity) {
     marks = markBefore || markAfter ? {before: markBefore, after: markAfter} : NO_MARK_DIFF
   }
   let topBefore = null, topAfter = null
-  for (let i = 0; i < rows.length && index <= until; i++) {
+  for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
     if (row.skip) {
       const states = [machines.before.state, machines.after.state]
       if (states[0] === states[1] || (states[0].length === states[1].length && states[0].every((mark, k) => compareMarkIds(mark.id, states[1][k].id) === 0))) {
-        flush()
-        spans.push({skipped: row.summary, index})
+        if (row.summary.visible > 0) {
+          flush()
+          spans.push({skipped: row.summary, index})
+        }
         for (const mark of row.summary.marks) applyMark(mark, SAME)
         index += row.summary.visible
         i += row.length
@@ -3643,9 +3630,38 @@ function spliceMarks(ctx, event, actor) {
   const clock = ctx.after.slice()
   clock[actor] = event.counter
   const rows = objectRows(ctx.doc, event.objectId, 'text', ctx.before, clock, ctx.touched.get(event.objectId))
-  const span = textSpans(rows, ctx.before, clock, ctx.actorRank, marks => addedMarks(marks, false), event.prop)
-    .find(span => span.diff === ADD && !span.row && span.index <= event.prop && event.prop < span.index + span.text.length)
-  return span ? exportMarks(span.marks) : null
+  const machine = {state: [], current: NO_MARKS}
+  let index = 0
+  for (let i = 0; i < rows.length && index <= event.prop; i++) {
+    const row = rows[i]
+    if (row.skip) {
+      for (const mark of row.summary.marks) machineMark(machine, mark, ctx.actorRank)
+      index += row.summary.visible
+      i += row.length
+      continue
+    }
+    if (!row[insertIdx]) continue
+    let topBefore = null, topAfter = null
+    for (let j = i; j < rows.length && (j === i || (!rows[j].skip && !rows[j][insertIdx])); j++) {
+      if (visibleAt(rows[j], ctx.before, null)) topBefore = rows[j]
+      if (visibleAt(rows[j], clock, null)) topAfter = rows[j]
+    }
+    if (!topAfter) continue
+    if (topAfter[actionIdx] === MARK_ACTION) {
+      machineMark(machine, topAfter, ctx.actorRank)
+    } else if (index === event.prop) {
+      if (topAfter === topBefore || topAfter[actionIdx] === MAKE_MAP_ACTION) return null
+      return exportMarks({before: null, after: machine.current.size > 0 ? machine.current : null})
+    } else {
+      index += textWidth(topAfter)
+    }
+  }
+  return null
+}
+
+function machineMark(machine, row, actorRank) {
+  const id = [row[idCtrIdx], actorRank[row[idActorIdx]]], name = row[markNameIdx]
+  if (name === null) markEnd(machine, id); else markBegin(machine, id, name, decodeValue(row[valLenIdx], row[valRawIdx]))
 }
 
 function localPatches(doc, change, actor, startOp, afterClock, events, valueOf) {
@@ -3774,10 +3790,12 @@ class BackendDoc {
 
       this.blocks = [{columns: makeDecoders(doc.opsColumns, DOC_OPS_COLUMNS)}]
       resetBlockMetadata(this.blocks[0])
+      LOADED_DOCUMENTS.set(buffer, {header: doc, columns: this.blocks[0].columns})
 
       let docState = {blocks: this.blocks, actorIds: this.actorIds, objectMeta: this.objectMeta, maxOp: 0,
         objectsWithMarks: this.objectsWithMarks, loadVisibleMapOps: this.visibleMapOps}
       this.initPatch = documentPatch(docState)
+      this.blocks = docState.blocks
       this.maxOp = docState.maxOp
 
     } else {
@@ -4051,7 +4069,9 @@ class BackendDoc {
     const clock = {}
     let numChangeOps = 0
 
-    for (let change of documentChanges(binaryDoc)) {
+    const loaded = LOADED_DOCUMENTS.get(binaryDoc)
+    const decoded = loaded ? documentChanges(binaryDoc, columnOperationCache(loaded.columns).operations, loaded.header) : documentChanges(binaryDoc)
+    for (let change of decoded) {
       changes.push(change.bytes)
       historyHashes.push(change.hash)
       changeIndexByHash[change.hash] = changes.length - 1
