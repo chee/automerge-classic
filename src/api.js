@@ -89,8 +89,8 @@ function changeWithSource(doc, options, callback, source) {
     callback = options
     options = undefined
   }
-  doc = integrated(doc)
-  return Frontend.change(doc, patchOptions(doc, options, source), callback)[0]
+  const full = integrated(doc), changed = Frontend.change(full, patchOptions(full, options, source), callback)[0]
+  return changed === full ? doc : changed
 }
 
 function integrated(doc) {
@@ -112,8 +112,14 @@ export function emptyChange(doc, options) {
 
 function isolatedView(doc, full, callback, source) {
   const points = isolations.get(doc), heads = points.at(-1), state = Frontend.getBackendState(full), residue = residues.get(doc)
-  const patches = (residue ? residue.patches.concat(diff(full, residue.from, residue.to)) : [])
-    .concat(points.slice(1).flatMap((point, i) => diff(full, points[i], point)))
+  const key = state.source || state.state, start = residue ? residue.start : points[0], cached = diffCache.get(key)
+  function between(before, after) { return backend.diff(state, before, after, diffValue, '_root', true) }
+  const patches = cached && cached.objectId === '_root' && cached.recursive && equals(cached.before, start) && equals(cached.after, heads)
+    ? (cached.compute ? cached.compute() : between(start, heads))
+    : !equals(heads, backend.getHeads(state)) ? between(start, heads)
+      : (residue ? residue.patches.concat(between(residue.from, residue.to)) : [])
+        .concat(points.slice(1).flatMap((point, i) => between(points[i], point)))
+  diffCache.set(key, {before: start, after: heads, objectId: '_root', recursive: true, compute: () => patches})
   const {clock, deps, maxOp} = full[STATE]
   const view = patches.length === 0
     ? Frontend.applyPatch(doc, {clock, deps, maxOp, diffs: {objectId: '_root', type: 'map', props: {}}}, state)
@@ -263,6 +269,7 @@ function cachedDiff(doc, before, after, objectId, recursive) {
 
 function applyBackendPatch(doc, patch, backendState, options, source, beforeHeads) {
   if (isolations.has(doc)) {
+    backendState.state.loaded = Frontend.getBackendState(doc).state.loaded
     const base = isolatedViews.get(doc) || doc
     return isolatedView(doc, patch ? Frontend.applyPatch(base, patch, backendState) : base, options.patchCallback || doc[OPTIONS].patchCallback, source)
   }
@@ -278,14 +285,21 @@ export function applyChanges(doc, changes, options = {}) {
   return [applyChangesWithSource(doc, changes, options, 'applyChanges', getHeads(doc))]
 }
 
+function logged(doc) {
+  const state = Frontend.getBackendState(doc).state
+  if (state.loaded && !isolations.has(doc)) state.loaded = false
+}
+
 function applyChangesWithSource(doc, changes, options, source, beforeHeads) {
   assertWritable(doc)
+  logged(doc)
   const [newState, patch] = backend.applyChanges(Frontend.getBackendState(doc, 'applyChanges'), changes)
   return applyBackendPatch(doc, patch, newState, options, source, beforeHeads)
 }
 
 export function loadIncremental(doc, data, options = {}) {
   assertWritable(doc)
+  logged(doc)
   const oldState = Frontend.getBackendState(doc, 'loadIncremental')
   const [newState, patch] = backend.loadIncremental(oldState, data)
   if (!patch && isolations.has(doc)) return applyBackendPatch(doc, null, newState, options, 'loadIncremental')
@@ -455,6 +469,7 @@ export function getFragments(doc, levels) {
 
 export function addCommits(doc, commits, options) {
   assertWritable(doc)
+  logged(doc)
   const state = Frontend.getBackendState(doc, 'addCommits')
   const inputs = readInputs(commits, 'commit inputs must be an array', (commit, i) => readCommit(commit, `bad commit input at index ${i}: `))
   for (const commit of inputs) {
@@ -478,6 +493,7 @@ export function addCommits(doc, commits, options) {
 
 export function addFragments(doc, fragments, options) {
   assertWritable(doc)
+  logged(doc)
   const state = Frontend.getBackendState(doc, 'addFragments')
   const inputs = readInputs(fragments, 'fragment inputs must be an array', (fragment, i) => readFragment(fragment, `bad fragment input at index ${i}: `, true))
   const data = new Uint8Array(inputs.reduce((length, input) => length + input.bytes.byteLength, 0))
@@ -568,17 +584,20 @@ function isolatedChange(doc, heads, options, callback, source) {
   let branchEvents = [], changed
   const branchOptions = Object.assign(typeof options === 'string' ? {message: options} : Object.assign({}, options),
     {patchCallback: (patch, before, after, local, changes, events) => { branchEvents = events }})
+  let draft
   try {
-    changed = Frontend.change(branch, branchOptions, callback)[0]
+    changed = Frontend.change(branch, branchOptions, root => { draft = root; return callback(root) })[0]
   } catch (error) {
     isolations.set(doc, points)
+    if (error instanceof RangeError || error instanceof TypeError || draft && draft[CHANGE].ops.length > 0) state.state.loaded = false
     throw error
   }
   if (changed === branch) {
     if (moved) {
       isolations.delete(doc)
+      isolations.delete(isolatedViews.get(doc))
       const residue = residues.get(doc), pending = residue ? residue.patches.concat(diff(doc, residue.from, residue.to)) : []
-      residues.set(doc, {patches: pending.concat(points.slice(1).flatMap((point, i) => diff(doc, points[i], point))), from: heads, to: current})
+      residues.set(doc, {patches: pending.concat(points.slice(1).flatMap((point, i) => diff(doc, points[i], point))), from: heads, to: current, start: residue ? residue.start : points[0]})
     }
     return {newDoc: doc, newHeads: null}
   }
@@ -587,13 +606,20 @@ function isolatedChange(doc, heads, options, callback, source) {
   const bytes = encodeChangeRaw(Object.assign(change, {seq: isolated.seq, deps: heads.slice().sort(), ops}))
   const loaded = backend.isLoaded(state), [newState, patch] = backend.applyChanges(state, [bytes])
   const applied = Frontend.applyPatch(isolatedViews.get(doc) || doc, patch, newState), newHeads = [decodeChange(bytes, true).hash]
-  const patches = points.slice(1, -1).flatMap((point, i) => diff(doc, points[i], point))
-    .concat(backend.isolatedPatches(newState, points.at(-2) || heads, heads, newHeads, bytes, isolated.actor, branchEvents, diffValue, loaded))
+  const prior = points.slice(1, -1).flatMap((point, i) => diff(doc, points[i], point))
+  const patches = prior.concat(backend.isolatedPatches(newState, points.at(-2) || heads, heads, newHeads, bytes, isolated.actor, branchEvents, diffValue,
+    loaded && prior.length === 0 && !residues.has(doc)))
     .concat(diff(applied, newHeads, getHeads(applied)))
-  const newDoc = Frontend.followPatchOrder(doc, applied, patches)
+  const newDoc = Frontend.followPatchOrder(doc, applied, patches, isolatedViews.has(doc))
   progress(doc, newDoc, isObject(options) && options.patchCallback || doc[OPTIONS].patchCallback, source, heads, () => patches)
   scopedDocs.set(doc, {heads, state: newState})
   return {newDoc, newHeads}
+}
+
+function scoped(doc) {
+  if (!isObject(doc) || doc[CHANGE] || !isolations.has(doc)) return doc
+  const [state, patch] = backend.view(Frontend.getBackendState(doc), isolations.get(doc).at(-1))
+  return Frontend.applyPatch(init(), patch, state)
 }
 
 function materialized(doc) {
@@ -608,10 +634,7 @@ export function toJS(value) {
     const {heads, state} = scopedDocs.get(value), [scoped, patch] = backend.view(state, heads)
     return toJS(Frontend.applyPatch(init(), patch, scoped))
   }
-  if (isObject(value) && isolations.has(value)) {
-    const [scoped, patch] = backend.view(Frontend.getBackendState(value), isolations.get(value).at(-1))
-    return toJS(Frontend.applyPatch(init(), patch, scoped))
-  }
+  if (isObject(value) && isolations.has(value)) return toJS(scoped(value))
   if (isObject(value) && isolatedViews.has(value)) return toJS(isolatedViews.get(value))
   if (value instanceof Frontend.Text) {
     let text = ''
@@ -1051,6 +1074,7 @@ function cursorTarget(doc, path, name) {
 }
 
 export function getCursor(doc, path, position, move = 'after') {
+  doc = scoped(doc)
   const value = cursorTarget(doc, path, 'getCursor')
   const length = textLength(value)
   if (!['before', 'after'].includes(move)) throw new RangeError('getCursor() move must be before or after')
@@ -1079,6 +1103,7 @@ function updateCursorPosition(before, after, position, move) {
 const cursorOffsets = new WeakMap()
 
 export function getCursorPosition(doc, path, cursor) {
+  doc = scoped(doc)
   const value = cursorTarget(doc, path, 'getCursorPosition')
   if (cursor === 's') return 0
   if (cursor === 'e') return textLength(value)
@@ -1379,12 +1404,14 @@ function markRangesFromValues(values, text) {
 }
 
 export function marks(doc, path) {
+  doc = scoped(doc)
   const state = markRanges(doc, path, 'Cannot call marks(): invalid object ID: ')
   if (!state) return []
   return markRangesFromValues(state.values, state.text).map(range => Object.assign({}, range))
 }
 
 export function marksAt(doc, path, index) {
+  doc = scoped(doc)
   const state = markRanges(doc, path, 'Cannot call marksAt(): invalid object ID: ')
   if (!state) return {}
   if (!Number.isInteger(index) || index < 0) throw new RangeError('marksAt() index is invalid')
@@ -1392,6 +1419,7 @@ export function marksAt(doc, path, index) {
 }
 
 export function spans(doc, path) {
+  doc = scoped(doc)
   const state = markRanges(doc, path, 'Cannot splice: RangeError: invalid object id: ')
   if (!state) return objectSpans(resolvePath(doc, path, '').value)
   const result = []
@@ -1498,23 +1526,25 @@ function richTextTarget(doc, path, index, name, convert) {
 }
 
 export function block(doc, path, index) {
+  doc = scoped(doc)
   const target = richTextTarget(doc, path, index, 'block', false)
   if (!target) return null
   const value = 'element' in target ? target.element : target.text.get(target.index)
   if (!isRecord(value)) return null
   const context = doc[CHANGE], source = context && isolatedSources.get(context.cache), objectId = Frontend.getObjectId(value)
-  return source ? currentBlock(source, context, objectId) : toJS(value)
+  return source ? toJS(currentObject(source, context, objectId).block) : toJS(value)
 }
 
-function currentBlock(source, context, objectId) {
+function currentObject(source, context, objectId) {
   let state = backend.clone(Frontend.getBackendState(source.doc, 'block'))
   if (context.ops.length > 0) {
-    const change = {actor: context.actorId, seq: source.seq, startOp: source.startOp, time: 0, message: '', deps: backend.getHeads(state), ops: context.ops}
+    const change = {actor: context.actorId, seq: source.seq, startOp: source.startOp, time: 0, message: '', deps: backend.getHeads(state), ops: context.ops.map(op => Object.assign({}, op))}
+    const anchors = Frontend.getBackendState(context.cache._root).state.anchorSource
+    anchors.doc.adjustInsertAnchors(change, anchors.clock)
     ;[state] = backend.applyChanges(state, [encodeChangeRaw(change)])
   }
   const patch = backend.objectPatch(state, objectId) || {objectId, type: 'map', props: {}}
-  const holder = Frontend.applyPatch(init(), {maxOp: 0, clock: {}, deps: [], diffs: {objectId: '_root', type: 'map', props: {block: {[objectId]: patch}}}}, state)
-  return toJS(holder.block)
+  return Frontend.applyPatch(init(), {maxOp: 0, clock: {}, deps: [], diffs: {objectId: '_root', type: 'map', props: {block: {[objectId]: patch}}}}, state)
 }
 
 export function splitBlock(doc, path, index, value) {
@@ -1604,12 +1634,21 @@ export function updateSpans(doc, path, newSpans, config = {}) {
       index += value.length
     }
   }
+  const context = target.text.context, source = isolatedSources.get(context.cache), objectId = Frontend.getObjectId(target.text)
+  function current() {
+    if (source) {
+      const holder = currentObject(source, context, objectId)
+      return {root: holder, text: valueAt(holder, 'block')}
+    }
+    const text = richTextTarget(doc, path, 0, 'updateSpans', true).text
+    return {root: text.context.cache._root, text}
+  }
   const old = []
   {
-    const values = markRangesForText(target.text.context.cache._root, target.text).values
+    const {root, text} = current(), values = markRangesForText(root, text).values
     let run = '', active = null
-    for (let i = 0; i < target.text.length; i++) {
-      const item = target.text.get(i)
+    for (let i = 0; i < text.length; i++) {
+      const item = text.get(i)
       if (typeof item === 'string' && (active === null || sameValue(active, values[i]))) {
         run += item
         active = values[i]
@@ -1680,21 +1719,31 @@ export function updateSpans(doc, path, newSpans, config = {}) {
       }
     }
   }
-  myersDiff(replaceHook(hook), old, next, itemEqual)
-
   const defaultExpand = config.defaultExpand || 'after'
   function expandFor(name) { return config.perMarkExpand && config.perMarkExpand[name] || defaultExpand }
-  const updated = richTextTarget(doc, path, 0, 'updateSpans', true)
-  const currentDoc = updated.text.context.cache._root
-  const currentMarks = markRangesFromValues(markRangesForText(currentDoc, updated.text).values, updated.text)
-  for (const range of currentMarks) {
-    if (!nextMarks.some(nextMark => markEqual(range, nextMark))) {
-      unmark(doc, path, {start: range.start, end: range.end, expand: expandFor(range.name)}, range.name)
+  let currentMarks, seen = -1
+  function marksNow() {
+    if (seen !== context.ops.length) {
+      const updated = current()
+      currentMarks = markRangesFromValues(markRangesForText(updated.root, updated.text).values, updated.text)
+      seen = context.ops.length
     }
+    return currentMarks
   }
-  for (const range of nextMarks) {
-    if (currentMarks.some(currentMark => markEqual(range, currentMark))) continue
-    mark(doc, path, {start: range.start, end: range.end, expand: expandFor(range.name)}, range.name, range.value)
+  try {
+    myersDiff(replaceHook(hook), old, next, itemEqual)
+    for (const range of marksNow()) {
+      if (!nextMarks.some(nextMark => markEqual(range, nextMark))) {
+        unmark(doc, path, {start: range.start, end: range.end, expand: expandFor(range.name)}, range.name)
+      }
+    }
+    for (const range of nextMarks) {
+      if (marksNow().some(currentMark => markEqual(range, currentMark))) continue
+      mark(doc, path, {start: range.start, end: range.end, expand: expandFor(range.name)}, range.name, range.value)
+    }
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error
+    throw new RangeError('Cannot updateSpans: RangeError: ' + error.message.replace(/^Cannot \w+: (RangeError: )?/, ''))
   }
 }
 
@@ -1739,6 +1788,7 @@ export function generateSyncMessage(doc, syncState) {
 
 export function receiveSyncMessage(doc, oldSyncState, message, options = {}) {
   assertWritable(doc)
+  if (Frontend.getBackendState(doc).state.loaded && !oldSyncState.readOnly && backend.decodeSyncMessage(message).changes.length > 0) logged(doc)
   const oldBackendState = Frontend.getBackendState(doc, 'receiveSyncMessage')
   const [backendState, syncState, patch] = backend.receiveSyncMessage(oldBackendState, oldSyncState, message)
   if (!patch && isolations.has(doc)) return [applyBackendPatch(doc, null, backendState, options, 'receiveSyncMessage'), syncState, null]
