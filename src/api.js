@@ -306,7 +306,8 @@ function patchOptions(doc, options, source) {
     const actor = Frontend.getActorId(after), startOp = before[STATE].maxOp + 1, residue = events.length > 0 && residues.get(before)
     if (residue) {
       residues.delete(before)
-      progress(before, after, callback, source, beforeHeads, () => residue.patches.concat(
+      const prefix = residue.patches
+      progress(before, after, callback, source, beforeHeads, () => prefix.concat(
         backend.isolatedPatches(state, residue.from, residue.to, getHeads(after), changes[0], actor, events, diffValue, false)))
       return
     }
@@ -697,11 +698,17 @@ function isolatedChange(doc, heads, options, callback, source) {
   if (changed === branch) {
     if (draft && draft[CHANGE].attempted) discardTransaction(state, points.at(-1), isolated)
     if (moved) {
-      finishView(state, points.at(-2), points.at(-1))
       isolations.delete(doc)
       isolations.delete(isolatedViews.get(doc))
-      const residue = residues.get(doc), pending = residue ? residue.patches.concat(transition(doc, residue.from, residue.to)) : []
-      residues.set(doc, {patches: pending.concat(points.slice(1).flatMap((point, i) => transition(doc, points[i], point))), from: heads, to: current, start: residue ? residue.start : points[0]})
+      const residue = residues.get(doc), start = residue ? residue.start : points[0]
+      try {
+        finishView(state, points.at(-2), points.at(-1))
+        const pending = residue ? residue.patches.concat(transition(doc, residue.from, residue.to)) : []
+        residues.set(doc, {patches: pending.concat(points.slice(1).flatMap((point, i) => transition(doc, points[i], point))), from: heads, to: current, start})
+      } catch (error) {
+        if (!(error instanceof PanicError)) throw error
+        residues.set(doc, {get patches() { throw error }, from: heads, to: current, start})
+      }
     }
     return {newDoc: doc, newHeads: null}
   }
@@ -1006,12 +1013,13 @@ export function splice(doc, path, index, del, newText) {
   if (Array.isArray(values)) {
     const bad = values.findIndex(value => !(value === null || ['boolean', 'string', 'number', 'bigint'].includes(typeof value) ||
       value instanceof Date || value instanceof Uint8Array))
-    if (bad >= 0) throw new RangeError('Cannot splice: RangeError: invalid import: ' + jsValueDebug(values[bad]))
+    if (bad >= 0) throw beforeTransaction(new RangeError('Cannot splice: RangeError: invalid import: ' + jsValueDebug(values[bad])))
     values = target.type === 'list' ? values.map(value => (typeof value === 'string' ? new ImmutableString(value) : value)) : values.join('')
   } else if (target.type === 'list') {
     values = [...values].map(char => new ImmutableString(char))
   }
   const text = target.value
+  if (target.type !== 'map' || values.length > 0) doc[CHANGE].attempted = true
   if (target.type === 'map') {
     if (values.length > 0) throw new RangeError('Cannot splice: RangeError: invalid op for object of type `map`')
     return
@@ -1360,14 +1368,14 @@ function markText(doc, path, range, name, value, label) {
   const prefix = `Cannot ${label}: RangeError: `
   const target = resolvePath(doc, path, prefix + 'invalid object id: ')
   const text = target.value
-  if (!isObject(range)) throw new RangeError(prefix + 'range must be an object')
-  if (typeof range.start !== 'number') throw new RangeError(prefix + 'start must be a number')
-  if (typeof range.end !== 'number') throw new RangeError(prefix + 'end must be a number')
+  if (!isObject(range)) throw beforeTransaction(new RangeError(prefix + 'range must be an object'))
+  if (typeof range.start !== 'number') throw beforeTransaction(new RangeError(prefix + 'start must be a number'))
+  if (typeof range.end !== 'number') throw beforeTransaction(new RangeError(prefix + 'end must be a number'))
   const expand = range.expand === undefined ? 'after' : range.expand
   if (!['before', 'after', 'both', 'none'].includes(expand)) {
-    throw new RangeError(prefix + "expand must be 'left', 'right', 'both', or 'none' - is 'right' by default")
+    throw beforeTransaction(new RangeError(prefix + "expand must be 'left', 'right', 'both', or 'none' - is 'right' by default"))
   }
-  if (typeof name !== 'string') throw new RangeError(prefix + 'Invalid mark name')
+  if (typeof name !== 'string') throw beforeTransaction(new RangeError(prefix + 'Invalid mark name'))
   let datatype
   if (value instanceof Date) {
     value = value.getTime()
@@ -1375,8 +1383,9 @@ function markText(doc, path, range, name, value, label) {
   } else if (typeof value === 'bigint') {
     value = Number(value)
   } else if (!(value === null || ['boolean', 'string', 'number'].includes(typeof value) || value instanceof Uint8Array)) {
-    throw new RangeError(prefix + 'Invalid mark value: invalid import: ' + jsValueDebug(value))
+    throw beforeTransaction(new RangeError(prefix + 'Invalid mark value: invalid import: ' + jsValueDebug(value)))
   }
+  doc[CHANGE].attempted = true
   if (target.type !== 'text') throw new RangeError(prefix + `invalid op for object of type \`${target.type}\``)
   const startOffset = seqIndex(range.start), endOffset = seqIndex(range.end)
   // A zero-width non-expanding mark can never cover anything; the Rust
@@ -1727,6 +1736,7 @@ function richTextTarget(doc, path, index, name, convert) {
     text = valueAt(target.parent, target.key)
   }
   if (name === 'block' && target.type === 'list') return {element: seqIndex(index) < text.length ? valueAt(text, seqIndex(index)) : null}
+  if (convert && name !== 'updateSpans' && doc[CHANGE]) doc[CHANGE].attempted = true
   if (!(text instanceof Frontend.Text)) {
     const error = new RangeError(prefix + (name === 'updateSpans' ? 'object was not a text object' : `invalid op for object of type \`${target.type}\``))
     throw name === 'updateSpans' ? beforeTransaction(error) : error
@@ -1906,7 +1916,7 @@ export function updateSpans(doc, path, newSpans, config = {}) {
   function blockAt(index) {
     const scoped = richTextTarget(doc, path, index, 'updateSpans', false)
     if (!source) return scoped.text.get(scoped.index)
-    const live = current().text, item = index < live.length ? live.get(index) : undefined
+    const live = current().text, element = textCursorIndex(live, index), item = element < live.length ? live.get(element) : undefined
     if (!isObject(item)) throw new RangeError(`Cannot updateSpans: RangeError: index ${index} is out of bounds`)
     const id = Frontend.getObjectId(item)
     for (let i = 0; i < scoped.text.length; i++) {

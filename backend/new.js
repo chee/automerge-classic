@@ -2285,7 +2285,7 @@ function topologicalOrder(changes, changeIndexByHash) {
 function applyChanges(patches, decodedChanges, docState, objectIds, throwExceptions) {
   let heads = new Set(docState.heads), changeHashes = new Set()
   let clock = copyObject(docState.clock)
-  let applied = [], enqueued = []
+  let applied = [], enqueued = [], gap = false
 
   for (let change of decodedChanges) {
     // Skip any duplicate changes that we have already seen
@@ -2311,13 +2311,30 @@ function applyChanges(patches, decodedChanges, docState, objectIds, throwExcepti
         return [[], decodedChanges]
       }
     } else if (change.seq > expectedSeq) {
-      throw new PanicError(`assertion \`left == right\` failed\n  left: ${expectedSeq}\n right: ${change.seq}`)
+      gap = true
+      changeHashes.add(change.hash)
+      applied.push(change)
     } else {
       clock[change.actor] = change.seq
       changeHashes.add(change.hash)
       for (let dep of change.deps) heads.delete(dep)
       heads.add(change.hash)
       applied.push(change)
+    }
+  }
+
+  if (gap) {
+    const known = new Set(applied.filter(change => change.seq === 1).map(change => change.actor))
+    const seqs = copyObject(docState.clock)
+    for (const change of applied) {
+      if (change.actorIds.some(actor => !docState.actorIndexById.has(actor) && !known.has(actor))) {
+        throw new PanicError('called `Option::unwrap()` on a `None` value')
+      }
+      const expectedSeq = (seqs[change.actor] || 0) + 1
+      if (change.seq !== expectedSeq) {
+        throw new PanicError(`assertion \`left == right\` failed\n  left: ${expectedSeq}\n right: ${change.seq}`)
+      }
+      seqs[change.actor] = change.seq
     }
   }
 
@@ -2958,7 +2975,7 @@ function incrementsAt(row, clock, incs) {
   if (clock === null || incs === null || !isCounterRow(row)) return total
   for (let i = 0; i < row[succNumIdx]; i++) {
     const counter = row[succCtrIdx][i], actor = row[succActorIdx][i], key = `${counter}@${actor}`
-    if (counter <= clock[actor] && incs.has(key)) total += incs.get(key)
+    if (counter <= clock[actor] && incs.has(key)) total = addInt(total, incs.get(key))
   }
   return total
 }
@@ -2988,7 +3005,7 @@ function groupItem(entries, before, after, incs, isList) {
     }
     const incAfter = incrementsAt(row, after, incs)
     const itemDiff = expose && diff === SAME ? ADD : diff
-    const item = {row, diff: itemDiff, inc: incAfter - incrementsAt(row, before, incs), incAfter,
+    const item = {row, diff: itemDiff, inc: Number(addInt(incAfter, -incrementsAt(row, before, incs))), incAfter,
       conflict: numNew > 1 && !(diff === SAME && numOld > 1), expose, update: itemDiff === ADD && numOld > 0}
     if (i < entries.length - 1) {
       if (diff !== DEL && entries[i + 1].diff === DEL) lastVisible = item
@@ -3078,7 +3095,7 @@ function batchEvents(ctx, objectId, rows, item, isList, events) {
   } else if (doc && change) {
     const order = compareRows(change.row, doc.row, ctx.actorRank)
     if (order === 0) {
-      const inc = incrementsAt(doc.row, ctx.after, item.incs) - incrementsAt(doc.row, ctx.before, item.incs)
+      const inc = Number(addInt(incrementsAt(doc.row, ctx.after, item.incs), -incrementsAt(doc.row, ctx.before, item.incs)))
       if (inc !== 0) events.push({objectId, kind: 'inc', prop, value: inc})
     } else if (order < 0) {
       if (isList || !doc.conflict) events.push({objectId, kind: 'conflict', prop})

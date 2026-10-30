@@ -3,7 +3,7 @@ import { interpretPatch, lamportCompare, notedDatatype } from './apply_patch.js'
 import { Text, elemAt, textOffset } from './text.js'
 import { Counter, getWriteableCounter } from './counter.js'
 import { Float64, Int, Uint } from './numbers.js'
-import { I64_MAX, U64_MAX, compareUtf8, equalBytes, importBigInt, isObject, parseOpId, truncateInt, wellFormedString } from '../src/common.js'
+import { I64_MAX, U64_MAX, addInt, compareUtf8, equalBytes, importBigInt, isObject, parseOpId, truncateInt, wellFormedString } from '../src/common.js'
 import { isImmutableString } from '../src/immutable_string.js'
 /**
  * An instance of this class is passed to `rootObjectProxy()`. The methods are
@@ -506,6 +506,7 @@ class Context {
     if (!(object[key] instanceof Counter)) {
       throw new TypeError('Only counter values can be incremented')
     }
+    delta = truncateInt(delta)
 
     // TODO what if there is a conflicting value on the same key as the counter?
     const isList = Array.isArray(object)
@@ -527,11 +528,11 @@ class Context {
     const conflicts = (object[CONFLICTS] && object[CONFLICTS][key]) || {[pred[0]]: object[key]}
     const counter = Object.keys(conflicts).sort(lamportCompare).find(opId => conflicts[opId] instanceof Counter)
     this.events.push(Object.keys(conflicts).length > 1
-      ? {objectId, kind: 'put', prop: key, value: {value: conflicts[counter].value + delta, datatype: 'counter'}}
-      : {objectId, kind: 'inc', prop: key, value: delta})
+      ? {objectId, kind: 'put', prop: key, value: {value: addInt(conflicts[counter].value, delta), datatype: 'counter'}}
+      : {objectId, kind: 'inc', prop: key, value: Number(delta)})
     const values = {}
     for (const [opId, conflict] of Object.entries(conflicts)) {
-      if (conflict instanceof Counter) values[opId] = {value: conflict.value + delta, datatype: 'counter'}
+      if (conflict instanceof Counter) values[opId] = {value: addInt(conflict.value, delta), datatype: 'counter'}
     }
     this.applyAtPath(path, subpatch => {
       if (isList) {

@@ -1562,4 +1562,181 @@ describe('@automerge/automerge 3.5.0 parity', () => {
       assert.deepStrictEqual([outOfDate.name, outOfDate.message], ['RangeError', 'Attempting to change an out of date document - set at: undefined'])
     })
   })
+
+  describe('parity round 10', () => {
+    function fail(fn) {
+      try {
+        fn()
+      } catch (error) {
+        return `${error.name}: ${error.message}`
+      }
+    }
+
+    function wide(value) {
+      return JSON.parse(JSON.stringify(value, (key, v) => (typeof v === 'bigint' ? `${v}n` : v)))
+    }
+
+    it('panics with an unwrap like wasm when a change ahead of a seq gap names an unknown actor', () => {
+      let a = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.l = [1] })
+      const first = Automerge.getHeads(a)
+      a = Automerge.emptyChange(a, {time: 0})
+      a = Automerge.changeAt(a, first, {time: 0}, draft => { draft.y = 2 }).newDoc
+      const gap = Automerge.getAllChanges(a)[2]
+      const unknown = Automerge.encodeChange({actor: 'cccc', seq: 1, startOp: 20, time: 0, message: null, deps: first,
+        ops: [{action: 'set', obj: `1@${ACTOR_A}`, elemId: `11@${ACTOR_B}`, insert: true, value: 'L', pred: []}]})
+      const saved = Automerge.save(Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.l = [1] }))
+      const unwrap = 'PanicError: called `Option::unwrap()` on a `None` value'
+      const assertion = 'PanicError: assertion `left == right` failed\n  left: 2\n right: 3'
+      for (const [changes, expected] of [[[unknown, gap], unwrap], [[gap, unknown], assertion]]) {
+        const commits = changes.map(bytes => {
+          const change = Automerge.decodeChange(bytes)
+          return {head: change.hash, parents: change.deps, bytes}
+        })
+        const message = Automerge.encodeSyncMessage({heads: [], need: [], have: [], changes})
+        assert.deepStrictEqual([
+          fail(() => Automerge.applyChanges(Automerge.load(saved, 'dddd'), changes)),
+          fail(() => Automerge.addCommits(Automerge.load(saved, 'dddd'), commits)),
+          fail(() => Automerge.loadIncremental(Automerge.load(saved, 'dddd'), new Uint8Array([...changes[0], ...changes[1]]))),
+          fail(() => Automerge.receiveSyncMessage(Automerge.load(saved, 'dddd'), Automerge.initSyncState(), message))
+        ], [expected, expected, expected, expected])
+      }
+    })
+
+    it('increments a counter that conflicts with a counter wider than a safe integer', () => {
+      const calls = []
+      let doc = Automerge.change(Automerge.init(ACTOR_B), {time: 0}, draft => { draft.c = new Automerge.Counter(2) })
+      const other = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.c = new Automerge.Counter(2 ** 53 - 1) })
+      doc = Automerge.load(Automerge.save(Automerge.merge(doc, other)), {actor: ACTOR_B, patchCallback: patches => calls.push(patches)})
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.c.increment(5) })
+      assert.deepStrictEqual(wide(calls), [
+        [{action: 'put', path: ['c'], value: 2, conflict: true}],
+        [{action: 'put', path: ['c'], value: '9007199254740996n'}]
+      ])
+      assert.deepStrictEqual(wide(Automerge.toJS(doc)), {c: 7})
+      assert.deepStrictEqual(wide(Automerge.getConflicts(doc, 'c')), {[`1@${ACTOR_A}`]: '9007199254740996n', [`1@${ACTOR_B}`]: 7})
+    })
+
+    it('casts fractional, infinite and out-of-range increments to an i64 like Rust', () => {
+      const results = [2.5, -2.5, NaN, Infinity, -Infinity, 2 ** 64, 2 ** 53].map(delta => {
+        const calls = []
+        let doc = Automerge.change(Automerge.init({actor: ACTOR_A, patchCallback: patches => calls.push(patches)}), {time: 0}, draft => { draft.c = new Automerge.Counter(1) })
+        let returned
+        doc = Automerge.change(doc, {time: 0}, draft => { returned = draft.c.increment(delta) })
+        return wide([returned, calls[1][0].value, Automerge.toJS(doc).c, Automerge.toJS(Automerge.load(Automerge.save(doc))).c])
+      })
+      assert.deepStrictEqual(results, [
+        [3.5, 2, 3, 3],
+        [-1.5, -2, -1, -1],
+        [null, 0, 1, 1],
+        [null, 9223372036854776000, '-9223372036854775808n', '-9223372036854775808n'],
+        [null, -9223372036854776000, '-9223372036854775807n', '-9223372036854775807n'],
+        [18446744073709552000, 9223372036854776000, '-9223372036854775808n', '-9223372036854775808n'],
+        [9007199254740992, 9007199254740992, '9007199254740993n', '9007199254740993n']
+      ])
+    })
+
+    it('wraps a merged increment past the i64 maximum in patches, diffs and the document', () => {
+      const calls = []
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.c = new Automerge.Counter(5) })
+      doc = Automerge.load(Automerge.save(doc), {actor: ACTOR_A, patchCallback: patches => calls.push(patches)})
+      const other = Automerge.change(Automerge.clone(doc, ACTOR_B), {time: 0}, draft => { draft.c.increment(2 ** 63) })
+      const heads = Automerge.getHeads(doc)
+      const merged = Automerge.merge(doc, other)
+      assert.deepStrictEqual(wide(calls[1]), [{action: 'inc', path: ['c'], value: 9223372036854776000}])
+      assert.deepStrictEqual(wide([merged, Automerge.toJS(merged), other]), [{c: '-9223372036854775804n'}, {c: '-9223372036854775804n'}, {c: '-9223372036854775804n'}])
+      const reloaded = Automerge.merge(Automerge.load(Automerge.save(doc)), other)
+      assert.deepStrictEqual(wide(Automerge.diff(reloaded, heads, Automerge.getHeads(reloaded))), [{action: 'inc', path: ['c'], value: 9223372036854776000}])
+      assert.deepStrictEqual(wide(Automerge.diff(reloaded, Automerge.getHeads(reloaded), heads)), [{action: 'inc', path: ['c'], value: -9223372036854776000}])
+    })
+
+    it('loads and throws like wasm on a counter incremented past a safe integer', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.c = new Automerge.Counter(1) })
+      doc = Automerge.load(Automerge.save(doc), ACTOR_A)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.c.increment(-(2 ** 53)) })
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.c.increment(-(2 ** 53)) })
+      assert.deepStrictEqual(wide([doc.c, Automerge.toJS(Automerge.load(Automerge.save(doc)))]), ['-18014398509481983n', {c: '-18014398509481983n'}])
+      let inner, thrown
+      try {
+        Automerge.change(doc, {time: 0}, draft => {
+          try {
+            draft.c.increment(1)
+          } catch (error) {
+            inner = `${error.name}: ${error.message}`
+          }
+        })
+      } catch (error) {
+        thrown = error
+      }
+      assert.strictEqual(inner, 'TypeError: Cannot mix BigInt and other types, use explicit conversions')
+      assert.strictEqual(thrown, 'cannot increment a non-numeric value')
+      assert.deepStrictEqual(wide(Automerge.toJS(doc)), {c: '-18014398509481982n'})
+    })
+
+    it('keeps the patch log actors after a throwing change whose failed call reached the document', () => {
+      for (const call of [
+        draft => Automerge.splice(draft, ['t'], 9, 0, 'z'),
+        draft => Automerge.splitBlock(draft, ['t'], 9, {type: 'p', parents: [], attrs: {}}),
+        draft => Automerge.mark(draft, ['t'], {start: 1, end: 1, expand: 'none'}, 'b', true)
+      ]) {
+        const calls = []
+        let doc = Automerge.change(Automerge.init(ACTOR_B), {time: 0}, draft => { draft.t = 'abc'; draft.k = 1 })
+        const scope = Automerge.getHeads(doc)
+        doc = Automerge.change(doc, {time: 0}, draft => { Automerge.splice(draft, ['t'], 3, 0, 'XY') })
+        doc = Automerge.load(Automerge.save(doc), {actor: ACTOR_B, patchCallback: patches => calls.push(patches)})
+        assert.throws(() => Automerge.change(doc, {time: 0}, draft => {
+          try {
+            call(draft)
+          } catch (error) {
+            assert.ok(error instanceof RangeError)
+          }
+          throw new Error('boom')
+        }), /boom/)
+        calls.length = 0
+        Automerge.changeAt(doc, scope, {time: 0}, draft => { draft.k = 2 })
+        assert.deepStrictEqual(calls, [[
+          {action: 'put', path: ['k'], value: 2},
+          {action: 'del', path: ['t', 3], length: 2},
+          {action: 'splice', path: ['t', 3], value: 'XY'}
+        ]])
+      }
+    })
+
+    it('updates a block by its text offset past a surrogate pair in a scope left by a throwing changeAt', () => {
+      function block(type) {
+        return {type, parents: [], attrs: {}}
+      }
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.text = 'hello ' })
+      doc = Automerge.change(doc, {time: 0}, draft => {
+        Automerge.splice(draft, ['text'], 0, 0, 'a😀')
+        Automerge.splitBlock(draft, ['text'], 3, block('li'))
+      })
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => Automerge.updateBlock(draft, ['text'], 3, block('paragraph')))
+      assert.throws(() => Automerge.changeAt(doc, scope, {time: 0}, draft => {
+        draft.k = 1
+        throw new Error('boom')
+      }), /boom/)
+      assert.strictEqual(fail(() => Automerge.change(doc, {time: 0}, draft => {
+        Automerge.updateSpans(draft, ['text'], [{type: 'text', value: 'a😀'}, {type: 'block', value: block('li')}, {type: 'text', value: 'a😀bhello '}])
+      })), `RangeError: Cannot updateSpans: RangeError: invalid obj id \`17@${ACTOR_A}\``)
+    })
+
+    it('defers the stale patch log panic of a changeAt without ops to the next change', () => {
+      const actorA = '11'.repeat(16), actorB = '22'.repeat(16)
+      let a = Automerge.change(Automerge.init(actorA), {time: 0}, draft => { draft.t = 'x'; draft.m = {} })
+      let b = Automerge.merge(Automerge.init(actorB), a)
+      const first = Automerge.getHeads(a)
+      a = Automerge.change(a, {time: 0}, draft => Automerge.splice(draft, ['t'], 1, 0, 'x'))
+      b = Automerge.change(b, {time: 0}, draft => { draft.z = 5 })
+      assert.throws(() => Automerge.changeAt(b, first, {time: 0}, draft => Automerge.updateBlock(draft, ['m'], 1, {type: 'p', parents: [], attrs: {}})), /invalid op/)
+      a = Automerge.loadIncremental(a, Automerge.saveSince(b, first))
+      a = Automerge.changeAt(a, Automerge.getHeads(b), {time: 0}, draft => Automerge.mark(draft, ['t'], {start: 0, end: 1, expand: 'before'}, 'bold', 'v')).newDoc
+      a = Automerge.change(a, {time: 0}, draft => { draft.k = 1 })
+      b = Automerge.loadIncremental(b, Automerge.saveSince(a, Automerge.getHeads(b)))
+      let result
+      assert.strictEqual(fail(() => { result = Automerge.changeAt(b, Automerge.getHeads(a), {time: 0}, draft => { delete draft.nope }) }), undefined)
+      assert.strictEqual(result.newHeads, null)
+      assert.strictEqual(fail(() => Automerge.change(result.newDoc, {time: 0}, draft => { draft.q = 1 })), 'PanicError: index out of bounds: the len is 3 but the index is 3')
+    })
+  })
 })

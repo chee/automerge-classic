@@ -1,6 +1,6 @@
 import * as Frontend from '../frontend/index.js'
 import { OBJECT_IDS, PATCH_OBJECTS, RAW_OBJECT_IDS } from '../backend/index.js'
-import { isObject } from './common.js'
+import { addInt, exportInt, isObject } from './common.js'
 
 const RAW_VALUE = Symbol.for('_am_raw_value_')
 const nodes = new WeakSet()
@@ -36,13 +36,19 @@ function incrementError(old) {
   return old instanceof Frontend.Counter && typeof old.value === 'number' ? null : 'cannot increment a non-numeric value'
 }
 
+function increment(data, prop, delta) {
+  const error = incrementError(data[prop])
+  if (error === null) data[prop] = new Frontend.Counter(exportInt(addInt(data[prop].value, delta)))
+  return error
+}
+
 function listError(data, patch, prop, created) {
   const index = typeof prop === 'number'
   if (!index && patch.action !== 'insert') return null
   if (patch.action === 'put') data[prop] = created(patch.value)
   else if (patch.action === 'del') data.splice(prop, patch.length || 1)
   else if (patch.action === 'insert') data.splice(prop, 0, ...patch.values.map(created))
-  else if (patch.action === 'inc') return incrementError(data[prop])
+  else if (patch.action === 'inc') return increment(data, prop, patch.value)
   return null
 }
 
@@ -50,7 +56,7 @@ function mapError(data, patch, prop, created) {
   if (typeof prop === 'number') return null
   if (patch.action === 'put') data[prop] = created(patch.value)
   else if (patch.action === 'del') delete data[prop]
-  else if (patch.action === 'inc') return incrementError(data[prop])
+  else if (patch.action === 'inc') return increment(data, prop, patch.value)
   return null
 }
 
