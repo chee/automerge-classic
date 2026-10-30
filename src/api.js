@@ -6,6 +6,7 @@ import { ImmutableString, isImmutableString } from './immutable_string.js'
 import { graphemes, myersDiff, replaceHook } from './text_diff.js'
 import { instantiateText, textOffset } from '../frontend/text.js'
 import * as backend from '../backend/index.js'
+import { rawObjectIds, sameShape, wasmApply } from './apply_error.js'
 
 const viewDocs = new WeakSet()
 const recentPatches = new WeakMap()
@@ -18,6 +19,8 @@ const residues = new WeakMap()
 const transitions = new WeakMap()
 const untransacted = new WeakSet()
 const viewSources = new WeakMap()
+const shadows = new WeakMap()
+const visibles = new WeakMap()
 
 /**
  * Automerge.* API
@@ -52,6 +55,40 @@ function assertWritable(doc) {
   }
 }
 
+function assertCurrent(doc, outOfDate = false) {
+  if (!scopedDocs.has(doc)) return
+  throw new RangeError(outOfDate ? 'Attempting to change an out of date document - set at: undefined'
+    : 'Attempting to change an outdated document.  Use Automerge.clone() if you wish to make a writable copy.')
+}
+
+function committed(doc, full, error, source, isolated = false) {
+  if (isolated) isolations.set(doc, [isolations.get(doc).at(-1).slice()])
+  else isolations.delete(doc)
+  residues.delete(doc)
+  if (recentPatches.has(doc)) recentPatches.set(full, recentPatches.get(doc))
+  if (['applyChanges', 'addCommits', 'addFragments'].includes(source)) {
+    scopedDocs.set(doc, {heads: getHeads(doc), state: Frontend.getBackendState(full)})
+  } else {
+    Object.assign(doc[STATE], full[STATE])
+    isolatedViews.set(doc, full)
+  }
+  throw error
+}
+
+function applied(doc, full, patches, source, isolated = false) {
+  const start = shadows.get(doc)
+  if (patches.length === 0) return start || null
+  if (getHeads(doc).length === 0 || !start && !Frontend.getBackendState(full).state.counters && !rawObjectIds(patches)) return null
+  const {error, root} = wasmApply(start || doc, patches)
+  if (error !== null) committed(doc, full, error, source, isolated)
+  return root
+}
+
+function shadowed(doc, root) {
+  if (root && !sameShape(root, doc)) shadows.set(doc, root)
+  return doc
+}
+
 export function init(options) {
   const normalized = {backend, textV2: true}
   if (typeof options === 'string') {
@@ -81,6 +118,7 @@ export function from(initialState, options) {
 }
 
 export function change(doc, options, callback) {
+  assertCurrent(doc)
   if (isolations.has(doc)) return isolatedChange(doc, isolations.get(doc).at(-1), options, callback, 'change').newDoc
   return changeWithSource(doc, options, callback, 'change')
 }
@@ -103,15 +141,32 @@ function changeWithSource(doc, options, callback, source) {
   }
 }
 
+function progressed(doc, state) {
+  diffCache.set(state.state, settledDiff(doc))
+  const {clock, deps, maxOp} = doc[STATE], full = current(doc)
+  const next = Frontend.applyPatch(doc, {clock, deps, maxOp, diffs: {objectId: '_root', type: 'map', props: {}}}, state)
+  if (full !== doc) isolatedViews.set(next, full)
+  if (recentPatches.has(doc)) recentPatches.set(next, recentPatches.get(doc))
+  if (shadows.has(doc)) shadows.set(next, shadows.get(doc))
+  scopedDocs.set(doc, {heads: getHeads(doc), state})
+  return next
+}
+
+function current(doc) {
+  return !isolations.has(doc) && isolatedViews.get(doc) || doc
+}
+
 function integrated(doc) {
-  const full = !isolations.has(doc) && isolatedViews.get(doc)
-  if (!full) return doc
+  const full = current(doc)
+  if (full === doc) return doc
+  visibles.set(full, doc)
   if (residues.has(doc)) residues.set(full, residues.get(doc))
   return full
 }
 
 export function emptyChange(doc, options) {
   assertWritable(doc)
+  assertCurrent(doc)
   if (isolations.has(doc)) {
     const quiet = Object.assign(typeof options === 'string' ? {message: options} : Object.assign({}, options), {patchCallback: () => {}})
     const full = Frontend.emptyChange(isolatedViews.get(doc) || doc, quiet)[0], record = pendingTransition(isolations.get(doc).at(-1))
@@ -135,6 +190,7 @@ function isolatedView(doc, full, callback, source) {
       : (residue ? residue.patches.concat(between(residue.from, residue.to)) : [])
         .concat(points.slice(1).flatMap((point, i) => between(points[i], point, actorMapping(transitions.get(point), docActors(state)))))
   diffCache.set(key, {before: start, after: heads, objectId: '_root', recursive: true, compute: () => patches})
+  const shadow = applied(doc, full, patches, source, true)
   const {clock, deps, maxOp} = full[STATE]
   const view = patches.length === 0
     ? Frontend.applyPatch(doc, {clock, deps, maxOp, diffs: {objectId: '_root', type: 'map', props: {}}}, state)
@@ -142,6 +198,7 @@ function isolatedView(doc, full, callback, source) {
       Object.assign({}, backend.view(state, heads)[1], {clock, deps, maxOp}), state), patches, true)
   isolatedViews.set(view, full)
   isolations.set(view, [heads.slice()])
+  shadowed(view, shadow)
   if (callback && patches.length > 0) callback(patches, {before: doc, after: view, source})
   return view
 }
@@ -184,6 +241,7 @@ export function save(doc) {
 
 export function merge(localDoc, remoteDoc, options = {}) {
   assertWritable(localDoc)
+  assertCurrent(localDoc, true)
   const localState = Frontend.getBackendState(localDoc, 'merge')
   const remoteState = Frontend.getBackendState(remoteDoc, 'merge', 'second')
   return applyChangesWithSource(localDoc, backend.getChangesAdded(localState, remoteState), options, 'merge')
@@ -214,7 +272,7 @@ export function getObjectId(object, prop) {
 }
 
 export function getConflicts(object, key) {
-  const values = Frontend.getConflicts(object, key)
+  const values = Frontend.getConflicts(current(object), key)
   if (!values) return
   const projected = {}
   for (const opId of Object.keys(values)) {
@@ -261,10 +319,12 @@ function patchOptions(doc, options, source) {
 }
 
 function progress(before, after, callback, source, beforeHeads, compute, patches = null, prior = null) {
+  const visible = visibles.get(before) || before
   const residue = residues.get(before), prefix = residue && residue.patches.concat(transition(before, residue.from, residue.to))
   const recent = prefix ? () => prefix.concat(compute()) : compute
   if (prefix && patches) patches = prefix.concat(patches)
-  if (callback && !patches) patches = recent()
+  if (!patches && (callback || shadows.has(visible) || Frontend.getBackendState(after).state.counters)) patches = recent()
+  if (patches) shadowed(after, applied(visible, after, patches, source))
   if (callback && patches.length > 0) callback(patches, {before, after, source})
   const heads = getHeads(after), state = Frontend.getBackendState(after)
   diffCache.set(state.state, {before: getHeads(before), after: heads, objectId: '_root', recursive: true, compute})
@@ -320,6 +380,7 @@ function applyBackendPatch(doc, patch, backendState, options, source, beforeHead
 }
 
 export function applyChanges(doc, changes, options = {}) {
+  assertCurrent(doc)
   return [applyChangesWithSource(doc, changes, options, 'applyChanges', getHeads(doc))]
 }
 
@@ -337,18 +398,17 @@ function applyChangesWithSource(doc, changes, options, source, beforeHeads) {
 
 export function loadIncremental(doc, data, options = {}) {
   assertWritable(doc)
+  assertCurrent(doc, true)
   logged(doc)
   const oldState = Frontend.getBackendState(doc, 'loadIncremental')
   const [newState, patch] = backend.loadIncremental(oldState, data)
   if (!patch && isolations.has(doc)) return applyBackendPatch(doc, null, newState, options, 'loadIncremental')
-  if (!patch) {
-    diffCache.set(oldState.state, settledDiff(doc))
-    return doc
-  }
+  if (!patch) return progressed(doc, oldState)
   return applyBackendPatch(doc, patch, newState, options, 'loadIncremental')
 }
 
 export function saveIncremental(doc) {
+  assertCurrent(doc, true)
   return backend.saveIncremental(Frontend.getBackendState(doc, 'saveIncremental'))
 }
 
@@ -507,6 +567,7 @@ export function getFragments(doc, levels) {
 
 export function addCommits(doc, commits, options) {
   assertWritable(doc)
+  assertCurrent(doc)
   logged(doc)
   const state = Frontend.getBackendState(doc, 'addCommits')
   const inputs = readInputs(commits, 'commit inputs must be an array', (commit, i) => readCommit(commit, `bad commit input at index ${i}: `))
@@ -531,6 +592,7 @@ export function addCommits(doc, commits, options) {
 
 export function addFragments(doc, fragments, options) {
   assertWritable(doc)
+  assertCurrent(doc)
   logged(doc)
   const state = Frontend.getBackendState(doc, 'addFragments')
   const inputs = readInputs(fragments, 'fragment inputs must be an array', (fragment, i) => readFragment(fragment, `bad fragment input at index ${i}: `, true))
@@ -548,10 +610,7 @@ export function addFragments(doc, fragments, options) {
     throw new RangeError(`error loading fragment bundles: ${parseErrorMessage(data, error, 'chunk')}`)
   }
   if (!patch && isolations.has(doc)) return applyBackendPatch(doc, null, newState, options || {}, 'addFragments')
-  if (!patch) {
-    diffCache.set(state.state, settledDiff(doc))
-    return doc
-  }
+  if (!patch) return progressed(doc, state)
   return applyBackendPatch(doc, patch, newState, options || {}, 'addFragments', getHeads(doc))
 }
 
@@ -589,6 +648,7 @@ export function view(doc, heads) {
 
 export function changeAt(doc, heads, options, callback) {
   assertWritable(doc)
+  assertCurrent(doc)
   if (typeof options === 'function') {
     callback = options
     options = undefined
@@ -659,7 +719,7 @@ function isolatedChange(doc, heads, options, callback, source) {
     record && record.final))
     .concat(diff(applied, newHeads, getHeads(applied)))
   const newDoc = Frontend.followPatchOrder(doc, applied, patches, isolatedViews.has(doc))
-  progress(doc, newDoc, isObject(options) && options.patchCallback || doc[OPTIONS].patchCallback, source, heads, () => patches)
+  progress(doc, newDoc, isObject(options) && options.patchCallback || doc[OPTIONS].patchCallback, source, heads, () => patches, patches)
   scopedDocs.set(doc, {heads, state: newState})
   return {newDoc, newHeads}
 }
@@ -758,7 +818,8 @@ function finishView(state, before, point) {
 }
 
 function scoped(doc) {
-  if (!isObject(doc) || doc[CHANGE] || !isolations.has(doc)) return doc
+  if (!isObject(doc) || doc[CHANGE]) return doc
+  if (!isolations.has(doc)) return current(doc)
   const [state, patch] = backend.view(Frontend.getBackendState(doc), isolations.get(doc).at(-1))
   return Frontend.applyPatch(init(), patch, state)
 }
@@ -1127,7 +1188,7 @@ export function diffPath(doc, path, before, after, options) {
   Frontend.getBackendState(doc, 'diffPath')
   path = path.slice()
   path.unshift('_root')
-  const objectId = resolveObjectPath(doc, path.join('/'))
+  const objectId = resolveObjectPath(current(doc), path.join('/'))
   let recursive
   try {
     recursive = Reflect.get(options, 'recursive') !== false
@@ -1955,14 +2016,12 @@ export function generateSyncMessage(doc, syncState) {
 
 export function receiveSyncMessage(doc, oldSyncState, message, options = {}) {
   assertWritable(doc)
+  assertCurrent(doc)
   if (isolations.has(doc) || Frontend.getBackendState(doc).state.patchActors !== null && !oldSyncState.readOnly && backend.decodeSyncMessage(message).changes.length > 0) logged(doc)
   const oldBackendState = Frontend.getBackendState(doc, 'receiveSyncMessage')
   const [backendState, syncState, patch] = backend.receiveSyncMessage(oldBackendState, oldSyncState, message)
   if (!patch && isolations.has(doc)) return [applyBackendPatch(doc, null, backendState, options, 'receiveSyncMessage'), syncState, null]
-  if (!patch) {
-    diffCache.set(oldBackendState.state, settledDiff(doc))
-    return [doc, syncState, null]
-  }
+  if (!patch) return [progressed(doc, oldBackendState), syncState, null]
   return [applyBackendPatch(doc, patch, backendState, options, 'receiveSyncMessage'), syncState, null]
 }
 

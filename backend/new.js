@@ -30,6 +30,9 @@ const MARK_STEPS = new WeakMap()
 const HEADS_CLOCKS = new Map()
 const CHANGE_TARGETS = new WeakMap()
 const LOADED_DOCUMENTS = new WeakMap()
+const PATCH_OBJECTS = new WeakMap()
+const RAW_OBJECT_IDS = new WeakMap()
+const OBJECT_IDS = new WeakMap()
 const MAX_TOUCHED_ELEMENTS = 16
 const TARGET_COLUMNS = [objActorIdx, objCtrIdx, keyActorIdx, keyCtrIdx, keyStrIdx, insertIdx, actionIdx].map(index => CHANGE_COLUMNS[index])
 const COLUMN_SLAB_OPTIONS = {slabRows: 24}
@@ -1343,6 +1346,7 @@ function readNextChangeOp(docState, changeState) {
   changeState.opCtr += 1
 
   const op = changeState.nextOp
+  if (op[actionIdx] === INC_ACTION || op[actionIdx] === SET_ACTION && (op[valLenIdx] & 0x0f) === VALUE_TYPE.COUNTER) docState.counters = true
   if ((op[objCtrIdx] === null && op[objActorIdx] !== null) ||
       (op[objCtrIdx] !== null && op[objActorIdx] === null)) {
     throw new RangeError(`Mismatched object reference: (${op[objCtrIdx]}, ${op[objActorIdx]})`)
@@ -2341,6 +2345,12 @@ function lastPropState() {
   }
 }
 
+function hasCounter(diff) {
+  if (diff.datatype === 'counter') return true
+  if (diff.props) return Object.values(diff.props).some(values => Object.values(values).some(hasCounter))
+  return !!diff.edits && diff.edits.some(edit => edit.datatype === 'counter' || !!edit.value && hasCounter(edit.value))
+}
+
 /**
  * Scans the operations in a document and generates a patch that can be sent to the frontend to
  * instantiate the current state of the document. `objectMeta` is mutated to contain information
@@ -3256,7 +3266,11 @@ function isMakeRow(row) {
 }
 
 function rowValue(ctx, row, incAfter) {
-  if (isMakeRow(row)) return ctx.valueOf({objectType: OBJECT_TYPE[ACTIONS[row[actionIdx]]]})
+  if (isMakeRow(row)) {
+    const value = ctx.valueOf({objectType: OBJECT_TYPE[ACTIONS[row[actionIdx]]]})
+    if (isObject(value)) OBJECT_IDS.set(value, opIdString(row, ctx.doc.actorIds))
+    return value
+  }
   const decoded = decodeValue(row[valLenIdx], row[valRawIdx])
   if (decoded.datatype === 'counter') decoded.value = addInt(decoded.value, incAfter)
   return ctx.valueOf(decoded)
@@ -3458,8 +3472,10 @@ function flushExposed(ctx, objectId) {
   if (type === 'text') {
     for (const span of textSpans(rows, null, ctx.after, ctx.actorRank)) {
       if (span.row) {
+        const value = ctx.valueOf({objectType: 'map'})
+        OBJECT_IDS.set(value, opIdString(span.row, ctx.doc.actorIds))
         exposeObject(ctx, opIdString(span.row, ctx.doc.actorIds))
-        insertPatch(ctx, objectId, span.index, ctx.valueOf({objectType: 'map'}), false)
+        insertPatch(ctx, objectId, span.index, value, false)
       } else {
         splicePatch(ctx, objectId, span.index, span.text, exportMarks(span.marks))
       }
@@ -3569,7 +3585,9 @@ function objectEventsInner(ctx, objectId, events) {
           ctx.pathMap.set(opIdString(span.row, ctx.doc.actorIds), {prop: span.index, parent: objectId})
         }
         if (span.diff === ADD) {
-          events.push({objectId, kind: 'insert', prop: span.index, value: ctx.valueOf({objectType: 'map'}), conflict: false, row: span.row})
+          const value = ctx.valueOf({objectType: 'map'})
+          OBJECT_IDS.set(value, opIdString(span.row, ctx.doc.actorIds))
+          events.push({objectId, kind: 'insert', prop: span.index, value, conflict: false, row: span.row})
           if (span.expose) exposeObject(ctx, opIdString(span.row, ctx.doc.actorIds))
         } else if (span.diff === DEL) {
           events.push({objectId, kind: 'del', prop: span.index, length: 1})
@@ -3696,7 +3714,13 @@ function remapActors(ctx, events, actorMap) {
   const kept = []
   for (const event of events) {
     const objectId = remappedId(event.objectId, actorMap)
-    if (objectId === null || event.row && remappedId(opIdString(event.row, ctx.doc.actorIds), actorMap) === null) continue
+    if (objectId === null) continue
+    const id = event.row && opIdString(event.row, ctx.doc.actorIds), rawId = id && remappedId(id, actorMap)
+    if (rawId === null) continue
+    if (rawId !== id && isMakeRow(event.row) && isObject(event.value)) {
+      OBJECT_IDS.set(event.value, rawId)
+      if (!ctx.doc.objectMeta[rawId]) RAW_OBJECT_IDS.set(event.value, rawId)
+    }
     kept.push(objectId === event.objectId ? event : Object.assign({}, event, {objectId}))
   }
   return kept
@@ -3842,7 +3866,11 @@ function buildPatches(ctx, events) {
     if (EVENT_PATCHES[event.kind]) EVENT_PATCHES[event.kind](ctx, event)
   }
   while (ctx.exposed.length > 0) flushExposed(ctx, ctx.exposed[0])
-  return ctx.patches.map(patch => exportPatch(ctx, patch))
+  return ctx.patches.map((patch, i) => {
+    const exported = exportPatch(ctx, patch)
+    PATCH_OBJECTS.set(exported, ctx.patchObjects[i])
+    return exported
+  })
 }
 
 class BackendDoc {
@@ -3868,6 +3896,7 @@ class BackendDoc {
     this.objectsWithMarks = new Set()
 
     this.patchActors = []
+    this.counters = false
     if (buffer) {
       const doc = decodeDocumentHeader(buffer)
       const {clock, headActors, numChanges} = readDocumentChanges(doc)
@@ -3912,6 +3941,7 @@ class BackendDoc {
       let docState = {blocks: this.blocks, actorIds: this.actorIds, objectMeta: this.objectMeta, maxOp: 0,
         objectsWithMarks: this.objectsWithMarks, loadVisibleMapOps: this.visibleMapOps}
       this.initPatch = documentPatch(docState)
+      this.counters = hasCounter(this.initPatch)
       this.blocks = docState.blocks
       this.maxOp = docState.maxOp
 
@@ -4028,6 +4058,7 @@ class BackendDoc {
     copy.queue = this.queue // immutable, no copying needed
     copy.saveCursor = this.saveCursor
     copy.patchActors = this.patchActors
+    copy.counters = this.counters
     copy.changesEncoders = this.changesEncoders &&
       this.changesEncoders.map(col => ({columnId: col.columnId, encoder: col.encoder.clone()}))
     copy.changesColumns = this.changesColumns
@@ -4138,6 +4169,7 @@ class BackendDoc {
     }
 
     this.maxOp        = docState.maxOp
+    if (docState.counters) this.counters = true
     this.actorIds     = docState.actorIds
     this.actorIndexById = docState.actorIndexById
     this.heads        = docState.heads
@@ -4630,4 +4662,4 @@ class BackendDoc {
   }
 }
 
-export { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, concatBuffers, bloomFilterContains, markEvent }
+export { MAX_BLOCK_SIZE, MAX_MAP_BLOCK_SIZE, BackendDoc, concatBuffers, bloomFilterContains, markEvent, OBJECT_IDS, PATCH_OBJECTS, RAW_OBJECT_IDS }

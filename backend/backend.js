@@ -1,6 +1,6 @@
 import { decompressChange, documentChanges, encodeChangeColumns, encodeLocalChange, splitContainers } from './columnar.js'
 import { decodeBundle, encodeBundle, encodeDocumentBundle } from './bundle.js'
-import { BackendDoc, concatBuffers, markEvent } from './new.js'
+import { BackendDoc, OBJECT_IDS, PATCH_OBJECTS, RAW_OBJECT_IDS, concatBuffers, markEvent } from './new.js'
 import { documentOps } from './fragments.js'
 import { backendState } from './util.js'
 import { PanicError } from '../src/common.js'
@@ -350,5 +350,5 @@ export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
   load, loadChanges, loadIncremental, getPatch, objectPatch, view, viewOf, getHeads, getAllChanges, getChanges,
   getChangesAdded, getChangeByHash, getLastChangeByActor, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta, isolatedActor, isolateAnchors,
-  getChangesByHash, topoHistoryTraversal, stats, diff, clockDiff, localPatches, isolatedPatches, markEvent, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
+  getChangesByHash, topoHistoryTraversal, stats, diff, clockDiff, localPatches, isolatedPatches, markEvent, OBJECT_IDS, PATCH_OBJECTS, RAW_OBJECT_IDS, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
 }

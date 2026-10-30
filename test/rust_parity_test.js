@@ -1473,4 +1473,93 @@ describe('@automerge/automerge 3.5.0 parity', () => {
       assert.deepStrictEqual(Automerge.diff(Automerge.load(Automerge.save(merged)), before, after), [])
     })
   })
+
+  describe('parity round 9', () => {
+    const rawValueError = 'unable to get property Symbol(_am_raw_value_): JsValue(TypeError: Reflect.get called on non-object'
+
+    function caught(fn) {
+      try {
+        fn()
+      } catch (error) {
+        return error
+      }
+      return undefined
+    }
+
+    function json(value) {
+      return JSON.parse(JSON.stringify(value))
+    }
+
+    function trailingCounter() {
+      const base = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.l = [0] })
+      let doc = Automerge.change(Automerge.clone(base, ACTOR_A), {time: 0}, draft => { draft.l[0] = 1 })
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l[0] = 2 })
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l[0] = 3 })
+      let other = Automerge.change(Automerge.clone(base, ACTOR_B), {time: 0}, draft => { draft.l[0] = 9; draft.l.insertAt(1, new Automerge.Counter(7)) })
+      other = Automerge.change(other, {time: 0}, draft => { draft.l.deleteAt(0) })
+      return {doc: Automerge.merge(Automerge.load(Automerge.save(doc), {actor: ACTOR_A}), other), other}
+    }
+
+    it('commits an isolated change and then throws the stale object id of a remapped object it writes into', () => {
+      const actorA = '11'.repeat(16), actorB = '22'.repeat(16)
+      let doc = Automerge.change(Automerge.init(actorA), {time: 0}, draft => { draft.l = [] })
+      const other = Automerge.change(Automerge.merge(Automerge.init(actorB), doc), {time: 0}, draft => { draft.l.push({}) })
+      doc = Automerge.merge(doc, other)
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l.deleteAt(0) })
+      const calls = []
+      doc = Automerge.load(Automerge.save(doc), {actor: actorA, patchCallback: patches => calls.push(patches)})
+      calls.length = 0
+      const before = Automerge.getHeads(doc)
+      const error = caught(() => Automerge.changeAt(doc, scope, {time: 0}, draft => { draft.l[0].k = 1 }))
+      assert.strictEqual(error, 'invalid obj id `2@13b223090111111111111111111111111111111111`')
+      assert.deepStrictEqual(calls, [])
+      assert.strictEqual(Automerge.getAllChanges(doc).length, 4)
+      assert.deepStrictEqual(Automerge.getHeads(doc), [before[0], Automerge.decodeChange(Automerge.getAllChanges(doc)[3]).hash].sort())
+      assert.deepStrictEqual(doc, {l: []})
+      assert.deepStrictEqual(Automerge.toJS(doc), {l: []})
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.n = 1 })
+      assert.deepStrictEqual(Automerge.toJS(doc), {l: [], n: 1})
+      assert.strictEqual(Automerge.getAllChanges(doc).length, 5)
+    })
+
+    it('commits a merge and then throws when its increment patch lands on a value that is not a counter', () => {
+      let {doc, other} = trailingCounter()
+      assert.deepStrictEqual(json(Automerge.toJS(doc)), {l: [3, 7]})
+      other = Automerge.change(other, {time: 0}, draft => { draft.l[0].increment(2) })
+      const before = Automerge.getHeads(doc)
+      const error = caught(() => Automerge.merge(doc, other))
+      assert.strictEqual(typeof error, 'string')
+      assert.strictEqual(error.split('\n')[0], rawValueError)
+      assert.notDeepStrictEqual(Automerge.getHeads(doc), before)
+      assert.ok(Automerge.getHeads(doc).includes(Automerge.getHeads(other)[0]))
+      assert.deepStrictEqual(json(Automerge.toJS(doc)), {l: [3, 9]})
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.x = 1 })
+      assert.deepStrictEqual(json(Automerge.toJS(doc)), {l: [3, 9], x: 1})
+    })
+
+    it('throws from a local increment whose patch lands on a value that is not a counter in the document object', () => {
+      const {doc} = trailingCounter()
+      const before = Automerge.getHeads(doc)
+      const error = caught(() => Automerge.change(doc, {time: 0}, draft => { draft.l[1].increment(1) }))
+      assert.strictEqual(error.split('\n')[0], rawValueError)
+      assert.notDeepStrictEqual(Automerge.getHeads(doc), before)
+      assert.deepStrictEqual(json(Automerge.toJS(doc)), {l: [3, 8]})
+    })
+
+    it('leaves the document outdated when applyChanges throws after committing', () => {
+      let {doc, other} = trailingCounter()
+      other = Automerge.change(other, {time: 0}, draft => { draft.l[0].increment(2) })
+      const before = Automerge.getHeads(doc)
+      const error = caught(() => Automerge.applyChanges(doc, [Automerge.getLastLocalChange(other)]))
+      assert.strictEqual(error.split('\n')[0], rawValueError)
+      assert.deepStrictEqual(Automerge.getHeads(doc), before)
+      assert.deepStrictEqual(json(Automerge.toJS(doc)), {l: [3, 7]})
+      assert.strictEqual(Automerge.getAllChanges(doc).length, 7)
+      const outdated = caught(() => Automerge.change(doc, {time: 0}, draft => { draft.x = 1 }))
+      assert.deepStrictEqual([outdated.name, outdated.message], ['RangeError', 'Attempting to change an outdated document.  Use Automerge.clone() if you wish to make a writable copy.'])
+      const outOfDate = caught(() => Automerge.merge(doc, other))
+      assert.deepStrictEqual([outOfDate.name, outOfDate.message], ['RangeError', 'Attempting to change an out of date document - set at: undefined'])
+    })
+  })
 })
