@@ -284,6 +284,7 @@ class Context {
   }
 
   setMapKeys(path, entries, hydrate = false) {
+    this.attempted = true
     const objectId = pathObjectId(path)
     const object = this.getObject(objectId)
 
@@ -320,6 +321,7 @@ class Context {
    * Updates the map object at path `path`, deleting the property `key`.
    */
   deleteMapKey(path, key) {
+    this.attempted = true
     const objectId = pathObjectId(path)
     const object = this.getObject(objectId)
 
@@ -394,6 +396,7 @@ class Context {
    * position `index` with the new value `value`.
    */
   setListIndex(path, index, value) {
+    this.attempted = true
     const objectId = pathObjectId(path)
     const list = this.getObject(objectId)
     checkNumbers(value, true)
@@ -433,6 +436,7 @@ class Context {
    * list index `start`, and inserting the list of new elements `insertions` at that position.
    */
   splice(path, start, deletions, insertions, blockOffset) {
+    this.attempted = true
     const objectId = pathObjectId(path)
     const list = this.getObject(objectId)
     for (const value of insertions) checkNumbers(value, false)
@@ -486,6 +490,7 @@ class Context {
   }
 
   deleteListIndex(path, index) {
+    this.attempted = true
     if (index >= this.getObject(pathObjectId(path)).length) throw new RangeError(`index ${index} is out of bounds`)
     this.splice(path, index, 1, [])
   }
@@ -495,6 +500,7 @@ class Context {
    * `key` in the object at path `path`.
    */
   increment(path, key, delta) {
+    this.attempted = true
     const objectId = pathObjectId(path)
     const object = this.getObject(objectId)
     if (!(object[key] instanceof Counter)) {
@@ -589,7 +595,7 @@ function storedDatatype(object, key) {
 function sameValue(a, b, datatype) {
   if (typeof a === 'number') {
     const int = datatype !== 'float64' && Number.isInteger(a)
-    if (typeof b === 'number') return a === b && int === Number.isSafeInteger(b)
+    if (typeof b === 'number') return a === b && int === Number.isInteger(b)
     if (typeof b === 'bigint') return int && a === Number(b)
     if (b instanceof Int) return int && a === b.value
     return b instanceof Float64 && !int && a === b.value

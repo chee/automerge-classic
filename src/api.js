@@ -15,6 +15,8 @@ const isolations = new WeakMap()
 const scopedDocs = new WeakMap()
 const isolatedViews = new WeakMap()
 const residues = new WeakMap()
+const transitions = new WeakMap()
+const untransacted = new WeakSet()
 const viewSources = new WeakMap()
 
 /**
@@ -93,9 +95,10 @@ function changeWithSource(doc, options, callback, source) {
   let draft
   try {
     const changed = Frontend.change(full, patchOptions(full, options, source), root => { draft = root; return callback(root) })[0]
+    if (changed !== full || draft && draft[CHANGE].attempted) Frontend.getBackendState(changed).state.patchActors = null
     return changed === full ? doc : changed
   } catch (error) {
-    if (draft && (error instanceof RangeError || error instanceof TypeError || draft[CHANGE].ops.length > 0)) Frontend.getBackendState(full).state.loaded = false
+    if (draft && attemptedOp(error, draft)) Frontend.getBackendState(full).state.patchActors = null
     throw error
   }
 }
@@ -111,21 +114,26 @@ export function emptyChange(doc, options) {
   assertWritable(doc)
   if (isolations.has(doc)) {
     const quiet = Object.assign(typeof options === 'string' ? {message: options} : Object.assign({}, options), {patchCallback: () => {}})
-    return isolatedView(doc, Frontend.emptyChange(isolatedViews.get(doc) || doc, quiet)[0])
+    const full = Frontend.emptyChange(isolatedViews.get(doc) || doc, quiet)[0], record = pendingTransition(isolations.get(doc).at(-1))
+    const state = Frontend.getBackendState(full)
+    state.state.patchActors = migrateActors(patchLogActors(Frontend.getBackendState(doc)), docActors(state), record && record.slots)
+    return isolatedView(doc, full)
   }
   doc = integrated(doc)
-  return Frontend.emptyChange(doc, patchOptions(doc, options, 'emptyChange'))[0]
+  const changed = Frontend.emptyChange(doc, patchOptions(doc, options, 'emptyChange'))[0]
+  Frontend.getBackendState(changed).state.patchActors = null
+  return changed
 }
 
 function isolatedView(doc, full, callback, source) {
   const points = isolations.get(doc), heads = points.at(-1), state = Frontend.getBackendState(full), residue = residues.get(doc)
   const key = state.source || state.state, start = residue ? residue.start : points[0], cached = diffCache.get(key)
-  function between(before, after) { return backend.diff(state, before, after, diffValue, '_root', true) }
+  function between(before, after, actorMap) { return backend.diff(state, before, after, diffValue, '_root', true, actorMap) }
   const patches = cached && cached.objectId === '_root' && cached.recursive && equals(cached.before, start) && equals(cached.after, heads)
     ? (cached.compute ? cached.compute() : between(start, heads))
     : !equals(heads, backend.getHeads(state)) ? between(start, heads)
       : (residue ? residue.patches.concat(between(residue.from, residue.to)) : [])
-        .concat(points.slice(1).flatMap((point, i) => between(points[i], point)))
+        .concat(points.slice(1).flatMap((point, i) => between(points[i], point, actorMapping(transitions.get(point), docActors(state)))))
   diffCache.set(key, {before: start, after: heads, objectId: '_root', recursive: true, compute: () => patches})
   const {clock, deps, maxOp} = full[STATE]
   const view = patches.length === 0
@@ -133,13 +141,15 @@ function isolatedView(doc, full, callback, source) {
     : Frontend.followPatchOrder(doc, Frontend.applyPatch(Frontend.init(Object.assign({}, full[OPTIONS])),
       Object.assign({}, backend.view(state, heads)[1], {clock, deps, maxOp}), state), patches, true)
   isolatedViews.set(view, full)
-  isolations.set(view, [heads])
+  isolations.set(view, [heads.slice()])
   if (callback && patches.length > 0) callback(patches, {before: doc, after: view, source})
   return view
 }
 
 export function clone(doc, options = {}) {
-  const copy = fromState(backend.clone(Frontend.getBackendState(doc, 'clone')), options)
+  const state = backend.clone(Frontend.getBackendState(doc, 'clone'))
+  state.state.patchActors = []
+  const copy = fromState(state, options)
   if (recentPatches.has(doc)) recentPatches.set(copy, recentPatches.get(doc))
   return copy
 }
@@ -251,7 +261,7 @@ function patchOptions(doc, options, source) {
 }
 
 function progress(before, after, callback, source, beforeHeads, compute, patches = null) {
-  const residue = residues.get(before), prefix = residue && residue.patches.concat(diff(before, residue.from, residue.to))
+  const residue = residues.get(before), prefix = residue && residue.patches.concat(transition(before, residue.from, residue.to))
   const recent = prefix ? () => prefix.concat(compute()) : compute
   if (prefix && patches) patches = prefix.concat(patches)
   if (callback && !patches) patches = recent()
@@ -281,7 +291,6 @@ function cachedDiff(doc, before, after, objectId, recursive) {
 
 function applyBackendPatch(doc, patch, backendState, options, source, beforeHeads) {
   if (isolations.has(doc)) {
-    backendState.state.loaded = Frontend.getBackendState(doc).state.loaded
     const base = isolatedViews.get(doc) || doc
     return isolatedView(doc, patch ? Frontend.applyPatch(base, patch, backendState) : base, options.patchCallback || doc[OPTIONS].patchCallback, source)
   }
@@ -298,8 +307,8 @@ export function applyChanges(doc, changes, options = {}) {
 }
 
 function logged(doc) {
-  const state = Frontend.getBackendState(doc).state
-  if (state.loaded && !isolations.has(doc)) state.loaded = false
+  const state = Frontend.getBackendState(doc)
+  state.state.patchActors = isolations.has(doc) ? patchLogActors(state) : null
 }
 
 function applyChangesWithSource(doc, changes, options, source, beforeHeads) {
@@ -580,7 +589,11 @@ function isolatedChange(doc, heads, options, callback, source) {
   }
   const state = Frontend.getBackendState(doc, source), current = backend.getHeads(state)
   const points = (isolations.get(doc) || [current]).slice(), moved = !equals(points.at(-1), heads)
-  if (moved) points.push(heads)
+  if (moved) {
+    if (points.length > 1) finishView(state, points.at(-2), points.at(-1))
+    points.push(heads.slice())
+    transitions.set(points.at(-1), {actors: docActors(state), slots: state.state.actorIds.map((actor, index) => index)})
+  }
   const isolated = backend.isolatedActor(state, Frontend.getActorId(doc), heads)
   const [scoped, scopePatch] = backend.view(state, heads)
   scoped.state = backend.clone(state).state
@@ -600,32 +613,130 @@ function isolatedChange(doc, heads, options, callback, source) {
   try {
     changed = Frontend.change(branch, branchOptions, root => { draft = root; return callback(root) })[0]
   } catch (error) {
+    if (attemptedOp(error, draft)) discardTransaction(state, points.at(-1), isolated)
     isolations.set(doc, points)
-    if (error instanceof RangeError || error instanceof TypeError || draft && draft[CHANGE].ops.length > 0) state.state.loaded = false
     throw error
   }
   if (changed === branch) {
+    if (draft && draft[CHANGE].attempted) discardTransaction(state, points.at(-1), isolated)
     if (moved) {
+      finishView(state, points.at(-2), points.at(-1))
       isolations.delete(doc)
       isolations.delete(isolatedViews.get(doc))
-      const residue = residues.get(doc), pending = residue ? residue.patches.concat(diff(doc, residue.from, residue.to)) : []
-      residues.set(doc, {patches: pending.concat(points.slice(1).flatMap((point, i) => diff(doc, points[i], point))), from: heads, to: current, start: residue ? residue.start : points[0]})
+      const residue = residues.get(doc), pending = residue ? residue.patches.concat(transition(doc, residue.from, residue.to)) : []
+      residues.set(doc, {patches: pending.concat(points.slice(1).flatMap((point, i) => transition(doc, points[i], point))), from: heads, to: current, start: residue ? residue.start : points[0]})
     }
     return {newDoc: doc, newHeads: null}
   }
   const change = decodeChange(getLastLocalChange(changed), true)
   const ops = Frontend.getBackendState(changed, source).state.anchorSource.ops
   const bytes = encodeChangeRaw(Object.assign(change, {seq: isolated.seq, deps: heads.slice().sort(), ops}))
-  const loaded = backend.isLoaded(state), [newState, patch] = backend.applyChanges(state, [bytes])
+  const record = pendingTransition(points.at(-1))
+  if (record) migrateActors(patchLogActors(state), withActor(docActors(state), isolated.actor), record.slots)
+  const [newState, patch] = backend.applyChanges(state, [bytes])
+  newState.state.patchActors = null
+  if (record) record.final = actorMapping(record, docActors(newState))
   const applied = Frontend.applyPatch(isolatedViews.get(doc) || doc, patch, newState), newHeads = [decodeChange(bytes, true).hash]
-  const prior = points.slice(1, -1).flatMap((point, i) => diff(doc, points[i], point))
+  const prior = points.slice(1, -1).flatMap((point, i) => transition(doc, points[i], point))
   const patches = prior.concat(backend.isolatedPatches(newState, points.at(-2) || heads, heads, newHeads, bytes, isolated.actor, branchEvents, diffValue,
-    loaded && prior.length === 0 && !residues.has(doc)))
+    record && record.final))
     .concat(diff(applied, newHeads, getHeads(applied)))
   const newDoc = Frontend.followPatchOrder(doc, applied, patches, isolatedViews.has(doc))
   progress(doc, newDoc, isObject(options) && options.patchCallback || doc[OPTIONS].patchCallback, source, heads, () => patches)
   scopedDocs.set(doc, {heads, state: newState})
   return {newDoc, newHeads}
+}
+
+function reading(fn) {
+  return (...args) => {
+    try {
+      return fn(...args)
+    } catch (error) {
+      throw beforeTransaction(error)
+    }
+  }
+}
+
+function beforeTransaction(error) {
+  if (isObject(error)) untransacted.add(error)
+  return error
+}
+
+function attemptedOp(error, draft) {
+  return (error instanceof RangeError || error instanceof TypeError) && !untransacted.has(error) || !!draft && !!draft[CHANGE].attempted
+}
+
+function transition(doc, before, after) {
+  const state = Frontend.getBackendState(doc)
+  return backend.diff(state, before, after, diffValue, '_root', true, actorMapping(transitions.get(after), docActors(state)))
+}
+
+function docActors(state) {
+  return (state.source || state.state).actorIds.slice().sort()
+}
+
+function patchLogActors(state) {
+  return state.state.patchActors === null ? docActors(state) : state.state.patchActors
+}
+
+function withActor(actors, actor) {
+  return actors.includes(actor) ? actors : actors.concat(actor).sort()
+}
+
+function migrateActors(actors, target, slots) {
+  if (actors.length === 0) return target.slice()
+  const result = actors.slice()
+  for (let i = 0; i < target.length; i++) {
+    if (result[i] === target[i]) continue
+    if (result[i] === undefined) {
+      result.push(target[i])
+    } else if (target[i] < result[i]) {
+      result.splice(i, 0, target[i])
+      if (slots) slots.forEach((slot, j) => { if (slot >= i) slots[j] = slot + 1 })
+    } else {
+      break
+    }
+  }
+  return result
+}
+
+function removeActor(actors, actor, slots) {
+  const index = actors.indexOf(actor)
+  if (index < 0) return actors
+  if (slots) slots.forEach((slot, j) => { slots[j] = slot === index ? -1 : slot > index ? slot - 1 : slot })
+  return actors.filter(id => id !== actor)
+}
+
+function discardTransaction(state, point, isolated) {
+  const record = pendingTransition(point), slots = record && record.slots
+  const actors = migrateActors(patchLogActors(state), withActor(docActors(state), isolated.actor), slots)
+  state.state.patchActors = isolated.seq === 1 ? removeActor(actors, isolated.actor, slots) : actors
+}
+
+function pendingTransition(point) {
+  const record = transitions.get(point)
+  return record && record.final === undefined ? record : null
+}
+
+function actorMapping(record, actors) {
+  if (!record) return null
+  if (record.final !== undefined) return record.final
+  const mapping = new Map()
+  record.actors.forEach((actor, j) => {
+    const mapped = record.slots[j] < 0 ? null : actors[record.slots[j]] || null
+    if (mapped !== actor) mapping.set(actor, mapped)
+  })
+  return mapping.size > 0 ? mapping : null
+}
+
+function finishView(state, before, point) {
+  const record = pendingTransition(point)
+  if (!record) return
+  const actors = docActors(state)
+  if (backend.diff(state, before, point, diffValue, '_root', true, actorMapping(record, actors)).length > 0) {
+    state.state.patchActors = migrateActors(patchLogActors(state), actors, record.slots)
+  }
+  record.final = actorMapping(record, actors)
 }
 
 function scoped(doc) {
@@ -637,7 +748,7 @@ function scoped(doc) {
 function materialized(doc) {
   const source = viewSources.get(doc) || doc
   residues.delete(source)
-  if (isolations.has(source)) isolations.set(source, [isolations.get(source).at(-1)])
+  if (isolations.has(source)) isolations.set(source, [isolations.get(source).at(-1).slice()])
 }
 
 export function toJS(value) {
@@ -732,9 +843,9 @@ function objectType(value) {
 }
 
 function resolvePath(doc, path, prefix) {
-  if (!Array.isArray(path)) throw new TypeError('path.unshift is not a function')
+  if (!Array.isArray(path)) throw beforeTransaction(new TypeError('path.unshift is not a function'))
   const objectId = Frontend.getObjectId(doc)
-  if (!objectId) throw new RangeError(`invalid object for ${prefix}`)
+  if (!objectId) throw beforeTransaction(new RangeError(`invalid object for ${prefix}`))
   const full = [objectId].concat(path).join('/')
   const parts = full.split('/').slice(1)
   let parent = null, key = null, value = doc
@@ -745,7 +856,7 @@ function resolvePath(doc, path, prefix) {
     if (type === 'map') {
       if (hasKey(value, prop)) next = valueAt(value, prop)
     } else if (!/^\+?[0-9]+$/.test(prop)) {
-      throw new RangeError(`${prefix}invalid path ${full}: path component ${i} (${prop}) should be an integer to index a sequence`)
+      throw beforeTransaction(new RangeError(`${prefix}invalid path ${full}: path component ${i} (${prop}) should be an integer to index a sequence`))
     } else if (type === 'list') {
       const index = parseInt(prop, 10)
       if (index < value.length) next = valueAt(value, index)
@@ -753,11 +864,11 @@ function resolvePath(doc, path, prefix) {
       next = value.get(textCursorIndex(value, parseInt(prop, 10)))
     }
     if (next === undefined) {
-      throw new RangeError(`${prefix}invalid path ${full}: path component ${i} (${prop}) referenced a nonexistent object`)
+      throw beforeTransaction(new RangeError(`${prefix}invalid path ${full}: path component ${i} (${prop}) referenced a nonexistent object`))
     }
     if (!(next instanceof Frontend.Text) && !Frontend.getObjectId(next) &&
         !(typeof next === 'string' && type !== 'text' && i === parts.length - 1)) {
-      throw new RangeError(`${prefix}invalid path ${full}: path did not refer to an object`)
+      throw beforeTransaction(new RangeError(`${prefix}invalid path ${full}: path did not refer to an object`))
     }
     parent = value
     key = type === 'map' ? prop : parseInt(prop, 10)
@@ -871,10 +982,11 @@ function textEdits(text, newText) {
 }
 
 export function updateText(doc, path, newText) {
-  if (typeof newText !== 'string') throw new TypeError('updateText() text must be a string')
+  if (typeof newText !== 'string') throw beforeTransaction(new TypeError('updateText() text must be a string'))
   newText = wellFormedString(newText)
   const text = resolvePath(doc, path, 'Cannot updateText: RangeError: invalid object ID: ').value
-  if (!(text instanceof Frontend.Text)) throw new RangeError('Cannot updateText: RangeError: object was not a text object')
+  if (!(text instanceof Frontend.Text)) throw beforeTransaction(new RangeError('Cannot updateText: RangeError: object was not a text object'))
+  if (doc[CHANGE]) doc[CHANGE].attempted = true
   for (const edit of textEdits(text, newText)) splice(doc, path, edit.index, edit.del, edit.text)
 }
 
@@ -1085,7 +1197,7 @@ function cursorTarget(doc, path, name) {
   return target.value
 }
 
-export function getCursor(doc, path, position, move = 'after') {
+export const getCursor = reading(function getCursor(doc, path, position, move = 'after') {
   doc = scoped(doc)
   const value = cursorTarget(doc, path, 'getCursor')
   const length = textLength(value)
@@ -1097,7 +1209,7 @@ export function getCursor(doc, path, position, move = 'after') {
   if (elementIndex === value.length) return 'e'
   const elemId = value.getElemId(elementIndex)
   return move === 'before' ? `-${elemId}` : elemId
-}
+})
 
 function updateCursorPosition(before, after, position, move) {
   let prefix = 0
@@ -1114,7 +1226,7 @@ function updateCursorPosition(before, after, position, move) {
 
 const cursorOffsets = new WeakMap()
 
-export function getCursorPosition(doc, path, cursor) {
+export const getCursorPosition = reading(function getCursorPosition(doc, path, cursor) {
   doc = scoped(doc)
   const value = cursorTarget(doc, path, 'getCursorPosition')
   if (cursor === 's') return 0
@@ -1149,7 +1261,7 @@ export function getCursorPosition(doc, path, cursor) {
   }
   const after = [...value.toString()]
   return Math.min(updateCursorPosition(before, after, position, match[1]), length)
-}
+})
 
 export function mark(doc, path, range, name, value) {
   markText(doc, path, range, name, value, 'mark')
@@ -1296,7 +1408,9 @@ function markRangesForText(doc, text, clock) {
       total + (op.values ? op.values.length : (op.multiOp || 1)), 0)
     const ops = text.context.ops.map(op => Object.assign({}, op))
     const startOp = text.context.nextOpNum - size
-    ;(state.source || state.state).adjustInsertAnchors({ops, startOp, actor: text.context.actorId})
+    const anchors = state.state.anchorSource
+    if (anchors) anchors.doc.adjustInsertAnchors({ops, startOp, actor: text.context.actorId}, anchors.clock)
+    else (state.source || state.state).adjustInsertAnchors({ops, startOp, actor: text.context.actorId})
     scanOps(ops, text.context.actorId, startOp)
   }
 
@@ -1423,22 +1537,22 @@ function markRangesFromValues(values, text) {
   return ranges
 }
 
-export function marks(doc, path) {
+export const marks = reading(function marks(doc, path) {
   doc = scoped(doc)
   const state = markRanges(doc, path, 'Cannot call marks(): invalid object ID: ')
   if (!state) return []
   return markRangesFromValues(state.values, state.text).map(range => Object.assign({}, range))
-}
+})
 
-export function marksAt(doc, path, index) {
+export const marksAt = reading(function marksAt(doc, path, index) {
   doc = scoped(doc)
   const state = markRanges(doc, path, 'Cannot call marksAt(): invalid object ID: ')
   if (!state) return {}
   if (!Number.isInteger(index) || index < 0) throw new RangeError('marksAt() index is invalid')
   return index < state.text.length ? Object.assign({}, state.values[index]) : {}
-}
+})
 
-export function spans(doc, path) {
+export const spans = reading(function spans(doc, path) {
   doc = scoped(doc)
   const state = markRanges(doc, path, 'Cannot splice: RangeError: invalid object id: ')
   if (!state) return objectSpans(resolvePath(doc, path, '').value)
@@ -1465,7 +1579,7 @@ export function spans(doc, path) {
   }
   flush()
   return result
-}
+})
 
 function objectSpans(object) {
   const result = []
@@ -1531,7 +1645,8 @@ function richTextTarget(doc, path, index, name, convert) {
   }
   if (name === 'block' && target.type === 'list') return {element: seqIndex(index) < text.length ? valueAt(text, seqIndex(index)) : null}
   if (!(text instanceof Frontend.Text)) {
-    throw new RangeError(prefix + (name === 'updateSpans' ? 'object was not a text object' : `invalid op for object of type \`${target.type}\``))
+    const error = new RangeError(prefix + (name === 'updateSpans' ? 'object was not a text object' : `invalid op for object of type \`${target.type}\``))
+    throw name === 'updateSpans' ? beforeTransaction(error) : error
   }
   if (typeof index === 'string') {
     if (!/^-?[0-9]+@[0-9a-zA-Z]+$|^[se]$/.test(index)) throw new RangeError('index must be a number or cursor')
@@ -1545,7 +1660,7 @@ function richTextTarget(doc, path, index, name, convert) {
   return {text, offset, index: name === 'splitBlock' ? textElementIndex(text, offset) : textCursorIndex(text, offset)}
 }
 
-export function block(doc, path, index) {
+export const block = reading(function block(doc, path, index) {
   doc = scoped(doc)
   const target = richTextTarget(doc, path, index, 'block', false)
   if (!target) return null
@@ -1553,7 +1668,7 @@ export function block(doc, path, index) {
   if (!isRecord(value)) return null
   const context = doc[CHANGE], source = context && isolatedSources.get(context.cache), objectId = Frontend.getObjectId(value)
   return source ? toJS(currentObject(source, context, objectId).block) : toJS(value)
-}
+})
 
 function currentObject(source, context, objectId) {
   let state = backend.clone(Frontend.getBackendState(source.doc, 'block'))
@@ -1629,8 +1744,9 @@ function updateRecord(current, value) {
 }
 
 export function updateSpans(doc, path, newSpans, config = {}) {
-  if (!Array.isArray(newSpans)) throw new TypeError('updateSpans() spans must be an array')
+  if (!Array.isArray(newSpans)) throw beforeTransaction(new TypeError('updateSpans() spans must be an array'))
   const target = richTextTarget(doc, path, 0, 'updateSpans', true)
+  if (doc[CHANGE]) doc[CHANGE].attempted = true
   // Mirror the Rust implementation: the current and new content become
   // sequences of graphemes and block markers, a Myers diff (with merged
   // delete+insert runs) updates the text and block structure, and a second
@@ -1817,7 +1933,7 @@ export function generateSyncMessage(doc, syncState) {
 
 export function receiveSyncMessage(doc, oldSyncState, message, options = {}) {
   assertWritable(doc)
-  if (Frontend.getBackendState(doc).state.loaded && !oldSyncState.readOnly && backend.decodeSyncMessage(message).changes.length > 0) logged(doc)
+  if (isolations.has(doc) || Frontend.getBackendState(doc).state.patchActors !== null && !oldSyncState.readOnly && backend.decodeSyncMessage(message).changes.length > 0) logged(doc)
   const oldBackendState = Frontend.getBackendState(doc, 'receiveSyncMessage')
   const [backendState, syncState, patch] = backend.receiveSyncMessage(oldBackendState, oldSyncState, message)
   if (!patch && isolations.has(doc)) return [applyBackendPatch(doc, null, backendState, options, 'receiveSyncMessage'), syncState, null]

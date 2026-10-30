@@ -1,5 +1,5 @@
 import { PanicError, addInt, compareUtf8, copyObject, parseOpId, wellFormedString } from '../src/common.js'
-import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, changeColumnReaders, decodeChangeColumns, decodeChangeMeta, decodeDocumentHeader, decodeValue, decoderByColumnId, documentChanges, documentRows, encodeDocumentHeader, encoderByColumnId, makeDecoders, readNext } from './columnar.js'
+import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, changeColumnReaders, decodeChangeColumns, decodeChangeMeta, decodeDocumentHeader, decodeValue, decoderByColumnId, decompressChange, documentChanges, documentRows, encodeDocumentHeader, encoderByColumnId, makeDecoders, readNext } from './columnar.js'
 import * as ColumnData from './column_data.js'
 import { Decoder, Encoder } from './encoding.js'
 const MAX_BLOCK_SIZE = 300 // operations
@@ -880,8 +880,8 @@ function resumeColumn(encoder, {state, literalLength}, buffer) {
     if (key !== 'buf' && key !== 'offset' && key !== 'literal' && key !== 'count' && encoder[key] !== state[key]) return null
   }
   if (encoder.state === 'nulls' && (encoder.offset === 0) !== (state.offset === 0)) return null
-  const tail = buffer.subarray(state.offset)
-  if (tail.byteLength === 0) return encoder.offset === 0 && state.offset === 0 ? {bytes: tail, headerShift: 0, count: 0} : null
+  const tail = buffer.subarray(state.offset), count = encoder.count === undefined ? 0 : encoder.count - state.count
+  if (tail.byteLength === 0) return encoder.offset === 0 && state.offset === 0 ? {bytes: tail, headerShift: 0, count} : null
   if (encoder.state === 'literal' || encoder.state === 'loneValue') {
     if (encoder.state === 'literal') {
       if (encoder.literal.length !== literalLength) return null
@@ -889,7 +889,6 @@ function resumeColumn(encoder, {state, literalLength}, buffer) {
     }
     return {bytes: tail, headerShift: 0, count: 0}
   }
-  const count = encoder.count === undefined ? 0 : encoder.count - state.count
   if (count === 0) return {bytes: tail, headerShift: 0, count}
   const decoder = new Decoder(tail), header = new Encoder()
   if (encoder.state === 'nulls') {
@@ -3570,7 +3569,7 @@ function objectEventsInner(ctx, objectId, events) {
           ctx.pathMap.set(opIdString(span.row, ctx.doc.actorIds), {prop: span.index, parent: objectId})
         }
         if (span.diff === ADD) {
-          events.push({objectId, kind: 'insert', prop: span.index, value: ctx.valueOf({objectType: 'map'}), conflict: false})
+          events.push({objectId, kind: 'insert', prop: span.index, value: ctx.valueOf({objectType: 'map'}), conflict: false, row: span.row})
           if (span.expose) exposeObject(ctx, opIdString(span.row, ctx.doc.actorIds))
         } else if (span.diff === DEL) {
           events.push({objectId, kind: 'del', prop: span.index, length: 1})
@@ -3603,9 +3602,9 @@ function objectEventsInner(ctx, objectId, events) {
     } else if (item.diff === ADD) {
       const value = rowValue(ctx, item.row, item.incAfter)
       if (item.expose && isMakeRow(item.row)) exposeObject(ctx, opIdString(item.row, ctx.doc.actorIds))
-      events.push({objectId, kind: isList && !item.update ? 'insert' : 'put', prop: item.prop, value, conflict: item.conflict})
+      events.push({objectId, kind: isList && !item.update ? 'insert' : 'put', prop: item.prop, value, conflict: item.conflict, row: item.row})
     } else if (item.diff === SAME) {
-      if (item.inc !== 0) events.push({objectId, kind: 'inc', prop: item.prop, value: item.inc})
+      if (item.inc !== 0) events.push({objectId, kind: 'inc', prop: item.prop, value: item.inc, row: item.row})
       else if (item.conflict) events.push({objectId, kind: 'conflict', prop: item.prop})
     } else if (isList) {
       events.push({objectId, kind: 'del', prop: item.prop, length: 1})
@@ -3672,7 +3671,7 @@ function diffContext(doc, beforeClock, afterClock, objectIds, valueOf, start, ba
   }
 }
 
-function documentDiff(doc, beforeClock, afterClock, objectIds, valueOf, start, recursive, batch) {
+function documentDiff(doc, beforeClock, afterClock, objectIds, valueOf, start, recursive, batch, actorMap) {
   const ctx = diffContext(doc, beforeClock, afterClock, objectIds, valueOf, start, batch)
   const events = []
   for (const objectId of [...objectIds.keys()].sort(compareObjectIds)) {
@@ -3680,7 +3679,26 @@ function documentDiff(doc, beforeClock, afterClock, objectIds, valueOf, start, r
       objectEvents(ctx, objectId, events)
     }
   }
-  return buildPatches(ctx, events)
+  return buildPatches(ctx, actorMap ? remapActors(ctx, events, actorMap) : events)
+}
+
+function remappedId(id, actorMap) {
+  if (id === '_root') return id
+  const {counter, actorId} = parseOpId(id)
+  if (!actorMap.has(actorId)) return id
+  const actor = actorMap.get(actorId)
+  return actor === null ? null : `${counter}@${actor}`
+}
+
+function remapActors(ctx, events, actorMap) {
+  ctx.exposed = ctx.exposed.map(id => remappedId(id, actorMap)).filter(id => id !== null).sort(compareObjectIds)
+  const kept = []
+  for (const event of events) {
+    const objectId = remappedId(event.objectId, actorMap)
+    if (objectId === null || event.row && remappedId(opIdString(event.row, ctx.doc.actorIds), actorMap) === null) continue
+    kept.push(objectId === event.objectId ? event : Object.assign({}, event, {objectId}))
+  }
+  return kept
 }
 
 function spliceMarks(ctx, event, actor) {
@@ -3796,22 +3814,13 @@ function eventPatches(doc, ctx, events, actor, valueOf) {
   return buildPatches(ctx, sorted)
 }
 
-function staleObjectId(objectId, actors, stale) {
-  if (objectId === '_root') return objectId
-  const {counter, actorId} = parseOpId(objectId)
-  return `${counter}@${actors[stale.indexOf(actorId)]}`
-}
-
-function isolatedPatches(doc, current, scope, after, touched, change, actor, events, valueOf, loaded) {
-  const isolation = diffContext(doc, current, scope, touched, valueOf, '_root', false), diffEvents = []
+function isolatedPatches(doc, current, scope, after, touched, change, actor, events, valueOf, actorMap) {
+  const isolation = diffContext(doc, current, scope, touched, valueOf, '_root', false)
+  let diffEvents = []
   for (const objectId of [...touched.keys()].sort(compareObjectIds)) {
     if (reachable(isolation, objectId)) objectEvents(isolation, objectId, diffEvents)
   }
-  if (loaded && decodeChangeMeta(change).seq === 1) {
-    const actors = doc.actorIds.slice().sort(), stale = actors.filter(actorId => actorId !== doc.actorIds[actor])
-    for (const event of diffEvents) event.objectId = staleObjectId(event.objectId, actors, stale)
-    isolation.exposed = isolation.exposed.map(objectId => staleObjectId(objectId, actors, stale)).sort(compareObjectIds)
-  }
+  if (actorMap) diffEvents = remapActors(isolation, diffEvents, actorMap)
   const changed = new Map()
   changeObjects(decodeTargets(change), changed, doc.actorIndexById)
   const local = diffContext(doc, scope, after, changed, valueOf, '_root', false)
@@ -3857,8 +3866,8 @@ class BackendDoc {
     this.cursorIndex = new Map()
     this.objectsWithMarks = new Set()
 
+    this.patchActors = []
     if (buffer) {
-      this.loaded = true
       const doc = decodeDocumentHeader(buffer)
       const {clock, headActors, numChanges} = readDocumentChanges(doc)
       this.binaryDoc = buffer
@@ -4017,7 +4026,7 @@ class BackendDoc {
     copy.anchorSource = this.anchorSource
     copy.queue = this.queue // immutable, no copying needed
     copy.saveCursor = this.saveCursor
-    copy.loaded = this.loaded
+    copy.patchActors = this.patchActors
     copy.changesEncoders = this.changesEncoders &&
       this.changesEncoders.map(col => ({columnId: col.columnId, encoder: col.encoder.clone()}))
     copy.changesColumns = this.changesColumns
@@ -4043,8 +4052,8 @@ class BackendDoc {
 
     // decoded change has the form { actor, seq, startOp, time, message, deps, actorIds, hash, columns, buffer }
     return this.applyDecodedChanges(changeBuffers.map(buffer => {
-      const decoded = decodeChangeColumns(buffer)
-      decoded.buffer = buffer
+      const raw = decompressChange(buffer), decoded = decodeChangeColumns(raw)
+      decoded.buffer = raw
       return decoded
     }), isLocal, inOrder)
   }
@@ -4142,7 +4151,6 @@ class BackendDoc {
     this.queue        = queue
     this.binaryDoc    = null
     this.initPatch    = null
-    this.loaded       = false
     if (objectIds.size > 0) {
       this.cursorIndex = new Map(this.cursorIndex)
       for (const objectId of objectIds) this.cursorIndex.delete(objectId)
@@ -4470,10 +4478,10 @@ class BackendDoc {
     return clock
   }
 
-  diff(beforeHeads, afterHeads, valueOf, objectId = '_root', recursive = true) {
+  diff(beforeHeads, afterHeads, valueOf, objectId = '_root', recursive = true, actorMap = null) {
     if (!this.haveHashGraph) this.computeHashGraph()
     const before = this.headsClock(beforeHeads), after = this.headsClock(afterHeads)
-    return documentDiff(this, this.opClock(before), this.opClock(after), this.touchedObjects(before, after, changeTargets), valueOf, objectId, recursive, false)
+    return documentDiff(this, this.opClock(before), this.opClock(after), this.touchedObjects(before, after, changeTargets), valueOf, objectId, recursive, false, actorMap)
   }
 
   touchedObjects(before, after, targetsOf) {
@@ -4500,11 +4508,11 @@ class BackendDoc {
     return localPatches(this, change, this.actorIndexById.get(actorId), startOp, clock, events, valueOf)
   }
 
-  isolatedPatches(currentHeads, scopeHeads, newHeads, change, actorId, events, valueOf, loaded) {
+  isolatedPatches(currentHeads, scopeHeads, newHeads, change, actorId, events, valueOf, actorMap) {
     if (!this.haveHashGraph) this.computeHashGraph()
     const current = this.headsClock(currentHeads), scope = this.headsClock(scopeHeads)
     return isolatedPatches(this, this.opClock(current), this.opClock(scope), this.opClock(this.headsClock(newHeads)),
-      this.touchedObjects(current, scope, changeTargets), change, this.actorIndexById.get(actorId), events, valueOf, loaded)
+      this.touchedObjects(current, scope, changeTargets), change, this.actorIndexById.get(actorId), events, valueOf, actorMap)
   }
 
   sequenceInserts(objectId, clock) {

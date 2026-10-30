@@ -1,5 +1,5 @@
 import { encodeDocumentBundle } from './bundle.js'
-import { DOC_OPS_COLUMNS, decodeColumns, decodeDocumentHeader, decodeOps } from './columnar.js'
+import { DOC_OPS_COLUMNS, compressChange, decodeColumns, decodeDocumentHeader, decodeOps } from './columnar.js'
 import { backendState } from './util.js'
 
 const graphs = new WeakMap()
@@ -157,7 +157,7 @@ function bundleFragments(backend, fragments) {
   for (const fragment of fragments) {
     if (fragmentLevel(fragment.head) === 0 && fragment.members.length === 1) {
       const index = state.changeIndexByHash[fragment.head]
-      if (index !== undefined) bundles.push(state.changes[index])
+      if (index !== undefined) bundles.push(compressChange(state.changes[index]))
     } else if (fragment.members.every(hash => state.changeIndexByHash[hash] !== undefined)) {
       const indexes = fragment.members.map(hash => state.changeIndexByHash[hash]).sort((a, b) => a - b)
       ops = ops || documentOps(state)

@@ -2,7 +2,7 @@
 import assert from 'node:assert'
 import Automerge from '../src/automerge.js'
 import * as Backend from '../backend/index.js'
-import { decodeChange, encodeChange } from '../backend/columnar.js'
+import { compressChange, decodeChange, encodeChange } from '../backend/columnar.js'
 import uuid from '../src/uuid.js'
 function hash(change) {
   return decodeChange(encodeChange(change)).hash
@@ -898,7 +898,7 @@ describe('Automerge.Backend', () => {
       }])
     })
 
-    it('should compress changes with DEFLATE', () => {
+    it('should return uncompressed changes and accept DEFLATE-compressed ones', () => {
       let longString = ''
       for (let i = 0; i < 1024; i++) longString += 'a'
       const change1 = {actor: '111111', seq: 1, time: 0, startOp: 1, deps: [], ops: [
@@ -906,8 +906,10 @@ describe('Automerge.Backend', () => {
       ]}
       const [s1, patch1] = Backend.applyLocalChange(Backend.init(), change1)
       const changes = Backend.getAllChanges(s1)
-      const [s2, patch2] = Backend.applyChanges(Backend.init(), changes)
-      assert.ok(changes[0].byteLength < 100)
+      const compressed = compressChange(changes[0])
+      const [s2, patch2] = Backend.applyChanges(Backend.init(), [compressed])
+      assert.ok(changes[0].byteLength > 1024 && compressed.byteLength < 100)
+      assert.deepStrictEqual(Backend.getAllChanges(s2), changes)
       assert.deepStrictEqual(patch2, {
         clock: {'111111': 1}, deps: [hash(change1)], maxOp: 1, pendingChanges: 0,
         diffs: {objectId: '_root', type: 'map', props: {

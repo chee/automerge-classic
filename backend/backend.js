@@ -164,7 +164,7 @@ function loadIncremental(backend, data) {
   if (changes.length > 0) patch = applyRemoteChanges(state, changes)
   if (replaced) {
     patch = state.getPatch()
-    state.loaded = true
+    state.patchActors = []
   }
   // Nothing was applied, so the caller's document is still current and must
   // not be frozen: a sync message that carries only changes we already have
@@ -325,8 +325,8 @@ function stats(backend) {
   return backendState(backend, true).stats()
 }
 
-function diff(backend, beforeHeads, afterHeads, valueOf, objectId, recursive) {
-  return (backend.source || backendState(backend, true)).diff(beforeHeads, afterHeads, valueOf, objectId, recursive)
+function diff(backend, beforeHeads, afterHeads, valueOf, objectId, recursive, actorMap) {
+  return (backend.source || backendState(backend, true)).diff(beforeHeads, afterHeads, valueOf, objectId, recursive, actorMap)
 }
 
 function clockDiff(backend, before, after, valueOf, batch) {
@@ -337,12 +337,8 @@ function localPatches(backend, change, actorId, startOp, clock, events, valueOf)
   return backendState(backend, true).localPatches(change, actorId, startOp, clock, events, valueOf)
 }
 
-function isolatedPatches(backend, currentHeads, scopeHeads, newHeads, change, actorId, events, valueOf, loaded) {
-  return backendState(backend, true).isolatedPatches(currentHeads, scopeHeads, newHeads, change, actorId, events, valueOf, loaded)
-}
-
-function isLoaded(backend) {
-  return !!backendState(backend, true).loaded
+function isolatedPatches(backend, currentHeads, scopeHeads, newHeads, change, actorId, events, valueOf, actorMap) {
+  return backendState(backend, true).isolatedPatches(currentHeads, scopeHeads, newHeads, change, actorId, events, valueOf, actorMap)
 }
 
 function saveBundleByHash(backend, hashes) {
@@ -354,5 +350,5 @@ export {
   init, clone, free, applyChanges, applyLocalChange, save, saveIncremental, saveSince,
   load, loadChanges, loadIncremental, getPatch, objectPatch, view, viewOf, getHeads, getAllChanges, getChanges,
   getChangesAdded, getChangeByHash, getLastChangeByActor, getMissingDeps, hasHeads, getCursorPosition, getChangesMeta, isolatedActor, isolateAnchors,
-  getChangesByHash, topoHistoryTraversal, stats, diff, clockDiff, localPatches, isolatedPatches, isLoaded, markEvent, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
+  getChangesByHash, topoHistoryTraversal, stats, diff, clockDiff, localPatches, isolatedPatches, markEvent, encodeBundle as saveBundle, saveBundleByHash, decodeBundle as readBundle
 }

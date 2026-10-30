@@ -822,7 +822,7 @@ function encodeChangeContainer(change, actorIds, extraBytes, opColumns) {
   if (extraBytes && extraBytes.byteLength > 0) decoded.extraBytes = extraBytes
   decoded.columns = columns
   decoded.hash = bytesToHexString(hash)
-  decoded.buffer = (bytes.byteLength > DEFLATE_MIN_SIZE) ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, data => deflate(data, {len: 0, cap: 0}).output) : bytes
+  decoded.buffer = bytes
   return decoded
 }
 
@@ -915,6 +915,10 @@ function recodeChange(buffer, chunkType, transform) {
 
 function decompressChange(buffer) {
   return buffer[8] === CHUNK_TYPE_DEFLATE ? recodeChange(buffer, CHUNK_TYPE_CHANGE, inflateRaw) : buffer
+}
+
+function compressChange(buffer) {
+  return buffer.byteLength > DEFLATE_MIN_SIZE ? recodeChange(buffer, CHUNK_TYPE_DEFLATE, data => deflate(data, {len: 0, cap: 0}).output) : buffer
 }
 
 /**
@@ -1499,7 +1503,7 @@ function documentChanges(buffer, rows, header = decodeDocumentHeader(buffer)) {
     headSet.add(hex)
     result.push({
       actor: actorIds[actorNum], seq: change.seq, deps, hash: hex, numOps: maxOp - startOp + 1,
-      bytes: bytes.byteLength > DEFLATE_MIN_SIZE ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, data => deflate(data, {len: 0, cap: 0}).output) : bytes
+      bytes
     })
   }
 
@@ -1847,7 +1851,7 @@ function encodeLocalChange(change) {
   return {
     actor: change.actor, seq: change.seq, startOp: change.startOp, time: change.time, message, deps, actorIds, columns,
     hash: bytesToHexString(chunk.hash),
-    buffer: bytes.byteLength > DEFLATE_MIN_SIZE ? recodeChange(bytes, CHUNK_TYPE_DEFLATE, data => deflate(data, {len: 0, cap: 0}).output) : bytes
+    buffer: bytes
   }
 }
 
@@ -1879,6 +1883,6 @@ export {
   COLUMN_TYPE, VALUE_TYPE, ACTIONS, OBJECT_TYPE, DOC_OPS_COLUMNS, CHANGE_COLUMNS, DOCUMENT_COLUMNS,
   encoderByColumnId, decoderByColumnId, makeDecoders, decodeValue, decodeColumns, decodeOps, encodeOp,
   encodeColumnInfo, decodeColumnInfo, encodeContainer, decodeContainerHeader, deflateColumn, inflateColumn,
-  splitContainers, decompressChange, encodeChange, encodeChangeColumns, encodeLocalChange, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
+  splitContainers, compressChange, decompressChange, encodeChange, encodeChangeColumns, encodeLocalChange, decodeChangeColumns, decodeChange, decodeChangeMeta, decodeChanges,
   encodeDocumentHeader, decodeDocumentHeader, documentChanges, documentRows, columnReader, readNext, changeColumnReaders, NO_SUCC, NO_BYTES
 }
