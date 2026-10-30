@@ -1427,4 +1427,50 @@ describe('@automerge/automerge 3.5.0 parity', () => {
       assert.deepStrictEqual(calls, [[{action: 'mark', path: ['t'], marks: [{name: 'link', value: null, start: 2, end: 3}]}]])
     })
   })
+
+  describe('parity round 8', () => {
+    it('drops the last element width before trailing inserts when a merged delete of an incoming update outranks the document ops', () => {
+      const base = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.l = [0] })
+      let doc = Automerge.change(Automerge.clone(base, ACTOR_A), {time: 0}, draft => { draft.l[0] = 1 })
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l[0] = 2 })
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l[0] = 3 })
+      let other = Automerge.change(Automerge.clone(base, ACTOR_B), {time: 0}, draft => { draft.l[0] = 9; draft.l.insertAt(1, 7) })
+      other = Automerge.change(other, {time: 0}, draft => { draft.l.deleteAt(0) })
+      const calls = []
+      const loaded = Automerge.load(Automerge.save(doc), {patchCallback: patches => calls.push(patches)})
+      calls.length = 0
+      const merged = Automerge.merge(loaded, other)
+      assert.deepStrictEqual(calls, [[{action: 'insert', path: ['l', 0], values: [7]}]])
+      assert.deepStrictEqual(merged.l, [3, 7])
+    })
+
+    it('panics like wasm when a stale patch log entry points past the actor table', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.l = []; draft.t = 'x' })
+      const first = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { Automerge.splice(draft, ['t'], 1, 0, 'yz') })
+      const second = Automerge.getHeads(doc)
+      const other = Automerge.change(Automerge.merge(Automerge.init('11'.repeat(16)), doc), {time: 0}, draft => { draft.l.push(5) })
+      let loaded = Automerge.load(Automerge.save(doc), {actor: ACTOR_A, patchCallback: () => {}})
+      assert.strictEqual(thrown(() => Automerge.changeAt(loaded, first, {time: 0}, draft => { draft.l.push(1); throw new Error('boom') })), 'Error: boom')
+      loaded = Automerge.merge(loaded, other)
+      let error
+      try { Automerge.changeAt(loaded, second, {time: 0}, draft => { draft.l.push(2) }) } catch (e) { error = e }
+      assert.deepStrictEqual([error.name, error.message], ['PanicError', 'index out of bounds: the len is 2 but the index is 2'])
+    })
+
+    it('keeps the most recent patches across a merge that produces none', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.text = ''; draft.l = [{t: 'x'}] })
+      let other = Automerge.merge(Automerge.init(ACTOR_B), doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l.deleteAt(0); Automerge.splice(draft, ['text'], 0, 0, 'x') })
+      const before = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { Automerge.unmark(draft, ['text'], {start: 0, end: 1, expand: 'both'}, 'link') })
+      const after = Automerge.getHeads(doc)
+      other = Automerge.change(other, {time: 0}, draft => { draft.l[0].c = 1 })
+      const merged = Automerge.merge(doc, other)
+      Automerge.diff(merged, [], before)
+      const unmarked = [{action: 'mark', path: ['text'], marks: [{name: 'link', value: null, start: 0, end: 1}]}]
+      assert.deepStrictEqual(Automerge.diff(merged, before, after), unmarked)
+      assert.deepStrictEqual(Automerge.diff(Automerge.load(Automerge.save(merged)), before, after), [])
+    })
+  })
 })

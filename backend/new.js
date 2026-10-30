@@ -1,4 +1,4 @@
-import { PanicError, addInt, compareUtf8, copyObject, parseOpId, wellFormedString } from '../src/common.js'
+import { PanicError, addInt, compareUtf8, copyObject, isObject, parseOpId, wellFormedString } from '../src/common.js'
 import { ACTIONS, CHANGE_COLUMNS, COLUMN_TYPE, DOCUMENT_COLUMNS, DOC_OPS_COLUMNS, OBJECT_TYPE, VALUE_TYPE, changeColumnReaders, decodeChangeColumns, decodeChangeMeta, decodeDocumentHeader, decodeValue, decoderByColumnId, decompressChange, documentChanges, documentRows, encodeDocumentHeader, encoderByColumnId, makeDecoders, readNext } from './columnar.js'
 import * as ColumnData from './column_data.js'
 import { Decoder, Encoder } from './encoding.js'
@@ -3511,13 +3511,13 @@ function trailingInsertShift(ctx, rows, type, events, first) {
   let maxDoc = null, update = null
   for (const row of group) {
     const id = [row[idCtrIdx], row[idActorIdx]]
+    for (let i = 0; i < row[succNumIdx]; i++) {
+      const succ = [row[succCtrIdx][i], row[succActorIdx][i]]
+      if (!ids.has(`${succ[0]}@${succ[1]}`) && ctx.after && succ[0] <= ctx.after[succ[1]] && !(ctx.before && succ[0] <= ctx.before[succ[1]]) &&
+          (!update || compare(succ, update.id) > 0)) update = {id: succ, visible: false}
+    }
     if (covers(ctx.before, row)) {
       if (!maxDoc || compare(id, maxDoc) > 0) maxDoc = id
-      for (let i = 0; i < row[succNumIdx]; i++) {
-        const succ = [row[succCtrIdx][i], row[succActorIdx][i]]
-        if (!ids.has(`${succ[0]}@${succ[1]}`) && ctx.after && succ[0] <= ctx.after[succ[1]] && !(ctx.before && succ[0] <= ctx.before[succ[1]]) &&
-            (!update || compare(succ, update.id) > 0)) update = {id: succ, visible: false}
-      }
     } else if (covers(ctx.after, row) && (!update || compare(id, update.id) > 0)) {
       update = {id, visible: row[actionIdx] !== INC_ACTION && visibleAt(row, ctx.after, null)}
     }
@@ -3687,6 +3687,7 @@ function remappedId(id, actorMap) {
   const {counter, actorId} = parseOpId(id)
   if (!actorMap.has(actorId)) return id
   const actor = actorMap.get(actorId)
+  if (isObject(actor)) throw new PanicError(`index out of bounds: the len is ${actor.len} but the index is ${actor.index}`)
   return actor === null ? null : `${counter}@${actor}`
 }
 

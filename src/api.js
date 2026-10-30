@@ -260,7 +260,7 @@ function patchOptions(doc, options, source) {
   return normalized
 }
 
-function progress(before, after, callback, source, beforeHeads, compute, patches = null) {
+function progress(before, after, callback, source, beforeHeads, compute, patches = null, prior = null) {
   const residue = residues.get(before), prefix = residue && residue.patches.concat(transition(before, residue.from, residue.to))
   const recent = prefix ? () => prefix.concat(compute()) : compute
   if (prefix && patches) patches = prefix.concat(patches)
@@ -271,9 +271,26 @@ function progress(before, after, callback, source, beforeHeads, compute, patches
   const changed = patches ? patches.length > 0 : !equals(getHeads(before), heads)
   if (!changed) {
     if (recentPatches.has(before)) recentPatches.set(after, recentPatches.get(before))
+  } else if (!patches && matchable(prior)) {
+    const depth = prior.prior ? prior.depth + 1 : 1, fallback = depth > 16 ? settledRecent(prior) : prior
+    recentPatches.set(after, {before: beforeHeads, after: heads, patches, compute: recent, prior: matchable(fallback) ? fallback : null, depth: fallback === prior ? depth : 1})
   } else if (beforeHeads) {
     recentPatches.set(after, {before: beforeHeads, after: heads, patches, compute: recent})
   }
+}
+
+function matchable(recent) {
+  if (!recent) return false
+  if (!recent.patches) return !!(recent.before || recent.prior)
+  return recent.patches.length > 0 ? !!recent.before : matchable(recent.prior)
+}
+
+function settledRecent(recent) {
+  if (!recent) return null
+  if (!recent.patches) recent.patches = recent.compute()
+  if (recent.patches.length === 0) return settledRecent(recent.prior)
+  recent.prior = null
+  return recent
 }
 
 function settledDiff(doc) {
@@ -298,7 +315,7 @@ function applyBackendPatch(doc, patch, backendState, options, source, beforeHead
   const newDoc = Frontend.applyPatch(doc, patch, backendState)
   const before = doc[STATE].clock, after = newDoc[STATE].clock, batch = getHeads(doc).length > 0
   progress(doc, newDoc, options.patchCallback || doc[OPTIONS].patchCallback, source, beforeHeads,
-    () => backend.clockDiff(backendState, before, after, diffValue, batch))
+    () => backend.clockDiff(backendState, before, after, diffValue, batch), null, recentPatches.get(doc))
   return newDoc
 }
 
@@ -723,7 +740,8 @@ function actorMapping(record, actors) {
   if (record.final !== undefined) return record.final
   const mapping = new Map()
   record.actors.forEach((actor, j) => {
-    const mapped = record.slots[j] < 0 ? null : actors[record.slots[j]] || null
+    const slot = record.slots[j]
+    const mapped = slot < 0 ? null : slot < actors.length ? actors[slot] : {len: actors.length, index: slot}
     if (mapped !== actor) mapping.set(actor, mapped)
   })
   return mapping.size > 0 ? mapping : null
@@ -1053,10 +1071,14 @@ function isRecord(value) {
 export function diff(doc, beforeHeads, afterHeads) {
   if (!Array.isArray(beforeHeads)) throw new TypeError('diff() before must be an array of heads')
   if (!Array.isArray(afterHeads)) throw new TypeError('diff() after must be an array of heads')
-  const recent = recentPatches.get(doc)
-  if (recent && equals(recent.before, beforeHeads) && equals(recent.after, afterHeads)) {
+  for (let recent = recentPatches.get(doc); recent; recent = recent.prior) {
+    const matches = !!recent.before && equals(recent.before, beforeHeads) && equals(recent.after, afterHeads)
+    if (!matches && !recent.prior) break
     if (!recent.patches) recent.patches = recent.compute()
-    if (recent.patches.length > 0) return recent.patches
+    if (recent.patches.length > 0) {
+      if (matches) return recent.patches
+      break
+    }
   }
   if (!hasHeads(doc, beforeHeads) || !hasHeads(doc, afterHeads)) return []
   return cachedDiff(doc, beforeHeads, afterHeads, '_root', true)
