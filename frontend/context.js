@@ -284,6 +284,7 @@ class Context {
   }
 
   setMapKeys(path, entries, hydrate = false) {
+    for (const [, value] of entries) checkNumbers(value, !hydrate)
     this.attempted = true
     const objectId = pathObjectId(path)
     const object = this.getObject(objectId)
@@ -301,7 +302,6 @@ class Context {
     if (changed.length === 0) return
     this.applyAtPath(path, subpatch => {
       this.hydrating = hydrate
-      if (hydrate) for (const [, value] of changed) checkNumbers(value, false)
       for (const [key, value, action] of changed) {
         const pred = getPred(object, key)
         if (action === 'resolve') {
@@ -396,10 +396,10 @@ class Context {
    * position `index` with the new value `value`.
    */
   setListIndex(path, index, value) {
+    checkNumbers(value, true)
     this.attempted = true
     const objectId = pathObjectId(path)
     const list = this.getObject(objectId)
-    checkNumbers(value, true)
 
     if (index > list.length) throw new RangeError(`index ${index} is out of bounds`)
     if (index === list.length) {
@@ -436,10 +436,10 @@ class Context {
    * list index `start`, and inserting the list of new elements `insertions` at that position.
    */
   splice(path, start, deletions, insertions, blockOffset) {
+    for (const value of insertions) checkNumbers(value, false)
     this.attempted = true
     const objectId = pathObjectId(path)
     const list = this.getObject(objectId)
-    for (const value of insertions) checkNumbers(value, false)
     if (deletions < 0) {
       if (start + deletions < 0) throw new RangeError(`index ${start} is out of bounds`)
       start += deletions

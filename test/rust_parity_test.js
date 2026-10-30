@@ -1739,4 +1739,101 @@ describe('@automerge/automerge 3.5.0 parity', () => {
       assert.strictEqual(fail(() => Automerge.change(result.newDoc, {time: 0}, draft => { draft.q = 1 })), 'PanicError: index out of bounds: the len is 3 but the index is 3')
     })
   })
+
+  describe('parity round 11', () => {
+    function fail(fn) {
+      try {
+        fn()
+      } catch (error) {
+        return `${error.name}: ${error.message}`
+      }
+    }
+
+    it('throws out of bounds from updateSpans when a partly deleted grapheme leaves a character where the block was', () => {
+      function block(type) { return {type, parents: [], attrs: {}} }
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.text = '👨‍😀👩' })
+      doc = Automerge.change(doc, {time: 0}, draft => Automerge.splitBlock(draft, ['text'], 7, block('li')))
+      assert.strictEqual(fail(() => Automerge.change(doc, {time: 0}, draft => {
+        Automerge.updateSpans(draft, ['text'], [{type: 'text', value: 'a‍😀👩'}, {type: 'block', value: block('paragraph')}])
+      })), 'RangeError: Cannot updateSpans: RangeError: index 6 is out of bounds')
+      assert.deepStrictEqual(Automerge.spans(doc, ['text']), [{type: 'text', value: '👨‍😀👩'}, {type: 'block', value: block('li')}])
+    })
+
+    it('builds the sync bloom filter from the sequence clock of the shared heads', () => {
+      let a = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.x = 1 })
+      const first = Automerge.getHeads(a)
+      a = Automerge.emptyChange(a, {time: 0})
+      const second = Automerge.getHeads(a)
+      a = Automerge.changeAt(a, first, {time: 0}, draft => { draft.z = 1 }).newDoc
+      let b = Automerge.load(Automerge.save(a), ACTOR_B)
+      a = Automerge.changeAt(a, second, {time: 0}, draft => { draft.y = 1 }).newDoc
+      b = Automerge.changeAt(b, second, {time: 0}, draft => { draft.w = 1 }).newDoc
+      let sa = Automerge.initSyncState(), sb = Automerge.initSyncState(), message
+      const sent = []
+      for (let round = 0; round < 4; round++) {
+        [sb, message] = Automerge.generateSyncMessage(b, sb)
+        if (message) {
+          sent.push(Automerge.decodeSyncMessage(message).have.map(have => [have.lastSync.length, have.bloom.length]))
+          ;[a, sa] = Automerge.receiveSyncMessage(a, sa, message)
+        }
+        [sa, message] = Automerge.generateSyncMessage(a, sa)
+        if (message) {
+          sent.push(Automerge.decodeSyncMessage(message).have.map(have => [have.lastSync.length, have.bloom.length]))
+          ;[b, sb] = Automerge.receiveSyncMessage(b, sb, message)
+        }
+      }
+      assert.deepStrictEqual(sent, [[[0, 8]], [[1, 5]], [[2, 5]], [[3, 0]]])
+      assert.deepStrictEqual(Automerge.toJS(b), {w: 1, x: 1, y: 1, z: 1})
+    })
+
+    it('does not open a transaction for a value that fails to import, so the stale patch log does not panic later', () => {
+      const actorA = '11'.repeat(16), actorB = '22'.repeat(16)
+      let a = Automerge.change(Automerge.init(actorA), {time: 0}, draft => { draft.x = 1; draft.l = [1] })
+      const base = Automerge.getHeads(a)
+      let b = Automerge.merge(Automerge.init(actorB), a)
+      b = Automerge.change(b, {time: 0}, draft => { draft.k = 0 })
+      const second = Automerge.getHeads(b)
+      a = Automerge.load(Automerge.save(Automerge.merge(a, b)), actorA)
+      b = Automerge.changeAt(b, base, {time: 0}, draft => { draft.x = true }).newDoc
+      assert.throws(() => Automerge.changeAt(a, base, {time: 0}, () => { throw new Error('boom') }), /boom/)
+      assert.strictEqual(fail(() => Automerge.change(a, {time: 0}, draft => { draft.y = -(2n ** 63n) - 1n })),
+        'RangeError: bignum -9223372036854775809 smaller than min -9223372036854775808')
+      assert.strictEqual(fail(() => Automerge.change(a, {time: 0}, draft => { draft.l[0] = 2n ** 64n })),
+        'RangeError: bignum 18446744073709551616 larger than max 18446744073709551615')
+      a = Automerge.loadIncremental(a, Automerge.save(b))
+      let result
+      assert.strictEqual(fail(() => { result = Automerge.changeAt(a, second, {time: 0}, draft => { draft.z = 0 }) }), undefined)
+      assert.deepStrictEqual(Automerge.toJS(result.newDoc), {k: 0, l: [1], x: true, z: 0})
+    })
+
+    it('drops an isolation event read against the stale actor table after a counter fails to import in a thrown changeAt', () => {
+      const actorA = '11'.repeat(16), actorB = '22'.repeat(16)
+      let a = Automerge.change(Automerge.init(actorA), {time: 0}, draft => { draft.list = []; draft.t = 'x' })
+      let b = Automerge.merge(Automerge.init(actorB), a)
+      b = Automerge.change(b, {time: 0}, draft => { draft.list.push({value: 10.25}) })
+      const scope = Automerge.getHeads(b)
+      b = Automerge.change(b, {time: 0}, draft => Automerge.splice(draft, ['t'], 1, 0, 'y'))
+      a = Automerge.change(a, {time: 0}, draft => { draft.c = new Automerge.Counter(3) })
+      const own = Automerge.getHeads(a)
+      a = Automerge.merge(a, b)
+      b = Automerge.change(b, {time: 0}, draft => { draft.probe = 'z' })
+      const patches = []
+      a = Automerge.load(Automerge.save(a), {actor: actorA, patchCallback: p => patches.push(p)})
+      assert.strictEqual(fail(() => Automerge.changeAt(a, own, {time: 0}, draft => { draft.c = new Automerge.Counter(2n ** 64n - 1n) })),
+        'RangeError: bignum 18446744073709551615 larger than max 9223372036854775807')
+      a = Automerge.loadIncremental(a, Automerge.save(b))
+      patches.length = 0
+      a = Automerge.changeAt(a, scope, {time: 0}, draft => Automerge.splice(draft, ['t'], 0, 0, 'h')).newDoc
+      assert.deepStrictEqual(patches, [[
+        {action: 'del', path: ['c']},
+        {action: 'insert', path: ['list', 0], values: [{}]},
+        {action: 'splice', path: ['t', 0], value: 'h'},
+        {action: 'put', path: ['c'], value: new Automerge.Counter(3)},
+        {action: 'put', path: ['probe'], value: ''},
+        {action: 'splice', path: ['t', 2], value: 'y'},
+        {action: 'splice', path: ['probe', 0], value: 'z'}
+      ]])
+      assert.deepStrictEqual(Automerge.toJS(a), {c: new Automerge.Counter(3), list: [{value: 10.25}], probe: 'z', t: 'hxy'})
+    })
+  })
 })

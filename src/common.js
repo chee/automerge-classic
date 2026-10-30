@@ -105,9 +105,16 @@ function truncateInt(value) {
   return safeInt(BigInt(Math.trunc(value)))
 }
 
+const untransacted = new WeakSet()
+
+function beforeTransaction(error) {
+  if (isObject(error)) untransacted.add(error)
+  return error
+}
+
 function importBigInt(value, max, nested) {
-  if (value > max) throw new RangeError(nested ? 'invalid value' : `bignum ${value} larger than max ${max}`)
-  if (value < I64_MIN) throw new RangeError(nested ? 'invalid value' : `bignum ${value} smaller than min ${I64_MIN}`)
+  if (value > max) throw beforeTransaction(new RangeError(nested ? 'invalid value' : `bignum ${value} larger than max ${max}`))
+  if (value < I64_MIN) throw beforeTransaction(new RangeError(nested ? 'invalid value' : `bignum ${value} smaller than min ${I64_MIN}`))
   return value > I64_MAX ? value : safeInt(value)
 }
 
@@ -116,5 +123,5 @@ Object.defineProperty(PanicError.prototype, 'name', {value: 'PanicError'})
 
 export {
   isObject, copyObject, parseOpId, equalBytes, createArrayOfNulls, compareUtf8, wellFormedString, PanicError,
-  I64_MAX, U64_MAX, safeInt, exportInt, addInt, truncateInt, importBigInt
+  I64_MAX, U64_MAX, safeInt, exportInt, addInt, truncateInt, importBigInt, untransacted, beforeTransaction
 }

@@ -245,8 +245,17 @@ function decodeSyncState(bytes) {
  * message.
  */
 function makeBloomFilter(doc, lastSync) {
-  const hashes = doc.changeIndexesSince(lastSync).map(index => doc.historyHashes[index])
+  const hashes = hashesSince(doc, lastSync)
   return {lastSync, bloom: new BloomFilter(hashes).bytes}
+}
+
+function hashesSince(doc, lastSync) {
+  const since = new Set(doc.changeIndexesSince(lastSync).map(index => doc.historyHashes[index]))
+  const indexes = []
+  for (const hashes of Object.values(doc.hashesByActor)) {
+    for (let seq = hashes.length - 1; seq >= 0 && since.has(hashes[seq]); seq--) indexes.push(doc.changeIndexByHash[hashes[seq]])
+  }
+  return indexes.sort((a, b) => a - b).map(index => doc.historyHashes[index])
 }
 
 function hasChange(doc, hash) {
@@ -286,7 +295,7 @@ function getHashesToSend(doc, have, need, theirHeads) {
   }
 
   // Get all changes that were added since the last sync
-  const hashes = doc.changeIndexesSince([...lastSyncHashes]).map(index => doc.historyHashes[index])
+  const hashes = hashesSince(doc, [...lastSyncHashes])
 
   let dependents = new Map(), hashesToSend = new Set()
   for (let hash of hashes) {

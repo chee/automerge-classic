@@ -1,7 +1,7 @@
 import * as Frontend from '../frontend/index.js'
 import { CACHE, CHANGE, OPTIONS, STATE } from '../frontend/constants.js'
 import { decodeChange, decodeChangeColumns, decodeChangeMeta, encodeChange as encodeChangeRaw } from '../backend/columnar.js'
-import { PanicError, compareUtf8, exportInt, isObject, parseOpId, wellFormedString } from './common.js'
+import { PanicError, beforeTransaction, compareUtf8, exportInt, isObject, parseOpId, untransacted, wellFormedString } from './common.js'
 import { ImmutableString, isImmutableString } from './immutable_string.js'
 import { graphemes, myersDiff, replaceHook } from './text_diff.js'
 import { instantiateText, textOffset } from '../frontend/text.js'
@@ -17,7 +17,6 @@ const scopedDocs = new WeakMap()
 const isolatedViews = new WeakMap()
 const residues = new WeakMap()
 const transitions = new WeakMap()
-const untransacted = new WeakSet()
 const viewSources = new WeakMap()
 const shadows = new WeakMap()
 const visibles = new WeakMap()
@@ -739,11 +738,6 @@ function reading(fn) {
       throw beforeTransaction(error)
     }
   }
-}
-
-function beforeTransaction(error) {
-  if (isObject(error)) untransacted.add(error)
-  return error
 }
 
 function attemptedOp(error, draft) {
@@ -1915,9 +1909,9 @@ export function updateSpans(doc, path, newSpans, config = {}) {
   }
   function blockAt(index) {
     const scoped = richTextTarget(doc, path, index, 'updateSpans', false)
-    if (!source) return scoped.text.get(scoped.index)
-    const live = current().text, element = textCursorIndex(live, index), item = element < live.length ? live.get(element) : undefined
+    const live = source ? current().text : scoped.text, element = textCursorIndex(live, index), item = element < live.length ? live.get(element) : undefined
     if (!isObject(item)) throw new RangeError(`Cannot updateSpans: RangeError: index ${index} is out of bounds`)
+    if (!source) return item
     const id = Frontend.getObjectId(item)
     for (let i = 0; i < scoped.text.length; i++) {
       const own = scoped.text.get(i)
