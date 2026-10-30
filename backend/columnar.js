@@ -1437,14 +1437,18 @@ function writerFinish(writer) {
   }
 }
 
+function decodedChanges(buffer) {
+  return decodeDocument(buffer).map(change => ({
+    actor: change.actor, seq: change.seq, deps: change.deps, hash: change.hash,
+    numOps: change.ops.length, bytes: encodeChange(change)
+  }))
+}
+
 function documentChanges(buffer, rows, header = decodeDocumentHeader(buffer)) {
   const { changesColumns, opsColumns, actorIds, heads } = header
   if (!changesColumns.every(column => DOCUMENT_COLUMNS.some(spec => spec.columnId === column.columnId)) ||
       !opsColumns.every(column => DOC_OPS_COLUMNS.some(spec => spec.columnId === column.columnId))) {
-    return decodeDocument(buffer).map(change => ({
-      actor: change.actor, seq: change.seq, deps: change.deps, hash: change.hash,
-      numOps: change.ops.length, bytes: encodeChange(change)
-    }))
+    return decodedChanges(buffer)
   }
 
   const [actorR, seqR, maxOpR, timeR, messageR, depsNumR, depsIndexR, extraLenR, extraRawR] =
@@ -1475,6 +1479,7 @@ function documentChanges(buffer, rows, header = decodeDocumentHeader(buffer)) {
   }
   const ops = opIndex(rows || documentRows(makeDecoders(opsColumns, DOC_OPS_COLUMNS).map(column => column.decoder.buf)),
     actorIds, changesByActor)
+  if (!ops) return decodedChanges(buffer)
   const encoder = changeEncoder(actorIds), lastMaxOp = new Array(actorIds.length).fill(0)
   const hashes = [], hashBytes = new Map(), headSet = new Set(), result = []
   for (let i = 0; i < changes.length; i++) {
@@ -1533,7 +1538,7 @@ function opIndex(rows, actorIds, changesByActor) {
   const ops = {rows, actorIds, rowAt: [], predAt: [], predRow: [0], predNext: [0]}
   for (let actor = 0; actor < actorIds.length; actor++) {
     const actorChanges = changesByActor[actor], size = actorChanges ? actorChanges[actorChanges.length - 1].maxOp + 1 : 1
-    if (size > maxCounter + 1) throw new RangeError(`Operation ID ${size - 1}@${actorIds[actor]} outside of allowed range`)
+    if (size > maxCounter + 1) return null
     ops.rowAt.push(new Int32Array(size))
     ops.predAt.push(new Int32Array(size))
   }

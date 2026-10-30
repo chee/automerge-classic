@@ -3292,31 +3292,33 @@ function updatePathMap(ctx, parent) {
   }
 }
 
+function rootEntry(doc, objectId, key) {
+  const values = doc.visibleMapOps.get(JSON.stringify([null, null, key]))
+  if (!values) return undefined
+  let top = null
+  for (const value of values) {
+    const at = value.indexOf('@'), id = `${value.slice(0, at)}@${doc.actorIds[value.slice(at + 1)]}`
+    if (top === null || compareObjectIds(id, top) > 0) top = id
+  }
+  return top === objectId ? {prop: key, parent: '_root'} : null
+}
+
 function parentEntry(ctx, objectId) {
   const entry = ctx.pathMap.get(objectId)
   if (entry) return entry
   const meta = ctx.doc.objectMeta[objectId]
   if (!meta || ctx.seen.has(objectId)) return null
-  const skipped = skippedEntry(ctx, meta.parentObj, objectId)
+  const skipped = ctx.skipped.has(meta.parentObj) && skippedEntry(ctx, meta.parentObj, objectId)
   if (skipped) {
     ctx.pathMap.set(objectId, skipped)
     return skipped
   }
-  if (meta.parentObj === '_root' && ctx.after.every(counter => counter >= ctx.doc.maxOp)) {
-    const values = ctx.doc.visibleMapOps.get(JSON.stringify([null, null, meta.parentKey]))
-    if (values) {
-      let top = null
-      for (const value of values) {
-        const at = value.indexOf('@'), id = {counter: Number(value.slice(0, at)), actorId: ctx.doc.actorIds[Number(value.slice(at + 1))]}
-        if (!top || id.counter > top.counter || id.counter === top.counter && id.actorId > top.actorId) top = id
-      }
-      ctx.seen.add(objectId)
-      if (!top || `${top.counter}@${top.actorId}` !== objectId) return null
-      ctx.pathMap.set(objectId, {prop: meta.parentKey, parent: meta.parentObj})
-      return ctx.pathMap.get(objectId)
-    }
-  }
+  const root = meta.parentObj === '_root' && ctx.after.every(counter => counter >= ctx.doc.maxOp) ? rootEntry(ctx.doc, objectId, meta.parentKey) : undefined
   ctx.seen.add(objectId)
+  if (root !== undefined) {
+    if (root) ctx.pathMap.set(objectId, root)
+    return root
+  }
   updatePathMap(ctx, meta.parentObj)
   return ctx.pathMap.get(objectId) || null
 }
@@ -3324,7 +3326,7 @@ function parentEntry(ctx, objectId) {
 function patchPath(ctx, objectId) {
   const path = []
   while (objectId !== '_root') {
-    const entry = parentEntry(ctx, objectId)
+    const entry = ctx.pathMap.get(objectId) || parentEntry(ctx, objectId)
     if (!entry) return null
     path.push(entry.prop)
     objectId = entry.parent
@@ -3545,7 +3547,8 @@ function objectEvents(ctx, objectId, events) {
   const first = events.length
   objectEventsInner(ctx, objectId, events)
   if (ctx.batch && objectType(ctx, objectId) !== 'map' && events.slice(first).some(event => event.kind === 'insert' || event.kind === 'splice')) {
-    trailingInsertShift(ctx, diffRows(ctx, objectId, true), objectType(ctx, objectId), events, first)
+    const rows = diffRows(ctx, objectId, true)
+    trailingInsertShift(ctx, rows.truncated ? diffRows(ctx, objectId, false) : rows, objectType(ctx, objectId), events, first)
   }
 }
 
@@ -3636,15 +3639,19 @@ function exportPatch(ctx, patch) {
     if (patch.conflicts.some(Boolean)) result.conflicts = patch.conflicts
     return result
   }
-  if (patch.action === 'splice') {
-    const result = {action: 'splice', path: patch.path, value: wellFormedString(patch.value)}
-    if (patch.marks) result.marks = Object.fromEntries(patch.marks.map(([name, value]) => [name, ctx.valueOf(value, true)]))
-    return result
-  }
-  if (patch.action === 'del' && patch.length !== undefined) {
-    return patch.length > 1 ? {action: 'del', path: patch.path, length: patch.length} : {action: 'del', path: patch.path}
-  }
+  if (patch.action === 'splice') return exportSplice(ctx, patch.path, patch.value, patch.marks)
+  if (patch.action === 'del' && patch.length !== undefined) return exportDel(patch.path, patch.length)
   return patch
+}
+
+function exportSplice(ctx, path, value, marks) {
+  const result = {action: 'splice', path, value: wellFormedString(value)}
+  if (marks) result.marks = Object.fromEntries(marks.map(([name, value]) => [name, ctx.valueOf(value, true)]))
+  return result
+}
+
+function exportDel(path, length) {
+  return length > 1 ? {action: 'del', path, length} : {action: 'del', path}
 }
 
 function descendsFrom(objectMeta, objectId, ancestor) {
@@ -3743,8 +3750,13 @@ function machineMark(machine, row, actorRank) {
   if (name === null) markEnd(machine, id); else markBegin(machine, id, name, decodeValue(row[valLenIdx], row[valRawIdx]))
 }
 
-function localPatches(doc, change, actor, startOp, afterClock, events, valueOf) {
-  const beforeClock = afterClock.slice(), objects = new Set(events.map(event => event.objectId)), parents = new Set(), objectIds = new Map()
+function rootObject(doc, objectId) {
+  const meta = doc.objectMeta[objectId]
+  return meta && meta.parentObj === '_root' && rootEntry(doc, objectId, meta.parentKey)
+}
+
+function localContext(doc, change, actor, startOp, afterClock, objects, valueOf) {
+  const beforeClock = afterClock.slice(), parents = new Set(), objectIds = new Map()
   beforeClock[actor] = startOp - 1
   for (const objectId of objects) {
     let meta = doc.objectMeta[objectId]
@@ -3758,6 +3770,24 @@ function localPatches(doc, change, actor, startOp, afterClock, events, valueOf) 
   const ctx = diffContext(doc, beforeClock, afterClock, objectIds, valueOf, '_root', false)
   for (const objectId of touchedParents) objectEvents(ctx, objectId, [])
   ctx.exposed = []
+  return ctx
+}
+
+function localPatches(doc, change, actor, startOp, clock, events, valueOf) {
+  const objects = new Set(events.map(event => event.objectId)), pathMap = new Map(), event = events[0]
+  for (const objectId of objects) if (objectId !== '_root') pathMap.set(objectId, rootObject(doc, objectId))
+  const lean = objects.has('_root') ? objects.size === 1 : [...pathMap.values()].every(Boolean)
+  const ctx = lean && ![...objects].some(objectId => doc.objectsWithMarks.has(objectId))
+    ? {valueOf, pathMap, patches: [], patchObjects: [], lastMarks: null, exposed: []}
+    : localContext(doc, change, actor, startOp, doc.opClock(clock), objects, valueOf)
+  if (lean && events.length === 1 && (event.kind === 'splice' || event.kind === 'del')) {
+    const path = [pathMap.get(event.objectId).prop, event.prop]
+    return [event.kind === 'splice' ? exportSplice(ctx, path, event.text, doc.objectsWithMarks.has(event.objectId) ? spliceMarks(ctx, event, actor) : null) : exportDel(path, event.length)]
+  }
+  return eventPatches(doc, ctx, events, actor, valueOf)
+}
+
+function eventPatches(doc, ctx, events, actor, valueOf) {
   const sorted = events.slice().sort((left, right) => compareObjectIds(left.objectId, right.objectId)).map(event => {
     if (event.kind === 'put' || event.kind === 'insert') return Object.assign({}, event, {value: valueOf(event.value), conflict: false})
     if (event.kind === 'splice') return {objectId: event.objectId, kind: 'splice', prop: event.prop, text: event.text, marks: doc.objectsWithMarks.has(event.objectId) ? spliceMarks(ctx, event, actor) : null}
@@ -4467,7 +4497,7 @@ class BackendDoc {
   }
 
   localPatches(change, actorId, startOp, clock, events, valueOf) {
-    return localPatches(this, change, this.actorIndexById.get(actorId), startOp, this.opClock(clock), events, valueOf)
+    return localPatches(this, change, this.actorIndexById.get(actorId), startOp, clock, events, valueOf)
   }
 
   isolatedPatches(currentHeads, scopeHeads, newHeads, change, actorId, events, valueOf, loaded) {
