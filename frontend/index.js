@@ -189,7 +189,7 @@ function rebuildNode(object, node, updated) {
   if (!node || !isObject(object) || object[OBJECT_ID] === undefined || Array.isArray(object) !== (node.items !== undefined)) return object
   const objectId = object[OBJECT_ID]
   let copy = null
-  const children = node.items !== undefined ? (node.items || []).map((child, index) => [index, child]) : Object.entries(node.children)
+  const children = node.items !== undefined ? Array.from(node.items || [], (child, index) => [index, child]) : Object.entries(node.children)
   for (const [key, child] of children) {
     const value = rebuildNode(object[key], child, updated)
     if (value === object[key]) continue

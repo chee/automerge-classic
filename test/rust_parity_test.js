@@ -1194,4 +1194,102 @@ describe('@automerge/automerge 3.5.0 parity', () => {
       assert.deepStrictEqual([Object.keys(a.m), Object.keys(Automerge.toJS(a).m), calls], [['l', 'ключ', 'z'], ['l', 'z', 'ключ'], [['change', [{action: 'del', path: ['m', 'l', 0]}]]]])
     })
   })
+
+  describe('parity round 6', () => {
+    function fail(fn) {
+      try {
+        fn()
+      } catch (error) {
+        return `${error.name}: ${error.message}`
+      }
+    }
+
+    function boom(doc, heads, callback = () => {}) {
+      return fail(() => Automerge.changeAt(doc, heads, {time: 0}, draft => { callback(draft); throw new Error('boom') }))
+    }
+
+    function recorder() {
+      const calls = []
+      return {calls, patchCallback: (patches, info) => calls.push([info.source, patches])}
+    }
+
+    it('orders mark names in spans and marksAt', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.t = 'hello' })
+      doc = Automerge.change(doc, {time: 0}, draft => {
+        Automerge.mark(draft, ['t'], {start: 0, end: 4, expand: 'none'}, 'link', 'x')
+        Automerge.mark(draft, ['t'], {start: 1, end: 3, expand: 'none'}, 'em', 1)
+        Automerge.mark(draft, ['t'], {start: 2, end: 5, expand: 'none'}, 'bold', true)
+      })
+      const spans = Automerge.spans(doc, ['t']).map(span => Object.keys(span.marks || {}))
+      const at = [0, 1, 2, 3, 4].map(index => Object.keys(Automerge.marksAt(doc, ['t'], index)))
+      assert.deepStrictEqual([spans, at], [[['link'], ['em', 'link'], ['bold', 'em', 'link'], ['bold', 'link'], ['bold']], [['link'], ['em', 'link'], ['bold', 'em', 'link'], ['bold', 'link'], ['bold']]])
+    })
+
+    it('resolves marks of an isolated change anchored next to a mark boundary outside its scope', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.t = 'x' })
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { Automerge.mark(draft, ['t'], {start: 0, end: 1, expand: 'both'}, 'link', null) })
+      let seen
+      Automerge.changeAt(doc, scope, {time: 0}, draft => {
+        Automerge.mark(draft, ['t'], {start: 0, end: 1, expand: 'none'}, 'bold', 3)
+        seen = [Automerge.marksAt(draft, ['t'], 0), Automerge.marks(draft, ['t'])]
+      })
+      assert.deepStrictEqual(seen, [{bold: 3}, [{name: 'bold', value: 3, start: 0, end: 1}]])
+    })
+
+    it('writes a bigint over an equal uint', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.m = {d: 2n ** 60n} })
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.m.c = new Automerge.Uint(3) })
+      const heads = Automerge.getHeads(doc)
+      const next = Automerge.change(doc, {time: 0}, draft => { draft.m.c = 3n; draft.m.d = 2n ** 60n })
+      const change = Automerge.decodeChange(Automerge.getLastLocalChange(next))
+      assert.deepStrictEqual([Automerge.getHeads(next).join() === heads.join(), change.ops.map(op => [op.key, op.datatype, op.value])], [false, [['c', 'int', 3]]])
+    })
+
+    it('treats an integer number equal to a stored wide int as unchanged', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.m = {z: -(2n ** 63n)}; draft.l = [2 ** 53] })
+      const heads = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.m.z = -1e20; draft.l[0] = 2 ** 53 })
+      const after = Automerge.change(doc, {time: 0}, draft => { draft.m.z = 2 ** 64; draft.l[0] = 2 ** 53 + 2 })
+      assert.deepStrictEqual([Automerge.getHeads(doc).join() === heads.join(), Automerge.getAllChanges(after).length], [true, 2])
+    })
+
+    it('keeps diff events of a changeAt on a loaded document after a change that threw', () => {
+      const {calls, patchCallback} = recorder()
+      const a = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.list = []; draft.deep = {} })
+      let b = Automerge.change(Automerge.merge(Automerge.init(ACTOR_B), a), {time: 0}, draft => { draft.list.insertAt(0, {value: 4}) })
+      const scope = Automerge.getHeads(b)
+      b = Automerge.change(b, {time: 0}, draft => { draft.list[0]['a/b'] = 11 })
+      b = Automerge.change(b, {time: 0}, draft => { draft.deep.k = 2.25 })
+      b = Automerge.load(Automerge.save(b), {actor: ACTOR_B, patchCallback})
+      assert.match(fail(() => Automerge.change(b, {time: 0}, draft => { Automerge.joinBlock(draft, ['list'], 0) })), /joinBlock/)
+      calls.length = 0
+      Automerge.changeAt(b, scope, {time: 0}, draft => { draft.deep.c = 1 })
+      assert.deepStrictEqual(calls, [['changeAt', [{action: 'del', path: ['deep', 'k']}, {action: 'put', path: ['deep', 'c'], value: 1}, {action: 'del', path: ['list', 0, 'a/b']}, {action: 'put', path: ['deep', 'k'], value: 2.25}, {action: 'put', path: ['list', 0, 'a/b'], value: 11}]]])
+    })
+
+    it('updates the block found at the index of the current text when updating spans in an isolated change', () => {
+      let doc = Automerge.change(Automerge.init(ACTOR_A), {time: 0}, draft => { draft.t = 'abc' })
+      doc = Automerge.change(doc, {time: 0}, draft => { Automerge.splitBlock(draft, ['t'], 1, {type: 'p', parents: [], attrs: {}}) })
+      const scope = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { Automerge.joinBlock(draft, ['t'], 1); Automerge.splitBlock(draft, ['t'], 1, {type: 'li', parents: [], attrs: {}}) })
+      assert.strictEqual(fail(() => Automerge.changeAt(doc, scope, {time: 0}, draft => { Automerge.updateSpans(draft, ['t'], Automerge.spans(draft, ['t'])) })),
+        'RangeError: Cannot updateSpans: RangeError: invalid obj id `11@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`')
+    })
+
+    it('emits nothing for an incremental load into the scope of a thrown changeAt after an empty sync', () => {
+      const {calls, patchCallback} = recorder()
+      let doc = Automerge.change(Automerge.init({actor: ACTOR_A, patchCallback}), {time: 0}, draft => { draft.l = [{t: 'x'}] })
+      const first = Automerge.getHeads(doc)
+      doc = Automerge.change(doc, {time: 0}, draft => { draft.l.deleteAt(0) })
+      const second = Automerge.getHeads(doc)
+      const [, message] = Automerge.generateSyncMessage(doc, Automerge.initSyncState())
+      ;[doc] = Automerge.receiveSyncMessage(doc, Automerge.initSyncState(), message)
+      boom(doc, first)
+      boom(doc, second)
+      calls.length = 0
+      doc = Automerge.loadIncremental(doc, Automerge.save(doc))
+      assert.deepStrictEqual([calls, Automerge.toJS(doc)], [[], {l: []}])
+    })
+  })
 })

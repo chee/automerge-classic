@@ -1,5 +1,5 @@
 import { CACHE, CONFLICTS, ELEM_IDS, OBJECT_ID, OPTIONS, STATE } from './constants.js'
-import { interpretPatch, isIntegralFloat, lamportCompare } from './apply_patch.js'
+import { interpretPatch, lamportCompare, notedDatatype } from './apply_patch.js'
 import { Text, elemAt, textOffset } from './text.js'
 import { Counter, getWriteableCounter } from './counter.js'
 import { Float64, Int, Uint } from './numbers.js'
@@ -573,7 +573,7 @@ function isScalarObject(value, hydrate = false) {
 }
 
 function assignment(object, key, value, textV2) {
-  if (value === undefined || (textV2 && typeof value === 'string') || !sameValue(object[key], value, storedFloat(object, key))) return 'set'
+  if (value === undefined || (textV2 && typeof value === 'string') || !sameValue(object[key], value, storedDatatype(object, key))) return 'set'
   return getPred(object, key).length > 1 ? 'resolve' : null
 }
 
@@ -581,21 +581,25 @@ function winner(opIds) {
   return opIds.reduce((a, b) => (lamportCompare(a, b) > 0 ? a : b))
 }
 
-function storedFloat(object, key) {
+function storedDatatype(object, key) {
   const values = !(object instanceof Text) && object[CONFLICTS] && object[CONFLICTS][key]
-  return !!values && isIntegralFloat(values, Object.keys(values).pop())
+  return values ? notedDatatype(values, Object.keys(values).pop()) : undefined
 }
 
-function sameValue(a, b, float) {
+function sameValue(a, b, datatype) {
   if (typeof a === 'number') {
-    const int = !float && Number.isInteger(a)
+    const int = datatype !== 'float64' && Number.isInteger(a)
     if (typeof b === 'number') return a === b && int === Number.isSafeInteger(b)
     if (typeof b === 'bigint') return int && a === Number(b)
     if (b instanceof Int) return int && a === b.value
     return b instanceof Float64 && !int && a === b.value
   }
+  if (typeof a === 'bigint') {
+    if (typeof b === 'number' && Number.isInteger(b)) return datatype !== 'uint' && BigInt(truncateInt(b)) === a
+    if (typeof b === 'bigint') return a === b && (datatype === 'uint') === (b > I64_MAX)
+    return datatype === 'uint' && b instanceof Uint && a === BigInt(b.value)
+  }
   if (a === b) return true
-  if (typeof a === 'bigint' && b instanceof Uint) return a === BigInt(b.value)
   if (isImmutableString(a) && isImmutableString(b)) return a.val === b.val
   if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime()
   if (a instanceof Counter && b instanceof Counter) return a.value === b.value

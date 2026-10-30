@@ -32,16 +32,16 @@ function getValue(patch, object, updated, textV2) {
   }
 }
 
-const integralFloats = new WeakMap()
+const notedDatatypes = new WeakMap()
 
 function noteDatatype(values, opId, patch) {
-  if (patch.datatype !== 'float64' || !Number.isInteger(patch.value)) return
-  if (!integralFloats.has(values)) integralFloats.set(values, new Set())
-  integralFloats.get(values).add(opId)
+  if (patch.datatype !== 'uint' && (patch.datatype !== 'float64' || !Number.isInteger(patch.value))) return
+  if (!notedDatatypes.has(values)) notedDatatypes.set(values, new Map())
+  notedDatatypes.get(values).set(opId, patch.datatype)
 }
 
-function isIntegralFloat(values, opId) {
-  return integralFloats.has(values) && integralFloats.get(values).has(opId)
+function notedDatatype(values, opId) {
+  return notedDatatypes.has(values) ? notedDatatypes.get(values).get(opId) : undefined
 }
 
 function getStoredValue(patch, object, updated, textV2) {
@@ -327,5 +327,5 @@ function reorderNewKeys(object) {
 }
 
 export {
-  interpretPatch, cloneMapObject, cloneListObject, lamportCompare, reorderNewKeys, isIntegralFloat
+  interpretPatch, cloneMapObject, cloneListObject, lamportCompare, reorderNewKeys, notedDatatype
 }

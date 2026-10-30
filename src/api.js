@@ -89,8 +89,15 @@ function changeWithSource(doc, options, callback, source) {
     callback = options
     options = undefined
   }
-  const full = integrated(doc), changed = Frontend.change(full, patchOptions(full, options, source), callback)[0]
-  return changed === full ? doc : changed
+  const full = integrated(doc)
+  let draft
+  try {
+    const changed = Frontend.change(full, patchOptions(full, options, source), root => { draft = root; return callback(root) })[0]
+    return changed === full ? doc : changed
+  } catch (error) {
+    if (draft && (error instanceof RangeError || error instanceof TypeError || draft[CHANGE].ops.length > 0)) Frontend.getBackendState(full).state.loaded = false
+    throw error
+  }
 }
 
 function integrated(doc) {
@@ -259,6 +266,11 @@ function progress(before, after, callback, source, beforeHeads, compute, patches
   }
 }
 
+function settledDiff(doc) {
+  const heads = getHeads(doc)
+  return {before: heads, after: heads, objectId: '_root', recursive: true, compute: () => []}
+}
+
 function cachedDiff(doc, before, after, objectId, recursive) {
   const state = Frontend.getBackendState(doc), key = state.source || state.state, cached = diffCache.get(key)
   if (cached && cached.compute && equals(cached.before, before) && equals(cached.after, after) &&
@@ -304,7 +316,7 @@ export function loadIncremental(doc, data, options = {}) {
   const [newState, patch] = backend.loadIncremental(oldState, data)
   if (!patch && isolations.has(doc)) return applyBackendPatch(doc, null, newState, options, 'loadIncremental')
   if (!patch) {
-    diffCache.delete(oldState.state)
+    diffCache.set(oldState.state, settledDiff(doc))
     return doc
   }
   return applyBackendPatch(doc, patch, newState, options, 'loadIncremental')
@@ -511,7 +523,7 @@ export function addFragments(doc, fragments, options) {
   }
   if (!patch && isolations.has(doc)) return applyBackendPatch(doc, null, newState, options || {}, 'addFragments')
   if (!patch) {
-    diffCache.delete(state.state)
+    diffCache.set(state.state, settledDiff(doc))
     return doc
   }
   return applyBackendPatch(doc, patch, newState, options || {}, 'addFragments', getHeads(doc))
@@ -1272,7 +1284,9 @@ function markRangesForText(doc, text, clock) {
     }
   }
   const state = Frontend.getBackendState(doc)
-  const sequence = (state.source || state.state).sequenceInserts(objectId, clock || state.clock)
+  const scope = clock || state.clock
+  const sequence = (state.source || state.state).sequenceInserts(objectId, null)
+    .map(entry => (!scope || !entry.mark || entry.counter <= (scope[entry.actor] || 0) ? entry : Object.assign({}, entry, {mark: undefined})))
   if (text.context) {
     for (const {id, ref, mark} of sequence) {
       inserts.set(id, ref)
@@ -1374,6 +1388,12 @@ function markValuesPerElement(operations, length) {
         if (values[index] === NO_MARKS) values[index] = {}
         values[index][operation.name] = operation.value
       }
+    }
+  }
+  for (let index = 0; index < length; index++) {
+    const keys = Object.keys(values[index])
+    if (keys.some((key, i) => i > 0 && compareUtf8(keys[i - 1], key) > 0)) {
+      values[index] = Object.fromEntries(keys.sort(compareUtf8).map(key => [key, values[index][key]]))
     }
   }
   return values
@@ -1684,6 +1704,18 @@ export function updateSpans(doc, path, newSpans, config = {}) {
     if (typeof item === 'string') splice(doc, path, at, 1)
     else joinBlock(doc, path, at)
   }
+  function blockAt(index) {
+    const scoped = richTextTarget(doc, path, index, 'updateSpans', false)
+    if (!source) return scoped.text.get(scoped.index)
+    const live = current().text, item = index < live.length ? live.get(index) : undefined
+    if (!isObject(item)) throw new RangeError(`Cannot updateSpans: RangeError: index ${index} is out of bounds`)
+    const id = Frontend.getObjectId(item)
+    for (let i = 0; i < scoped.text.length; i++) {
+      const own = scoped.text.get(i)
+      if (isObject(own) && Frontend.getObjectId(own) === id) return own
+    }
+    throw new RangeError(`Cannot updateSpans: RangeError: invalid obj id \`${id}\``)
+  }
   const hook = {
     equal(oldIndex, newIndex, length) {
       for (let offset = 0; offset < length; offset++) at += textElementWidth(old[oldIndex + offset])
@@ -1707,10 +1739,7 @@ export function updateSpans(doc, path, newSpans, config = {}) {
         const oldItem = offset < oldLength ? old[oldIndex + offset] : undefined
         const newItem = offset < newLength ? next[newIndex + offset] : undefined
         if (isObject(oldItem) && isObject(newItem)) {
-          if (!sameValue(oldItem.block, newItem.block)) {
-            const current = richTextTarget(doc, path, at, 'updateSpans', false)
-            updateRecord(current.text.get(current.index), newItem.block)
-          }
+          if (!sameValue(oldItem.block, newItem.block)) updateRecord(blockAt(at), newItem.block)
           at++
         } else {
           if (oldItem !== undefined) deleteItem(oldItem)
@@ -1793,7 +1822,7 @@ export function receiveSyncMessage(doc, oldSyncState, message, options = {}) {
   const [backendState, syncState, patch] = backend.receiveSyncMessage(oldBackendState, oldSyncState, message)
   if (!patch && isolations.has(doc)) return [applyBackendPatch(doc, null, backendState, options, 'receiveSyncMessage'), syncState, null]
   if (!patch) {
-    diffCache.delete(oldBackendState.state)
+    diffCache.set(oldBackendState.state, settledDiff(doc))
     return [doc, syncState, null]
   }
   return [applyBackendPatch(doc, patch, backendState, options, 'receiveSyncMessage'), syncState, null]

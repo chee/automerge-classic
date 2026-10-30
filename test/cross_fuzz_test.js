@@ -3,6 +3,7 @@ import Classic from './subject.js'
 import Modern, { describeLive } from './modern.js'
 import { CHANGE_COLUMNS, decodeChangeColumns, decodeChangeMeta, decodeColumnInfo, decodeColumns, decodeContainerHeader, decodeOps, encodeChange, inflateColumn } from '../backend/columnar.js'
 import { Decoder } from '../backend/encoding.js'
+import { BUNDLE_OPS_COLUMNS } from '../backend/bundle.js'
 
 const SEEDS = Number(process.env.CROSS_FUZZ_SEEDS || 40)
 const STEPS = Number(process.env.CROSS_FUZZ_STEPS || 60)
@@ -169,6 +170,30 @@ function inflated(bundle) {
   return parts
 }
 
+function canonicalBundle(bundle) {
+  const decoder = new Decoder(decodeContainerHeader(new Decoder(bundle), false).chunkData), deps = [], actors = [], sections = []
+  for (let i = decoder.readUint53(); i > 0; i--) deps.push(decoder.readRawBytes(32))
+  for (let i = decoder.readUint53(); i > 0; i--) actors.push(decoder.readHexString())
+  for (let section = 0; section < 2; section++) {
+    const columns = decodeColumnInfo(decoder)
+    for (const column of columns) {
+      column.buffer = decoder.readRawBytes(column.bufferLen)
+      inflateColumn(column)
+    }
+    sections.push(columns)
+  }
+  const ops = decodeColumns(sections[1], actors, BUNDLE_OPS_COLUMNS).map(op => JSON.stringify(Object.assign({}, op, {idCtrInverse: undefined})))
+  function target(op) {
+    const {action, objActor, objCtr, keyActor, keyCtr, keyStr} = JSON.parse(op)
+    return action === 3 ? JSON.stringify([objActor, objCtr, keyActor, keyCtr, keyStr]) : null
+  }
+  for (let i = 0, j; i < ops.length; i = j) {
+    for (j = i + 1; target(ops[i]) !== null && j < ops.length && target(ops[j]) === target(ops[i]); j++);
+    ops.splice(i, j - i, ...ops.slice(i, j).sort())
+  }
+  return {deps, actors, changes: sections[0].map(({columnId, buffer}) => [columnId, buffer]), ops}
+}
+
 function assertBundles(metas, classic, modern, context) {
   assert.strictEqual(classic.length, modern.length, `bundle count ${context}`)
   for (let i = 0; i < classic.length; i++) {
@@ -177,7 +202,7 @@ function assertBundles(metas, classic, modern, context) {
       assert.strictEqual(modern[i][8], 2, `change bytes ${context}`)
       assert.deepStrictEqual(Classic.decodeChange(classic[i]), Classic.decodeChange(modern[i]), `change ${context}`)
     } else if (deletesOrderUnstable(modern[i])) {
-      assert.deepStrictEqual(Classic.readBundle(classic[i]), Classic.readBundle(modern[i]), `bundle changes ${context}`)
+      assert.deepStrictEqual(canonicalBundle(classic[i]), canonicalBundle(modern[i]), `bundle ${context}`)
     } else {
       assert.deepStrictEqual(inflated(classic[i]), inflated(modern[i]), `bundle bytes ${context}`)
     }
